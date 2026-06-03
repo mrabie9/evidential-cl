@@ -475,6 +475,64 @@ def get_parser():
 
     # Parameters for HAT
 
+    # EUCR (Evidential Uncertainty Channel Regularisation) parameters
+    parser.add_argument(
+        "--reg_lambda",
+        type=float,
+        default=1000.0,
+        help="EUCR consolidation penalty strength (lambda).",
+    )
+    parser.add_argument(
+        "--probe_loss_weight",
+        type=float,
+        default=0.5,
+        help="EUCR weight of the backbone deep-evidential-supervision (probe) loss.",
+    )
+    parser.add_argument(
+        "--probe_stages",
+        type=str,
+        default="1,2,3,4",
+        help="EUCR comma-separated backbone stages (1-4) that carry evidential probes.",
+    )
+    parser.add_argument(
+        "--reg_granularity",
+        type=str,
+        default="channel",
+        choices=["channel", "param"],
+        help="EUCR granularity of evidential importance / regularisation.",
+    )
+    parser.add_argument(
+        "--nu",
+        type=float,
+        default=0.9,
+        help="EUCR Dempster-Shafer decision-making ignorance retention factor.",
+    )
+    parser.add_argument(
+        "--proto_factor",
+        type=int,
+        default=20,
+        help="EUCR number of Dempster-Shafer prototypes per class.",
+    )
+    parser.add_argument(
+        "--kl_warmup_epochs",
+        type=int,
+        default=35,
+        help="EUCR evidential-loss KL warm-up length (in epochs).",
+    )
+    parser.add_argument(
+        "--importance_batches",
+        type=int,
+        default=None,
+        help="EUCR max minibatches used for end-of-task importance estimation (all if unset).",
+    )
+    parser.add_argument(
+        "--eucr_depth",
+        type=int,
+        default=18,
+        choices=[18, 34],
+        help="EUCR evidential ResNet-1D backbone depth.",
+    )
+
     return parser
 
 

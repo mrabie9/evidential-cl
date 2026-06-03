@@ -46,8 +46,15 @@ MIN_NOISE_ACCURACY = 0.56
 
 # Meta-learning / special baselines excluded from this smoke suite (fragile in
 # minimal synthetic IQ setup or unrelated API).
+#
+# ``eucr`` is also excluded: its Dempster-Shafer evidential head requires Adam
+# (adaptive per-parameter steps) plus the KL warm-up to escape the flat
+# maximum-ignorance region. Under this suite's CE-oriented regime (SGD, lr 0.08,
+# 180 steps on prior-only random inputs) it stays at ignorance, but it trains to
+# confident, calibrated predictions under its own ``configs/models/*/eucr.yaml``
+# (Adam) setup.
 MODEL_MODULES_EXCLUDED_FROM_NOISE_SMOKE: frozenset[str] = frozenset(
-    ("anml", "meralg1", "meta-bgd")
+    ("anml", "meralg1", "meta-bgd", "eucr")
 )
 
 
