@@ -754,11 +754,24 @@ TUNING_PRESETS: Dict[str, TuningPreset] = {
                     ],
                 },
                 "woe_lambda": {
+                    # The DS importance signal I_2 is normalised by feature_dim**2
+                    # in model/woe_si.py, which shrank the surrogate penalty by
+                    # ~2.6e5. The old [0.1, 1.0] grid now yields a negligible
+                    # penalty, so search a log-spaced range ~[1e2, 1e5] (old useful
+                    # value x feature_dim**2). Re-tune from this range.
                     "kind": "float",
                     "factors": (0.5, 1.0, 2.0),
-                    "min": 0.01,
-                    "fallback": 0.1,
-                    "values": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+                    "min": 1.0,
+                    "fallback": 1000.0,
+                    "values": [
+                        100.0,
+                        300.0,
+                        1000.0,
+                        3000.0,
+                        10000.0,
+                        30000.0,
+                        100000.0,
+                    ],
                 },
                 "woe_xi": {
                     "kind": "float",

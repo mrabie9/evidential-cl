@@ -3,8 +3,11 @@ model: woe_si
 loader: class_incremental_loader
 
 lr: 0.001
-woe_lambda: 0.9
-woe_xi: 0.001
+# Provisional, pending a re-tune: I_2 is now normalised by feature_dim**2 in
+# model/woe_si.py, so the old woe_lambda (0.9) gives a negligible penalty. See
+# the corrected sweep range in tuning/presets.py (~[1e2, 1e5]).
+woe_lambda: 1000.0
+woe_xi: 0.01
 woe_centering_mode: centered_uniform
 woe_mu_momentum: 0.9
 woe_importance_stride: 1

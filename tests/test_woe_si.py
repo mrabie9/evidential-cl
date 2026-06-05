@@ -204,6 +204,31 @@ def test_vacuous_model_has_small_omega() -> None:
     assert _per_task_w_norm(model) < 1e-4
 
 
+def test_information_signal_is_scale_normalised() -> None:
+    """The learner's importance signal must not scale with ``feature_dim**2``.
+
+    Regression guard for the surrogate-loss explosion: the *unnormalised* Denoeux
+    ``I_2`` scales as ~``K * feature_dim**2`` -- hundreds even at init and growing
+    to 1e5-1e6 once the readout trains, which made ``omega`` and the quadratic
+    anchor penalty blow up across tasks. The learner divides ``I_2`` by
+    ``feature_dim**2`` (= 512**2 here), so the signal it backprops must collapse
+    to well under 1.0; the unnormalised value would be in the hundreds and trip
+    this assertion.
+    """
+    torch.manual_seed(11)
+    model = Net(2, 6, 2, _make_args("task_incremental_loader"))
+    # Drive the readout to O(1) weights so the unnormalised I_2 is clearly large.
+    with torch.no_grad():
+        torch.nn.init.normal_(model.net.model.fc.weight, std=1.0)
+        torch.nn.init.normal_(model.net.model.fc.bias, std=1.0)
+    x = torch.randn(8, 2, 128)
+    signal = float(
+        model._compute_information_content(x, t=0, update_feature_mean=False).item()
+    )
+    assert signal >= 0.0
+    assert signal < 1.0, f"importance signal not normalised (got {signal})"
+
+
 def test_penalty_is_exactly_zero_on_first_task() -> None:
     torch.manual_seed(6)
     model = Net(2, 6, 2, _make_args("task_incremental_loader"))

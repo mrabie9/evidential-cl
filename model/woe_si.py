@@ -488,6 +488,24 @@ class Net(DetectionReplayMixin, nn.Module):
         i2_per_sample = information_content(
             weights, conflict_weighting=self.conflict_weighting
         )
+        # Denoeux's I_2 is an *unnormalised* double sum: each per-class total
+        # w_k_plus = sum_j relu(w_jk) is O(J) in the feature dimension J, so
+        # I_2 ~ O(K * J^2). Used verbatim as the SI importance signal that scales
+        # the quadratic anchor penalty, it dwarfs the O(1) cross-entropy loss by
+        # several orders of magnitude (J = feature_dim is in the hundreds, e.g.
+        # 512), so the per-task path integral and the cumulative omega -- and
+        # hence the surrogate loss -- explode across tasks (training losses of
+        # 1e5-1e6 that collapse plasticity on every task after the first). Divide
+        # by J^2 so the per-feature evidence is *averaged* rather than summed; the
+        # importance signal then lives on an O(K) ~ O(1) scale like SI's
+        # loss-based path integral. Because the path integral telescopes to the
+        # change in this scalar, w_buf stays bounded regardless of step count, and
+        # the *relative* per-parameter importance the penalty actually uses is
+        # unchanged. The exact Denoeux sum is preserved in the functional core
+        # (`information_content`) for the paper correspondence and unit tests;
+        # only the learner's internal importance signal is rescaled here.
+        feature_count = features.shape[1]
+        i2_per_sample = i2_per_sample / float(feature_count * feature_count)
         return i2_per_sample.mean()
 
     # ------------------------------------------------------------------
