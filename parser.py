@@ -533,6 +533,47 @@ def get_parser():
         help="EUCR evidential ResNet-1D backbone depth.",
     )
 
+    # WoE-SI (Weight-of-Evidence Synaptic Intelligence) parameters.
+    parser.add_argument(
+        "--woe_lambda",
+        type=float,
+        default=0.1,
+        help="WoE-SI quadratic-penalty strength (analogue of SI's si_c).",
+    )
+    parser.add_argument(
+        "--woe_xi",
+        type=float,
+        default=1e-3,
+        help="WoE-SI damping term xi in the per-task importance normaliser.",
+    )
+    parser.add_argument(
+        "--woe_centering_mode",
+        type=str,
+        default="centered_uniform",
+        choices=["centered_uniform", "raw_uniform", "full_lc"],
+        help=(
+            "WoE-SI feature-centering / alpha scheme for the DS weights of "
+            "evidence (Denoeux 2019 Eq 25/29). 'full_lc' is not implemented."
+        ),
+    )
+    parser.add_argument(
+        "--woe_mu_momentum",
+        type=float,
+        default=0.9,
+        help="WoE-SI EMA momentum for the per-task running feature mean mu_j.",
+    )
+    parser.add_argument(
+        "--woe_importance_stride",
+        type=int,
+        default=1,
+        help="WoE-SI: compute the I_2 importance gradient every k optimiser steps.",
+    )
+    parser.add_argument(
+        "--woe_conflict_weighting",
+        action="store_true",
+        help="WoE-SI: enable the kappa-style conflict-weighting ablation (default off).",
+    )
+
     return parser
 
 

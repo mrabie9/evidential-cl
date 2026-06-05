@@ -1,0 +1,11 @@
+# Model-specific overrides for woe_si (Weight-of-Evidence Synaptic Intelligence).
+model: woe_si
+loader: task_incremental_loader
+
+lr: 0.003
+woe_lambda: 0.4
+woe_xi: 0.001
+woe_centering_mode: centered_uniform
+woe_mu_momentum: 0.9
+woe_importance_stride: 1
+woe_conflict_weighting: false
