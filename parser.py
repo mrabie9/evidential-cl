@@ -553,6 +553,22 @@ def get_parser():
         choices=[18, 34],
         help="EUCR evidential ResNet-1D backbone depth.",
     )
+    parser.add_argument(
+        "--eucr_distance_metric",
+        type=str,
+        default="cosine",
+        choices=["cosine", "euclidean"],
+        help="EUCR Dempster-Shafer prototype distance metric (cosine is robust to "
+        "LayerNorm'd features; euclidean collapses the input signal).",
+    )
+    parser.add_argument(
+        "--eucr_uncertainty",
+        type=str,
+        default="both",
+        choices=["nonspecificity", "discord", "both"],
+        help="EUCR consolidation importance readout: nonspecificity (omega), "
+        "discord (entropy of the pignistic probability), or both (DS total).",
+    )
 
     # WoE-SI (Weight-of-Evidence Synaptic Intelligence) parameters.
     parser.add_argument(

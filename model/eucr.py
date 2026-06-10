@@ -105,6 +105,7 @@ class Net(nn.Module):
             nu=float(self.cfg.nu),
             probe_stages=probe_stages,
             proto_factor=int(self.cfg.proto_factor),
+            metric=str(getattr(args, "eucr_distance_metric", "cosine")),
         )
 
         self.criterion = EvidentialLoss(
@@ -114,6 +115,7 @@ class Net(nn.Module):
         self.reg_lambda = float(self.cfg.reg_lambda)
         self.probe_loss_weight = float(self.cfg.probe_loss_weight)
         self.reg_granularity = str(self.cfg.reg_granularity)
+        self.uncertainty_mode = str(getattr(args, "eucr_uncertainty", "both"))
         self.importance_batches = self.cfg.importance_batches
         self.inner_steps = max(1, int(self.cfg.inner_steps))
         self.clipgrad = (
@@ -122,6 +124,7 @@ class Net(nn.Module):
             else None
         )
 
+        self.backbone_params, self.evidential_params = self._split_parameters()
         self.opt = self._build_optimizer()
 
         self.current_task: Optional[int] = None
@@ -129,10 +132,16 @@ class Net(nn.Module):
         self.theta_star: Optional[Dict[str, torch.Tensor]] = None
 
     # ------------------------------------------------------------------
-    def _build_optimizer(self) -> torch.optim.Optimizer:
-        lr = float(self.cfg.lr)
-        if str(self.cfg.optimizer).lower() == "sgd":
-            return torch.optim.SGD(self.backbone.parameters(), lr=lr, momentum=0.9)
+    def _split_parameters(self) -> Tuple[list, list]:
+        """Partition backbone params into shared-backbone vs evidential-head groups.
+
+        The Dempster-Shafer head / probes (``ds_head``, ``dm_head``, ``probes``,
+        which includes the ``DistanceActivation`` gamma/alpha params) produce
+        gradients orders of magnitude larger than the convolutional feature
+        extractor. Keeping the two groups separate lets the optimizer and the
+        gradient clipper treat them independently so the head cannot starve the
+        backbone of its gradient budget.
+        """
         backbone_params: list[nn.Parameter] = []
         evidential_params: list[nn.Parameter] = []
         for name, param in self.backbone.named_parameters():
@@ -142,10 +151,22 @@ class Net(nn.Module):
                 evidential_params.append(param)
             else:
                 backbone_params.append(param)
+        return backbone_params, evidential_params
+
+    def _build_optimizer(self) -> torch.optim.Optimizer:
+        lr = float(self.cfg.lr)
+        if str(self.cfg.optimizer).lower() == "sgd":
+            return torch.optim.SGD(
+                [
+                    {"params": self.backbone_params, "lr": lr},
+                    {"params": self.evidential_params, "lr": lr * 0.25},
+                ],
+                momentum=0.9,
+            )
         return torch.optim.Adam(
             [
-                {"params": backbone_params, "lr": lr},
-                {"params": evidential_params, "lr": lr * 0.25},
+                {"params": self.backbone_params, "lr": lr},
+                {"params": self.evidential_params, "lr": lr * 0.25},
             ],
             eps=1e-7,
             amsgrad=True,
@@ -240,9 +261,11 @@ class Net(nn.Module):
             self.opt.zero_grad(set_to_none=True)
             loss.backward()
             if self.clipgrad is not None:
-                torch.nn.utils.clip_grad_norm_(
-                    self.backbone.parameters(), self.clipgrad
-                )
+                # Clip each group against its own budget: a single global clip
+                # lets the high-gradient evidential head scale the backbone's
+                # update down to near-zero and freeze the feature extractor.
+                torch.nn.utils.clip_grad_norm_(self.backbone_params, self.clipgrad)
+                torch.nn.utils.clip_grad_norm_(self.evidential_params, self.clipgrad)
             self.opt.step()
 
             with torch.no_grad():
@@ -268,6 +291,7 @@ class Net(nn.Module):
             device,
             max_batches=self.importance_batches,
             normalize=True,
+            uncertainty_mode=self.uncertainty_mode,
         )
         if self.reg_granularity == "channel":
             new_importance = cons.to_channel(self.backbone, new_importance)

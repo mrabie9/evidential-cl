@@ -2,14 +2,18 @@
 
 This is the anti-forgetting machinery for EUCR. It replaces the Fisher-information
 diagonal of EWC with an *evidential* importance signal read out from the
-uncertainty (``omega``) the backbone probes assign to each stage.
+Dempster-Shafer uncertainty the backbone probes assign to each stage.
 
 Pipeline per task ``t``:
   1. :func:`compute_importance` -- run over the task's data and accumulate the
-     squared gradient of the backbone evidential *confidence*
-     ``conf = mean_stages(1 - omega_stage)`` w.r.t. each shared backbone
-     parameter. Parameters whose perturbation most changes the backbone's
-     certainty are deemed important (evidential analogue of the Fisher diagonal).
+     squared gradient of the mean backbone DS uncertainty w.r.t. each shared
+     backbone parameter. The uncertainty readout (``uncertainty_mode``) selects
+     the DS component: ``nonspecificity`` (the ignorance mass ``omega``),
+     ``discord`` (entropy of the pignistic probability), or ``both`` (their sum,
+     the DS total). Parameters whose perturbation most changes the backbone's
+     uncertainty are deemed important (evidential analogue of the Fisher
+     diagonal). Note ``nonspecificity`` alone weakens as the long Dempster chain
+     drives ``omega`` -> 0; ``discord`` / ``both`` stay informative.
   2. :func:`to_channel` (optional) -- collapse per-weight importance to one score
      per convolution output channel, then broadcast it back across the filter.
   3. :func:`accumulate` -- online (running-sum) accumulation across tasks.
@@ -22,10 +26,13 @@ No pruning and no binary masks are used.
 
 from __future__ import annotations
 
+import math
 from typing import Dict, Iterable, Optional
 
 import torch
 import torch.nn as nn
+
+_UNCERTAINTY_MODES = ("nonspecificity", "discord", "both")
 
 # Per-task evidential heads / probes are NOT shared across tasks, so they are
 # excluded from consolidation. Everything else (conv1, layer1..layer4, the
@@ -44,10 +51,46 @@ def _named_consolidatable_params(model: nn.Module) -> Iterable:
             yield name, param
 
 
-def _backbone_confidence(probe_outs) -> torch.Tensor:
-    """Mean over stages of ``(1 - omega_stage)``, per sample. Shape ``[B]``."""
-    confs = [1.0 - omega for _eu, _beliefs, omega in probe_outs]
-    return torch.stack(confs, dim=0).mean(dim=0)
+def _stage_uncertainty(
+    beliefs: torch.Tensor, omega: torch.Tensor, mode: str, eps: float = 1e-8
+) -> torch.Tensor:
+    """Per-sample Dempster-Shafer uncertainty for one probe stage. Shape ``[B]``.
+
+    Decomposes total DS uncertainty into its two additive components:
+
+    * ``nonspecificity`` -- the ignorance mass ``omega`` (normalised; "how vague").
+    * ``discord`` -- the Shannon entropy of the pignistic probability
+      ``BetP_c = beliefs_c + omega / C`` divided by ``log C`` ("how conflicted
+      across classes"). Entropy is taken on ``BetP`` -- a genuine probability
+      distribution -- not on the raw masses, on which Shannon entropy is undefined.
+    * ``both`` -- their sum, the (normalised) DS total uncertainty.
+
+    Using ``discord`` / ``both`` keeps the importance signal alive even when the
+    long Dempster chain drives ``omega`` toward zero (where ``nonspecificity``
+    alone vanishes).
+    """
+    if mode == "nonspecificity":
+        return omega
+    num_classes = beliefs.size(-1)
+    log_c = math.log(num_classes) if num_classes > 1 else 1.0
+    betp = beliefs + omega.unsqueeze(-1) / num_classes
+    betp = betp / betp.sum(dim=-1, keepdim=True).clamp_min(eps)
+    discord = -(betp * (betp + eps).log()).sum(dim=-1) / log_c
+    if mode == "discord":
+        return discord
+    return omega + discord
+
+
+def _backbone_uncertainty(probe_outs, mode: str) -> torch.Tensor:
+    """Mean over stages of the chosen per-sample DS uncertainty. Shape ``[B]``."""
+    if mode not in _UNCERTAINTY_MODES:
+        raise ValueError(
+            f"Unknown eucr_uncertainty mode {mode!r}; expected one of {_UNCERTAINTY_MODES}."
+        )
+    per_stage = [
+        _stage_uncertainty(beliefs, omega, mode) for _eu, beliefs, omega in probe_outs
+    ]
+    return torch.stack(per_stage, dim=0).mean(dim=0)
 
 
 @torch.enable_grad()
@@ -57,14 +100,19 @@ def compute_importance(
     device: torch.device,
     max_batches: Optional[int] = None,
     normalize: bool = True,
+    uncertainty_mode: str = "both",
 ) -> Dict[str, torch.Tensor]:
-    """Estimate evidential importance (Fisher-style diagonal of certainty).
+    """Estimate evidential importance (Fisher-style diagonal of uncertainty).
 
-    For each batch we differentiate the mean backbone confidence and accumulate
+    For each batch we differentiate the mean backbone DS uncertainty
+    (``uncertainty_mode`` selects nonspecificity / discord / both) and accumulate
     ``grad ** 2`` weighted by the batch size, then normalise by the number of
-    samples seen. Returns a dict ``{param_name: importance_tensor}`` over shared
-    backbone parameters only. With ``normalize`` the per-task importance is
-    rescaled to unit mean so ``lambda`` stays interpretable across datasets.
+    samples seen. Differentiating uncertainty rather than confidence yields the
+    same importance (the squared gradient is invariant to the sign flip).
+    Returns a dict ``{param_name: importance_tensor}`` over shared backbone
+    parameters only. With ``normalize`` the per-task importance is rescaled to
+    unit mean so ``lambda`` stays interpretable across datasets and uncertainty
+    modes.
     """
     was_training = backbone.training
     backbone.eval()
@@ -93,8 +141,8 @@ def compute_importance(
         probe_outs = out[-1]
         if not probe_outs:
             break
-        conf = _backbone_confidence(probe_outs)
-        scalar = conf.mean()
+        uncertainty = _backbone_uncertainty(probe_outs, uncertainty_mode)
+        scalar = uncertainty.mean()
 
         backbone.zero_grad(set_to_none=True)
         scalar.backward()

@@ -36,6 +36,7 @@ class EvidentialProbe(nn.Module):
         n_classes: int,
         nu: float = 0.9,
         proto_factor: int = 20,
+        metric: str = "cosine",
     ) -> None:
         super().__init__()
         self.n_channels = n_channels
@@ -45,10 +46,13 @@ class EvidentialProbe(nn.Module):
             n_feature_maps=n_channels,
             n_classes=n_classes,
             n_prototypes=max(1, n_classes) * proto_factor,
+            metric=metric,
         )
         self.dm_layer = DM(num_class=n_classes, nu=float(nu))
 
-    def forward(self, feat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        self, feat: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         pooled = F.adaptive_avg_pool1d(feat, 1).flatten(1)
         pooled = self.norm(pooled)
         mass = self.ds_module(pooled)
@@ -76,16 +80,20 @@ class EucrResNet1D(nn.Module):
         probe_stages: Sequence[int] = (1, 2, 3, 4),
         proto_factor: int = 20,
         in_channels: int = 2,
+        metric: str = "cosine",
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
         self.probe_stages = tuple(sorted(set(int(s) for s in probe_stages)))
         self.in_planes = 64
+        self.metric = str(metric).lower()
 
         self.use_iq_aug_features = bool(getattr(args, "use_iq_aug_features", False))
         self.iq_aug_scaling_mode = str(getattr(args, "data_scaling", "none"))
         self.iq_aug_feature_type = str(
-            getattr(args, "iq_aug_feature_type", getattr(args, "iq_aug_feature", "power"))
+            getattr(
+                args, "iq_aug_feature_type", getattr(args, "iq_aug_feature", "power")
+            )
         )
         effective_in_channels = 3 if self.use_iq_aug_features else in_channels
 
@@ -110,6 +118,7 @@ class EucrResNet1D(nn.Module):
             n_feature_maps=feat_dim,
             n_classes=num_classes,
             n_prototypes=num_classes * proto_factor,
+            metric=self.metric,
         )
         self.dm_head = DM(num_class=num_classes, nu=float(nu))
 
@@ -122,7 +131,11 @@ class EucrResNet1D(nn.Module):
         self.probes = nn.ModuleDict(
             {
                 str(stage): EvidentialProbe(
-                    stage_channels[stage], num_classes, nu=nu, proto_factor=proto_factor
+                    stage_channels[stage],
+                    num_classes,
+                    nu=nu,
+                    proto_factor=proto_factor,
+                    metric=self.metric,
                 )
                 for stage in self.probe_stages
             }
@@ -142,7 +155,11 @@ class EucrResNet1D(nn.Module):
                 ),
                 norm_layer(planes * BasicBlock1D.expansion),
             )
-        layers = [BasicBlock1D(self.in_planes, planes, stride, downsample, norm_layer=norm_layer)]
+        layers = [
+            BasicBlock1D(
+                self.in_planes, planes, stride, downsample, norm_layer=norm_layer
+            )
+        ]
         self.in_planes = planes * BasicBlock1D.expansion
         for _ in range(1, blocks):
             layers.append(BasicBlock1D(self.in_planes, planes, norm_layer=norm_layer))

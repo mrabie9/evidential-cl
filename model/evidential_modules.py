@@ -37,18 +37,35 @@ def _safe_normalize(tensor: torch.Tensor, dim: int = -1) -> torch.Tensor:
 
 
 class Distance_layer(nn.Module):
-    """Squared Euclidean distance from each input to ``n_prototypes`` prototypes."""
+    """Distance from each input to ``n_prototypes`` prototypes.
 
-    def __init__(self, n_prototypes: int, n_feature_maps: int) -> None:
+    ``metric="cosine"`` returns the directional distance ``1 - cos(f, p)`` in
+    ``[0, 2]``; ``metric="euclidean"`` returns the squared Euclidean distance.
+    Cosine is the default because the backbone feeds ``LayerNorm``-normalised
+    features whose L2 norm is ~constant across samples, so squared-Euclidean
+    distance is dominated by that constant norm and collapses the input signal
+    (feature coefficient-of-variation ~0.44 -> distance ~0.01); cosine reads the
+    directional signal LayerNorm preserves and keeps the prototype gradient
+    informative.
+    """
+
+    def __init__(
+        self, n_prototypes: int, n_feature_maps: int, metric: str = "cosine"
+    ) -> None:
         super().__init__()
         self.w = nn.Linear(
             in_features=n_feature_maps, out_features=n_prototypes, bias=False
         ).weight
         self.n_prototypes = n_prototypes
+        self.metric = str(metric).lower()
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        # inputs: [B, F], self.w: [P, F] -> [B, P] squared distances.
-        return torch.cdist(inputs, self.w, p=2).pow(2)
+        # inputs: [B, F], self.w: [P, F] -> [B, P] distances.
+        if self.metric == "euclidean":
+            return torch.cdist(inputs, self.w, p=2).pow(2)
+        normalized_inputs = F.normalize(inputs, dim=-1)
+        normalized_prototypes = F.normalize(self.w, dim=-1)
+        return 1.0 - normalized_inputs @ normalized_prototypes.t()
 
 
 class DistanceActivation_layer(nn.Module):
@@ -120,14 +137,19 @@ class Dempster_layer(nn.Module):
         for i in range(self.n_prototypes - 1):
             m2 = inputs[..., (i + 1), :]
             omega2 = torch.unsqueeze(inputs[..., (i + 1), -1], -1)
-            combine1 = torch.mul(m1, m2)
-            combine2 = torch.mul(m1, omega2)
-            combine3 = torch.mul(omega1, m2)
-            combine1_2 = combine1 + combine2
-            combine2_3 = combine1_2 + combine3
-            combine2_3 = _safe_normalize(combine2_3, dim=-1)
-            m1 = combine2_3
-            omega1 = torch.unsqueeze(combine2_3[..., -1], -1)
+            # Dempster's rule for singleton + ignorance mass functions:
+            #   class c : m1(c)m2(c) + m1(c)omega2 + omega1 m2(c)
+            #   ignorance: omega1 * omega2  (both sources ignorant)
+            # combine2/combine3 are belief-transfer terms and must NOT add to the
+            # ignorance column; the previous code summed all three at the omega
+            # index, triple-counting ignorance (3*omega1*omega2) and biasing the
+            # head toward maximum ignorance.
+            class_terms = (m1 * m2 + m1 * omega2 + omega1 * m2)[..., :-1]
+            omega_term = omega1 * omega2
+            combined = torch.cat([class_terms, omega_term], dim=-1)
+            combined = _safe_normalize(combined, dim=-1)
+            m1 = combined
+            omega1 = torch.unsqueeze(combined[..., -1], -1)
         return m1
 
 
@@ -141,15 +163,31 @@ class DempsterNormalize_layer(nn.Module):
 class Dempster_Shafer_module(nn.Module):
     """Feature vector -> normalised Dempster-Shafer masses ``[B, n_classes + 1]``."""
 
-    def __init__(self, n_feature_maps: int, n_classes: int, n_prototypes: int) -> None:
+    def __init__(
+        self,
+        n_feature_maps: int,
+        n_classes: int,
+        n_prototypes: int,
+        metric: str = "cosine",
+    ) -> None:
         super().__init__()
         self.n_prototypes = n_prototypes
         self.n_classes = n_classes
         self.n_feature_maps = n_feature_maps
+        self.metric = str(metric).lower()
         self.ds1 = Distance_layer(
-            n_prototypes=n_prototypes, n_feature_maps=n_feature_maps
+            n_prototypes=n_prototypes,
+            n_feature_maps=n_feature_maps,
+            metric=self.metric,
         )
-        self.ds1_activate = DistanceActivation_layer(n_prototypes=n_prototypes)
+        # gamma = eta**2 sets the activation temperature exp(-gamma * distance).
+        # Euclidean distances are O(feat_dim) so they need a tiny gamma (~0.01);
+        # cosine distances live in [0, 2] and need gamma ~1 to span the activation
+        # range. Pick the init that matches the metric's scale.
+        init_gamma = 0.1 if self.metric == "euclidean" else 1.0
+        self.ds1_activate = DistanceActivation_layer(
+            n_prototypes=n_prototypes, init_gamma=init_gamma
+        )
         self.ds2 = Belief_layer(n_prototypes=n_prototypes, num_class=n_classes)
         self.ds2_omega = Omega_layer(n_prototypes=n_prototypes, num_class=n_classes)
         self.ds3_dempster = Dempster_layer(

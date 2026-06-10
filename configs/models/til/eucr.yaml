@@ -13,12 +13,14 @@ grad_clip_norm: 5.0
 reg_lambda: 1000.0
 reg_granularity: channel
 importance_batches: 20
+# Importance readout: nonspecificity (omega) | discord (entropy of pignistic) | both
+eucr_uncertainty: both
 
 # Evidential backbone / probes
 probe_stages: "1,2,3,4"
 probe_loss_weight: 0.5
 nu: 0.9
-proto_factor: 20
+proto_factor: 3
 kl_warmup_epochs: 20
 eucr_depth: 18
-n_epochs: 20
+eucr_distance_metric: cosine
