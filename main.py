@@ -130,11 +130,13 @@ class _OutputTee:
         return None
 
 
-def enable_output_tee(log_file_path: str) -> None:
+def enable_output_tee(log_file_path: str, append: bool = False) -> None:
     """Enable stdout/stderr mirroring to a log file (without hiding terminal output).
 
     Args:
         log_file_path: Full path to the log file to append/overwrite.
+        append: When ``True``, append to an existing log (used when resuming an
+            interrupted experiment) instead of truncating it.
     """
     global _OUTPUT_TEE_INITIALIZED, _OUTPUT_TEE_LOG_FILE
     global _OUTPUT_TEE_ORIGINAL_STDOUT, _OUTPUT_TEE_ORIGINAL_STDERR
@@ -146,7 +148,8 @@ def enable_output_tee(log_file_path: str) -> None:
     _OUTPUT_TEE_ORIGINAL_STDERR = sys.stderr
 
     # Use line buffering so the log closely matches what users see in the terminal.
-    _OUTPUT_TEE_LOG_FILE = open(log_file_path, "w", encoding="utf-8", buffering=1)
+    file_mode = "a" if append else "w"
+    _OUTPUT_TEE_LOG_FILE = open(log_file_path, file_mode, encoding="utf-8", buffering=1)
 
     sys.stdout = _OutputTee(_OUTPUT_TEE_ORIGINAL_STDOUT, _OUTPUT_TEE_LOG_FILE)  # type: ignore[assignment]
     sys.stderr = _OutputTee(_OUTPUT_TEE_ORIGINAL_STDERR, _OUTPUT_TEE_LOG_FILE)  # type: ignore[assignment]
@@ -816,6 +819,174 @@ def _save_task_checkpoint(
     return checkpoint_path
 
 
+def _checkpoint_task_index(checkpoint_path: object) -> int:
+    """Return the completed-task id encoded in a ``task_<i>.pt`` filename.
+
+    Args:
+        checkpoint_path: Path to a checkpoint written by ``_save_task_checkpoint``.
+
+    Returns:
+        The integer task id parsed from the filename (e.g. ``task_4.pt`` -> ``4``).
+
+    Raises:
+        ValueError: If the filename does not end with an integer task id.
+    """
+    stem = Path(checkpoint_path).stem
+    return int(stem.split("_")[-1])
+
+
+def _discover_task_checkpoints(checkpoints_dir: Path) -> dict[int, Path]:
+    """Map completed task ids to their checkpoint files inside ``checkpoints_dir``.
+
+    Args:
+        checkpoints_dir: Directory containing ``task_<i>.pt`` files.
+
+    Returns:
+        Dict of ``task_id -> checkpoint Path`` for every parseable checkpoint.
+    """
+    discovered: dict[int, Path] = {}
+    for candidate in checkpoints_dir.glob("task_*.pt"):
+        try:
+            discovered[_checkpoint_task_index(candidate)] = candidate
+        except ValueError:
+            continue
+    return discovered
+
+
+def _resolve_resume_plan(args: object, resume_request: str) -> dict:
+    """Resolve where to resume an interrupted experiment from.
+
+    The ``resume_request`` may point at an experiment log directory (whose
+    ``checkpoints/`` folder is scanned) or directly at a ``task_<i>.pt`` file.
+    The optional ``args.resume_task`` overrides which task training resumes at
+    (loading ``task_<resume_task-1>.pt``); otherwise we continue one task past
+    the latest available checkpoint.
+
+    Args:
+        args: Parsed experiment arguments (read ``resume_task``).
+        resume_request: Value of ``--resume`` (directory or checkpoint file).
+
+    Returns:
+        Dict with ``experiment_dir`` (str), ``tf_dir`` (str),
+        ``resume_from_task`` (int), and ``checkpoint_path`` (str or ``None``).
+
+    Raises:
+        SystemExit: If the path or requested checkpoint cannot be found.
+    """
+    request_path = Path(resume_request).expanduser()
+    if request_path.is_file():
+        checkpoints_dir = request_path.parent
+        experiment_dir = checkpoints_dir.parent
+        explicit_checkpoint: Path | None = request_path
+    else:
+        experiment_dir = request_path
+        checkpoints_dir = request_path / "checkpoints"
+        explicit_checkpoint = None
+
+    if not checkpoints_dir.is_dir():
+        raise SystemExit(
+            "Cannot resume: no checkpoints directory at {}".format(checkpoints_dir)
+        )
+
+    available_checkpoints = _discover_task_checkpoints(checkpoints_dir)
+    resume_task_override = getattr(args, "resume_task", None)
+
+    if explicit_checkpoint is not None and resume_task_override is None:
+        checkpoint_path: Path | None = explicit_checkpoint
+        resume_from_task = _checkpoint_task_index(explicit_checkpoint) + 1
+    elif resume_task_override is not None:
+        resume_from_task = int(resume_task_override)
+        needed_task = resume_from_task - 1
+        if needed_task < 0:
+            checkpoint_path = None
+        elif needed_task in available_checkpoints:
+            checkpoint_path = available_checkpoints[needed_task]
+        else:
+            raise SystemExit(
+                "Cannot resume at task {}: required checkpoint task_{}.pt not found in {}".format(
+                    resume_from_task, needed_task, checkpoints_dir
+                )
+            )
+    else:
+        if not available_checkpoints:
+            raise SystemExit(
+                "Cannot resume: no task_<i>.pt checkpoints found in {}".format(
+                    checkpoints_dir
+                )
+            )
+        latest_task = max(available_checkpoints)
+        checkpoint_path = available_checkpoints[latest_task]
+        resume_from_task = latest_task + 1
+
+    tf_dir = experiment_dir / "tfdir"
+    os.makedirs(tf_dir, exist_ok=True)
+
+    return {
+        "experiment_dir": str(experiment_dir),
+        "tf_dir": str(tf_dir),
+        "resume_from_task": resume_from_task,
+        "checkpoint_path": str(checkpoint_path) if checkpoint_path else None,
+    }
+
+
+def _load_checkpoint_into_model(
+    model: torch.nn.Module, checkpoint_path: str, args: object
+) -> None:
+    """Load a task checkpoint's weights into ``model`` for resuming.
+
+    Args:
+        model: Model instance to receive the checkpoint weights.
+        checkpoint_path: Path to a ``task_<i>.pt`` file written by
+            ``_save_task_checkpoint``.
+        args: Parsed experiment arguments (read ``cuda`` for the map location).
+
+    Raises:
+        SystemExit: If the checkpoint cannot be read or has no usable state dict.
+    """
+    path = Path(checkpoint_path).expanduser()
+    if not path.exists():
+        raise SystemExit("Resume checkpoint does not exist: {}".format(path))
+
+    map_location = (
+        "cuda" if getattr(args, "cuda", False) and torch.cuda.is_available() else "cpu"
+    )
+    try:
+        checkpoint = torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(path, map_location=map_location)
+
+    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        checkpoint_state_dict = checkpoint["state_dict"]
+    elif isinstance(checkpoint, dict):
+        checkpoint_state_dict = checkpoint
+    else:
+        raise SystemExit(
+            "Unsupported checkpoint format at {}; expected a dict with 'state_dict'.".format(
+                path
+            )
+        )
+
+    model_state_dict = model.state_dict()
+    filtered_state_dict = {
+        key: value
+        for key, value in checkpoint_state_dict.items()
+        if key in model_state_dict
+    }
+    incompatible = model.load_state_dict(filtered_state_dict, strict=False)
+
+    print(
+        "Loaded resume checkpoint: {} (matched keys: {} / {})".format(
+            path, len(filtered_state_dict), len(model_state_dict)
+        )
+    )
+    if incompatible.missing_keys:
+        print(
+            "Missing {} model key(s) not present in checkpoint.".format(
+                len(incompatible.missing_keys)
+            )
+        )
+
+
 def life_experience(model, inc_loader, args):
     result_val_a = []
     result_test_a = []
@@ -856,10 +1027,24 @@ def life_experience(model, inc_loader, args):
     use_amp = bool(getattr(args, "amp", False) and args.cuda)
     if getattr(args, "model", "") == "eucr":
         use_amp = False
+    resume_from_task = int(getattr(args, "resume_from_task", 0) or 0)
     log_state(
         args.state_logging,
         "Life experience start: {} tasks queued".format(inc_loader.n_tasks),
     )
+    if resume_from_task > 0:
+        log_state(
+            args.state_logging,
+            "Resuming from checkpoint: tasks 0-{} will be replayed to rebuild "
+            "their loaders without retraining; training continues at task {}.".format(
+                resume_from_task - 1, resume_from_task
+            ),
+        )
+        print(
+            "Resuming experiment at task {} (skipping {} completed task(s)).".format(
+                resume_from_task, resume_from_task
+            )
+        )
     if task_epoch_schedule:
         log_state(
             args.state_logging,
@@ -881,6 +1066,25 @@ def life_experience(model, inc_loader, args):
         train_task_loaders.append(train_loader)
         test_task_loaders.append(test_loader)
         current_task = task_info["task"]
+
+        # When resuming an interrupted experiment, advance the loader for tasks
+        # already trained (so their loaders exist for evaluating retention) but
+        # skip retraining, zero-shot eval, metric dumps, and checkpoint writes.
+        # The model weights were restored from the resume checkpoint in main().
+        if current_task < resume_from_task:
+            log_state(
+                args.state_logging,
+                "Skipping completed task {} ({}/{}) while resuming".format(
+                    current_task, task_i + 1, inc_loader.n_tasks
+                ),
+            )
+            print(
+                "Skipping completed task {} (loaded from checkpoint).".format(
+                    current_task
+                )
+            )
+            continue
+
         task_n_epochs = task_epoch_schedule.get(current_task, base_n_epochs)
         args.n_epochs = task_n_epochs
         noise_label_for_task = _noise_label_for_metrics(args, train_loader)
@@ -1777,9 +1981,25 @@ def main():
     # Setup logging early so we can mirror all prints to a log file.
     timestamp = misc_utils.get_date_time()
     config_name = Path(config_chain[-1]).stem if config_chain else None
-    args.log_dir, args.tf_dir = misc_utils.log_dir(args, timestamp, config_name)
+
+    # When resuming an interrupted run, reuse its existing log directory and
+    # continue after the latest task checkpoint instead of starting fresh.
+    resume_request = (getattr(args, "resume", "") or "").strip()
+    if resume_request:
+        resume_plan = _resolve_resume_plan(args, resume_request)
+        args.log_dir = resume_plan["experiment_dir"]
+        args.tf_dir = resume_plan["tf_dir"]
+        args.resume_from_task = resume_plan["resume_from_task"]
+        args.resume_checkpoint = resume_plan["checkpoint_path"]
+    else:
+        args.log_dir, args.tf_dir = misc_utils.log_dir(args, timestamp, config_name)
+        args.resume_from_task = 0
+        args.resume_checkpoint = None
+
     if getattr(args, "state_logging", False):
-        enable_output_tee(os.path.join(args.log_dir, "terminal.log"))
+        enable_output_tee(
+            os.path.join(args.log_dir, "terminal.log"), append=bool(resume_request)
+        )
         log_state(
             args.state_logging,
             "Enabling terminal logging to {}".format(
@@ -1855,6 +2075,17 @@ def main():
         args.state_logging,
         "Model initialized on device {}".format(next(model.parameters()).device),
     )
+
+    # Restore weights from the resume checkpoint before training continues.
+    if getattr(args, "resume_checkpoint", None):
+        _load_checkpoint_into_model(model, args.resume_checkpoint, args)
+        log_state(
+            args.state_logging,
+            "Resumed model weights from {}; training continues at task {}".format(
+                args.resume_checkpoint, args.resume_from_task
+            ),
+        )
+
     # run model on loader
     if args.model == "iid2":
         # `iid2` is handled by the single-round entrypoint; delegate so we

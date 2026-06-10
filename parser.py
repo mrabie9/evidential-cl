@@ -193,6 +193,27 @@ def get_parser():
         action="store_true",
         help="Print high-level state messages to stdout for debugging",
     )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default="",
+        help=(
+            "Resume an interrupted experiment from its task checkpoints instead of "
+            "starting from task 0. Provide the experiment log directory (its "
+            "`checkpoints/` folder is reused and training continues after the latest "
+            "`task_<i>.pt`) or the path to a specific `task_<i>.pt` checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--resume_task",
+        type=int,
+        default=None,
+        help=(
+            "Override the task index to resume training at. Loads `task_<resume_task-1>.pt` "
+            "and trains tasks `resume_task` onward. Defaults to one past the latest "
+            "available checkpoint. Ignored unless --resume is set."
+        ),
+    )
 
     # data parameters
     parser.add_argument(
