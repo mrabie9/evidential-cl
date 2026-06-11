@@ -1,26 +1,19 @@
-# Model-specific overrides for EUCR (Evidential Uncertainty Channel Regularisation).
 model: eucr
 loader: task_incremental_loader
-
-# Optimiser (Adam required for evidential heads; AMP disabled — see main.py)
 optimizer: sgd
 amp: false
-lr: 0.0003
+lr: 0.003
 inner_steps: 1
 grad_clip_norm: 5.0
-
-# Evidential consolidation
-reg_lambda: 1000.0
+reg_lambda: 1000
 reg_granularity: channel
 importance_batches: 20
-# Importance readout: nonspecificity (omega) | discord (entropy of pignistic) | both
 eucr_uncertainty: both
-
-# Evidential backbone / probes
-probe_stages: "1,2,3,4"
+probe_stages: 1,2,3,4
 probe_loss_weight: 0.5
 nu: 0.9
 proto_factor: 3
 kl_warmup_epochs: 20
 eucr_depth: 18
 eucr_distance_metric: cosine
+eucr_head: pignistic

@@ -23,7 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from model.resnet1d import AdcIqAdapter, BasicBlock1D
-from model.evidential_modules import DM, Dempster_Shafer_module
+from model.evidential_modules import DM, Dempster_Shafer_module, pignistic_probability
 from utils.iq_features import append_iq_augmented_features
 
 
@@ -37,10 +37,12 @@ class EvidentialProbe(nn.Module):
         nu: float = 0.9,
         proto_factor: int = 20,
         metric: str = "cosine",
+        head: str = "dm",
     ) -> None:
         super().__init__()
         self.n_channels = n_channels
         self.n_classes = n_classes
+        self.head = str(head).lower()
         self.norm = nn.LayerNorm(n_channels)
         self.ds_module = Dempster_Shafer_module(
             n_feature_maps=n_channels,
@@ -56,10 +58,14 @@ class EvidentialProbe(nn.Module):
         pooled = F.adaptive_avg_pool1d(feat, 1).flatten(1)
         pooled = self.norm(pooled)
         mass = self.ds_module(pooled)
-        eu = self.dm_layer(mass)
+        readout = (
+            pignistic_probability(mass)
+            if self.head == "pignistic"
+            else self.dm_layer(mass)
+        )
         omega = mass[:, -1]
         beliefs = mass[:, :-1]
-        return eu, beliefs, omega
+        return readout, beliefs, omega
 
 
 class EucrResNet1D(nn.Module):
@@ -81,12 +87,14 @@ class EucrResNet1D(nn.Module):
         proto_factor: int = 20,
         in_channels: int = 2,
         metric: str = "cosine",
+        head: str = "dm",
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
         self.probe_stages = tuple(sorted(set(int(s) for s in probe_stages)))
         self.in_planes = 64
         self.metric = str(metric).lower()
+        self.head = str(head).lower()
 
         self.use_iq_aug_features = bool(getattr(args, "use_iq_aug_features", False))
         self.iq_aug_scaling_mode = str(getattr(args, "data_scaling", "none"))
@@ -136,6 +144,7 @@ class EucrResNet1D(nn.Module):
                     nu=nu,
                     proto_factor=proto_factor,
                     metric=self.metric,
+                    head=self.head,
                 )
                 for stage in self.probe_stages
             }
@@ -234,7 +243,11 @@ class EucrResNet1D(nn.Module):
         features = self.feat_norm(self.do(out))
 
         mass = self.ds_head(features)
-        eu = self.dm_head(mass)
+        eu = (
+            pignistic_probability(mass)
+            if self.head == "pignistic"
+            else self.dm_head(mass)
+        )
         omegas = mass[:, -1]
         beliefs = mass[:, :-1]
 

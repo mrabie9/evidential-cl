@@ -30,7 +30,7 @@ from model.detection_replay import (
     unpack_y_to_class_labels,
 )
 from model.eucr_backbone import EucrResNet1D
-from model.evidential_modules import EvidentialLoss
+from model.evidential_modules import EvidentialLoss, PignisticNLLLoss
 from utils import misc_utils
 from utils.training_metrics import macro_recall
 
@@ -106,11 +106,17 @@ class Net(nn.Module):
             probe_stages=probe_stages,
             proto_factor=int(self.cfg.proto_factor),
             metric=str(getattr(args, "eucr_distance_metric", "cosine")),
+            head=str(getattr(args, "eucr_head", "dm")),
         )
 
-        self.criterion = EvidentialLoss(
-            num_classes=n_outputs, kl_warmup_epochs=int(self.cfg.kl_warmup_epochs)
-        )
+        self.head_mode = str(getattr(args, "eucr_head", "dm")).lower()
+        if self.head_mode == "pignistic":
+            # Pignistic head emits a proper distribution -> NLL, no KL warm-up.
+            self.criterion = PignisticNLLLoss(num_classes=n_outputs)
+        else:
+            self.criterion = EvidentialLoss(
+                num_classes=n_outputs, kl_warmup_epochs=int(self.cfg.kl_warmup_epochs)
+            )
 
         self.reg_lambda = float(self.cfg.reg_lambda)
         self.probe_loss_weight = float(self.cfg.probe_loss_weight)

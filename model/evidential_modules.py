@@ -238,6 +238,46 @@ class DM(nn.Module):
         return torch.cat([beliefs, omega], dim=-1)
 
 
+def pignistic_probability(
+    mass: torch.Tensor, eps: float = _NUMERICAL_EPS
+) -> torch.Tensor:
+    """Smets pignistic transform of a singleton+ignorance mass function.
+
+    Splits the ignorance mass equally over the classes:
+    ``BetP_c = m({c}) + omega / C``. Unlike the :class:`DM` expected-utility
+    vector, the result is a genuine probability distribution (sums to one), so
+    cross-entropy / NLL on it is well defined.
+
+    Usage:
+        >>> betp = pignistic_probability(mass)  # mass: [B, C+1] -> [B, C]
+    """
+    beliefs = mass[..., :-1]
+    omega = mass[..., -1:]
+    num_classes = beliefs.size(-1)
+    betp = beliefs + omega / num_classes
+    return betp / betp.sum(dim=-1, keepdim=True).clamp_min(eps)
+
+
+class PignisticNLLLoss(nn.Module):
+    """Negative log-likelihood on the pignistic probability.
+
+    Drop-in replacement for :class:`EvidentialLoss` when the head emits a
+    pignistic distribution: same call signature ``(probs, targets, beliefs,
+    epoch)`` so callers need not branch, but ``beliefs`` / ``epoch`` are unused
+    (no BCE-style per-class term, no KL warm-up -- the uniform-attractor KL is
+    exactly what destabilised the expected-utility head).
+    """
+
+    def __init__(self, num_classes: int, eps: float = _NUMERICAL_EPS) -> None:
+        super().__init__()
+        self.num_classes = num_classes
+        self.eps = eps
+
+    def forward(self, probs, targets, beliefs=None, epoch=None):
+        log_probs = probs.clamp_min(self.eps).log()
+        return F.nll_loss(log_probs, targets)
+
+
 class EvidentialLoss(nn.Module):
     """BCE-style evidential loss on expected utilities with a KL warm-up gate."""
 
@@ -290,4 +330,6 @@ __all__ = [
     "Dempster_Shafer_module",
     "DM",
     "EvidentialLoss",
+    "PignisticNLLLoss",
+    "pignistic_probability",
 ]

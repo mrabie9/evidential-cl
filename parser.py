@@ -569,6 +569,14 @@ def get_parser():
         help="EUCR consolidation importance readout: nonspecificity (omega), "
         "discord (entropy of the pignistic probability), or both (DS total).",
     )
+    parser.add_argument(
+        "--eucr_head",
+        type=str,
+        default="dm",
+        choices=["dm", "pignistic"],
+        help="EUCR classification head: dm (expected-utility + evidential BCE) or "
+        "pignistic (BetP probability + NLL, no KL warm-up).",
+    )
 
     # WoE-SI (Weight-of-Evidence Synaptic Intelligence) parameters.
     parser.add_argument(
