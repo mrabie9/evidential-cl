@@ -34,10 +34,13 @@ import torch.nn as nn
 
 _UNCERTAINTY_MODES = ("nonspecificity", "discord", "both")
 
-# Per-task evidential heads / probes are NOT shared across tasks, so they are
-# excluded from consolidation. Everything else (conv1, layer1..layer4, the
-# feature LayerNorm, BatchNorm params, input adapter) is the shared backbone.
-_EXCLUDE_SUBSTRINGS = ("ds_head", "dm_head", "probes")
+# The shared backbone AND the single shared evidential head ``ds_head`` (its
+# prototypes + belief weights) carry old-task knowledge and must be consolidated:
+# leaving ``ds_head`` unprotected lets each task overwrite the class readout and
+# causes catastrophic forgetting (confirmed by a head-rollback probe). Excluded:
+# ``probes`` (auxiliary deep-supervision readouts -- their uncertainty is *read*
+# to derive importance, not itself protected) and ``dm_head`` (parameter-free).
+_EXCLUDE_SUBSTRINGS = ("dm_head", "probes")
 
 
 def is_consolidatable(name: str) -> bool:
@@ -137,11 +140,18 @@ def compute_importance(
             continue
         bsz = inputs.size(0)
 
-        out = backbone(inputs, return_probes=True)
-        probe_outs = out[-1]
-        if not probe_outs:
-            break
-        uncertainty = _backbone_uncertainty(probe_outs, uncertainty_mode)
+        _eu, _features, omegas, beliefs, probe_outs = backbone(
+            inputs, return_probes=True
+        )
+        # Differentiate the MAIN head's uncertainty (depends on ds_head) plus the
+        # per-stage probe uncertainty (depends on the backbone). The probes do not
+        # touch ds_head, so without the head term ds_head would get zero importance
+        # and stay unprotected.
+        uncertainty = _stage_uncertainty(beliefs, omegas, uncertainty_mode)
+        if probe_outs:
+            uncertainty = uncertainty + _backbone_uncertainty(
+                probe_outs, uncertainty_mode
+            )
         scalar = uncertainty.mean()
 
         backbone.zero_grad(set_to_none=True)
