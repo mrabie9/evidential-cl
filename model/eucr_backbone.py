@@ -88,6 +88,7 @@ class EucrResNet1D(nn.Module):
         in_channels: int = 2,
         metric: str = "cosine",
         head: str = "dm",
+        classes_per_task: Sequence[int] | None = None,
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
@@ -95,6 +96,23 @@ class EucrResNet1D(nn.Module):
         self.in_planes = 64
         self.metric = str(metric).lower()
         self.head = str(head).lower()
+
+        # Per-task evidential heads: each task owns a Dempster-Shafer head over
+        # only its own classes. Routing forward(x, t) through head t decouples
+        # stability from plasticity -- head t is only trained during task t (its
+        # params get no gradient otherwise, so it is naturally frozen afterwards),
+        # so new tasks keep full plasticity and old tasks suffer no head drift.
+        # The shared backbone is what consolidation protects.
+        self.classes_per_task = (
+            [int(c) for c in classes_per_task]
+            if classes_per_task
+            else [int(num_classes)]
+        )
+        offsets, running = [], 0
+        for count in self.classes_per_task:
+            offsets.append((running, running + count))
+            running += count
+        self._task_offsets = offsets
 
         self.use_iq_aug_features = bool(getattr(args, "use_iq_aug_features", False))
         self.iq_aug_scaling_mode = str(getattr(args, "data_scaling", "none"))
@@ -122,13 +140,23 @@ class EucrResNet1D(nn.Module):
         feat_dim = 512 * BasicBlock1D.expansion
         self.feat_norm = nn.LayerNorm(feat_dim)
 
-        self.ds_head = Dempster_Shafer_module(
-            n_feature_maps=feat_dim,
-            n_classes=num_classes,
-            n_prototypes=num_classes * proto_factor,
-            metric=self.metric,
+        self.ds_heads = nn.ModuleDict(
+            {
+                str(task_index): Dempster_Shafer_module(
+                    n_feature_maps=feat_dim,
+                    n_classes=count,
+                    n_prototypes=count * proto_factor,
+                    metric=self.metric,
+                )
+                for task_index, count in enumerate(self.classes_per_task)
+            }
         )
-        self.dm_head = DM(num_class=num_classes, nu=float(nu))
+        self.dm_heads = nn.ModuleDict(
+            {
+                str(task_index): DM(num_class=count, nu=float(nu))
+                for task_index, count in enumerate(self.classes_per_task)
+            }
+        )
 
         stage_channels = {
             1: 64 * BasicBlock1D.expansion,
@@ -221,9 +249,22 @@ class EucrResNet1D(nn.Module):
         return x
 
     # ------------------------------------------------------------------
+    def _task_readout(self, features: torch.Tensor, task: int):
+        """Run task ``task``'s head; return (local class scores, mass)."""
+        mass = self.ds_heads[str(task)](features)
+        if self.head == "pignistic":
+            scores = pignistic_probability(mass)
+        else:
+            n_classes = mass.size(-1) - 1
+            scores = self.dm_heads[str(task)](mass)[:, :n_classes]
+        return scores, mass
+
     def forward(
         self,
         x: torch.Tensor,
+        task: int | None = None,
+        *,
+        cil_all_seen_upto_task: int | None = None,
         return_features: bool = False,
         return_probes: bool = False,
     ):
@@ -242,14 +283,25 @@ class EucrResNet1D(nn.Module):
         out = F.adaptive_avg_pool1d(out, 1).flatten(1)
         features = self.feat_norm(self.do(out))
 
-        mass = self.ds_head(features)
-        eu = (
-            pignistic_probability(mass)
-            if self.head == "pignistic"
-            else self.dm_head(mass)
-        )
-        omegas = mass[:, -1]
-        beliefs = mass[:, :-1]
+        # Per-task head routing. ``task=None`` (e.g. importance estimation, which
+        # only needs the probes) skips the head entirely. Each task's local scores
+        # are scattered into a global ``[B, num_classes]`` tensor at the task's
+        # class offsets, so callers keep working in the global label space. CIL
+        # runs every seen head; TIL runs only the queried task's head.
+        eu = omegas = beliefs = None
+        if task is not None:
+            if cil_all_seen_upto_task is not None:
+                tasks_to_run = range(0, int(cil_all_seen_upto_task) + 1)
+            else:
+                tasks_to_run = [int(task)]
+            eu = features.new_zeros((features.size(0), self.num_classes))
+            for task_index in tasks_to_run:
+                scores, mass = self._task_readout(features, task_index)
+                start, end = self._task_offsets[task_index]
+                eu[:, start:end] = scores
+                if task_index == int(task):
+                    omegas = mass[:, -1]
+                    beliefs = mass[:, :-1]
 
         if return_probes:
             stage_feats = {1: s1, 2: s2, 3: s3, 4: s4}

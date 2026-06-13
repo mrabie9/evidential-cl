@@ -107,6 +107,7 @@ class Net(nn.Module):
             proto_factor=int(self.cfg.proto_factor),
             metric=str(getattr(args, "eucr_distance_metric", "cosine")),
             head=str(getattr(args, "eucr_head", "dm")),
+            classes_per_task=self.classes_per_task,
         )
 
         self.head_mode = str(getattr(args, "eucr_head", "dm")).lower()
@@ -206,7 +207,7 @@ class Net(nn.Module):
         *,
         cil_all_seen_upto_task: int | None = None,
     ) -> torch.Tensor:
-        eu = self.backbone(x)
+        eu = self.backbone(x, t, cil_all_seen_upto_task=cil_all_seen_upto_task)
         logits = eu[:, : self.n_outputs]
         return self._mask(logits, t, cil_all_seen_upto_task=cil_all_seen_upto_task)
 
@@ -233,7 +234,7 @@ class Net(nn.Module):
             # Evidential heads use exp/normalise chains that are unstable in AMP.
             with torch.autocast(device_type=amp_device, enabled=False):
                 eu, _features, _omegas, beliefs, probe_outs = self.backbone(
-                    x, return_probes=True
+                    x, t, return_probes=True
                 )
                 head_eu = eu[:, : self.n_outputs].float()
                 head_loss = self.criterion(head_eu, y_cls, beliefs, epoch)
