@@ -1939,6 +1939,42 @@ def _default_main_config_chain() -> List[str]:
     return chain
 
 
+def _parse_seed_list(raw: str) -> List[int]:
+    """Parse a comma-separated seed string like "0,39,55" into a list of ints."""
+    seeds: List[int] = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        seeds.append(int(token))
+    return seeds
+
+
+def _strip_argv_flags(argv: List[str], flags: set) -> List[str]:
+    """Drop the given flags (and their values) from an argv list.
+
+    Handles both ``--flag value`` and ``--flag=value`` forms. ``--single-seed``
+    is a boolean flag with no value; the others consume the following token.
+    """
+    boolean_flags = {"--single-seed"}
+    result: List[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        name = tok.split("=", 1)[0]
+        if name in flags:
+            # Skip the following value token for non-boolean flags using the
+            # space-separated form (i.e. no "=" embedded in this token).
+            if name not in boolean_flags and "=" not in tok:
+                i += 2
+            else:
+                i += 1
+            continue
+        result.append(tok)
+        i += 1
+    return result
+
+
 def main():
     config_parser = argparse.ArgumentParser(add_help=False)
     config_parser.add_argument(
@@ -1974,12 +2010,66 @@ def main():
     parser = file_parser.get_parser()
     args = parser.parse_args(remaining, namespace=base_args)
 
+    # Resolve the seed list. --single-seed forces the legacy single-run path
+    # (one seed = args.seed); otherwise --seeds (default "0,39,55") drives a sweep.
+    if getattr(args, "single_seed", False):
+        seeds = [args.seed]
+    else:
+        seeds = _parse_seed_list(getattr(args, "seeds", "") or "")
+        if not seeds:
+            seeds = [args.seed]
+
+    # When more than one seed is requested, act as a launcher: re-invoke this
+    # script once per seed in a fresh process so each run starts with clean RNG,
+    # CUDA, and global state. Each child is forced single-seed and shares one
+    # timestamp so all seeds group under the same experiment directory.
+    if len(seeds) > 1:
+        if (getattr(args, "resume", "") or "").strip():
+            raise SystemExit(
+                "--resume targets a single experiment directory; pass "
+                "--single-seed or a single --seeds value when resuming."
+            )
+
+        import subprocess
+
+        shared_timestamp = misc_utils.get_date_time()
+        base_argv = _strip_argv_flags(
+            sys.argv[1:], {"--seeds", "--seed", "--single-seed", "--timestamp"}
+        )
+        for idx, seed in enumerate(seeds):
+            child_argv = base_argv + [
+                "--single-seed",
+                "--seed",
+                str(seed),
+                "--timestamp",
+                shared_timestamp,
+            ]
+            print(
+                "[seed-sweep] launching seed {} ({} of {})".format(
+                    seed, idx + 1, len(seeds)
+                )
+            )
+            code = subprocess.call([sys.executable, sys.argv[0], *child_argv])
+            if code != 0:
+                raise SystemExit(
+                    "[seed-sweep] seed {} failed with exit code {}; "
+                    "aborting remaining seeds.".format(seed, code)
+                )
+        raise SystemExit(0)
+
+    # Single-seed run: ensure args.seed reflects the resolved seed.
+    args.seed = seeds[0]
+
     # Scale learning rate based on batch size (reference batch size = 128).
     # This applies uniformly across all models that rely on args.lr.
     args.lr = misc_utils.scale_learning_rate_for_batch_size(args.lr, args.batch_size)
 
     # Setup logging early so we can mirror all prints to a log file.
-    timestamp = misc_utils.get_date_time()
+    # Honor a timestamp passed down from the multi-seed launcher so all seeds
+    # in a sweep share one experiment directory.
+    timestamp = (
+        getattr(args, "timestamp", "") or ""
+    ).strip() or misc_utils.get_date_time()
     config_name = Path(config_chain[-1]).stem if config_chain else None
 
     # When resuming an interrupted run, reuse its existing log directory and
