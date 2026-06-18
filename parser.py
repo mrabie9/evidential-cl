@@ -289,6 +289,21 @@ def get_parser():
         ),
     )
     parser.add_argument(
+        "--snr_range",
+        dest="snr_range",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("MIN_DB", "MAX_DB"),
+        help=(
+            "Inclusive SNR window (in dB) used to filter samples for datasets that "
+            "carry a per-sample SNR label: deeprad's 'lbl_tr'/'lbl_te' column 0 and "
+            "uclresm's 'snr_db_tr'/'snr_db_te'. Only samples with "
+            "MIN_DB <= SNR <= MAX_DB are retained. Files without an SNR label "
+            "(e.g. rcn) are left unfiltered. Omit to disable filtering."
+        ),
+    )
+    parser.add_argument(
         "--use_iq_aug_features",
         default=False,
         action="store_true",

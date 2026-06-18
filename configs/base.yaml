@@ -4,6 +4,10 @@ arch: resnet1d
 loader: task_incremental_loader
 data_path: data/rff/radar/full
 data_scaling: normalize
+# Optional inclusive SNR window (dB) for datasets with a per-sample SNR label
+# (deeprad lbl_tr/lbl_te column 0; uclresm snr_db_tr/snr_db_te). Files without
+# it (e.g. rcn) are unfiltered.
+# snr_range: [0, 20]
 task_order_files: "t2-rcn,t0-rcn,t2-uclresm-25noise,t0-deeprad,t1-deeprad,t1-uclresm-25noise,t3-deeprad,t0-uclresm-25noise,t1-rcn,t2-deeprad"
 dataset: iq
 classes_per_it: 6

@@ -138,6 +138,78 @@ def _apply_data_scaling(
     )
 
 
+def _filter_samples_by_snr(
+    samples: np.ndarray | None,
+    labels,
+    snr_labels: np.ndarray | None,
+    snr_range: Sequence[float] | None,
+    source: str,
+) -> tuple[np.ndarray | None, object]:
+    """Keep only samples whose SNR (dB) lies within ``snr_range`` inclusive.
+
+    Datasets carry a per-sample SNR in dB under different keys: deeprad stores it
+    in the first column of its 2-D ``lbl_tr``/``lbl_te`` arrays, while uclresm stores
+    a 1-D ``snr_db_tr``/``snr_db_te`` vector. This helper masks ``samples`` and
+    ``labels`` down to the rows whose SNR falls inside the requested window. When
+    the dataset has no SNR label (``snr_labels is None``) or no window was requested
+    (``snr_range is None``), the inputs are returned unchanged so that mixed task
+    orders containing non-SNR-labelled files (e.g. rcn) still load.
+
+    Args:
+        samples: Sample array with the sample dimension first.
+        labels: Label array aligned to ``samples`` along axis 0.
+        snr_labels: Per-sample SNR label array. When 2-D, column 0 is read as the
+            SNR in dB (deeprad ``lbl_*``); a 1-D array is used directly (uclresm
+            ``snr_db_*``). When ``None`` filtering is skipped for this split.
+        snr_range: Inclusive ``(min_db, max_db)`` bounds, or ``None`` to disable.
+        source: Human-readable tag used in log/error messages.
+
+    Returns:
+        The filtered ``(samples, labels)`` pair, or the inputs unchanged when the
+        filter does not apply.
+
+    Raises:
+        ValueError: If the window removes every sample for this split.
+
+    Usage:
+        >>> import numpy as np
+        >>> x = np.arange(6).reshape(3, 2)
+        >>> snr = np.array([[-5.0], [3.0], [12.0]])
+        >>> xf, yf = _filter_samples_by_snr(x, np.array([0, 1, 2]), snr, (0, 10), "demo")
+        >>> yf.tolist()
+        [1]
+    """
+
+    if snr_range is None or samples is None or snr_labels is None:
+        return samples, labels
+
+    snr_min, snr_max = float(snr_range[0]), float(snr_range[1])
+    snr_values = np.asarray(snr_labels)
+    if snr_values.ndim == 2:
+        snr_values = snr_values[:, 0]
+    snr_values = snr_values.reshape(-1)
+
+    if snr_values.shape[0] != samples.shape[0]:
+        print(
+            f"[snr_filter] {source}: SNR label length {snr_values.shape[0]} does not "
+            f"match {samples.shape[0]} samples; skipping SNR filter."
+        )
+        return samples, labels
+
+    keep_mask = (snr_values >= snr_min) & (snr_values <= snr_max)
+    kept = int(keep_mask.sum())
+    if kept == 0:
+        raise ValueError(
+            f"[snr_filter] {source}: SNR window [{snr_min}, {snr_max}] dB removed all "
+            f"{snr_values.shape[0]} samples. Widen --snr_range."
+        )
+    print(
+        f"[snr_filter] {source}: keeping {kept}/{snr_values.shape[0]} samples "
+        f"with SNR in [{snr_min}, {snr_max}] dB."
+    )
+    return samples[keep_mask], np.asarray(labels)[keep_mask]
+
+
 def _resolve_task_file_order(all_files: Sequence[str], order_arg: str) -> List[str]:
     """Resolve IQ .npz task file ordering from a CLI argument.
 
@@ -558,6 +630,29 @@ class IncrementalLoader:
                         print(f"{fname} test: moved sample axis {before} -> {after}")
                         # x_test = x_test[:,0,:]
                         # print("Dropped ADC channel from test data, new shape:", x_test.shape)
+
+                # Optionally drop samples outside a requested SNR window. The SNR
+                # source differs by dataset: deeprad stores it in column 0 of
+                # lbl_tr/lbl_te, while uclresm stores a 1-D snr_db_tr/snr_db_te.
+                # Applied after the sample axis has been moved to the front so that
+                # samples, labels and SNR labels are all aligned along axis 0.
+                snr_range = getattr(self._args, "snr_range", None)
+                if snr_range is not None:
+                    x_train, y_train = _filter_samples_by_snr(
+                        x_train,
+                        y_train,
+                        _get(["lbl_tr", "lbl_train", "snr_db_tr"]),
+                        snr_range,
+                        f"{fname} train",
+                    )
+                    x_test, y_test = _filter_samples_by_snr(
+                        x_test,
+                        y_test,
+                        _get(["lbl_te", "lbl_test", "snr_db_te"]),
+                        snr_range,
+                        f"{fname} test",
+                    )
+
                 if x_train is not None and y_train is not None:
                     y_train = _normalize_label_array(
                         y_train, x_train.shape[0], f"{fname} train"
