@@ -1704,6 +1704,11 @@ def life_experience(model, inc_loader, args):
             return sum(float(v) for v in x) / len(x)
         return float(x)
 
+    # Headline classification F1 (cls_f1) values, stashed on args so main() can
+    # record them for the cross-seed sweep summary. Both default to None.
+    args.final_val_cls_f1 = None
+    args.final_tr_cls_f1 = None
+
     if (
         last_tr_cls_rec is not None
         or last_tr_cls_prec is not None
@@ -1712,6 +1717,7 @@ def life_experience(model, inc_loader, args):
         tr_rec = float(last_tr_cls_rec) if last_tr_cls_rec is not None else None
         tr_prec = float(last_tr_cls_prec) if last_tr_cls_prec is not None else None
         tr_f1 = float(last_tr_cls_f1) if last_tr_cls_f1 is not None else None
+        args.final_tr_cls_f1 = tr_f1
         tr_det = last_tr_det
         tr_fa = last_tr_fa
         parts = []
@@ -1732,6 +1738,7 @@ def life_experience(model, inc_loader, args):
         te_rec = _mean(result_val_a[-1])
         te_prec = _mean(result_val_prec[-1]) if result_val_prec else None
         te_f1 = _mean(result_val_f1[-1]) if result_val_f1 else None
+        args.final_val_cls_f1 = te_f1
         te_det = _mean(result_val_det_a[-1]) if result_val_det_a else None
         te_fa = _mean(result_val_det_fa[-1]) if result_val_det_fa else None
         parts = ["cls_rec={:.4f}".format(te_rec)]
@@ -1951,37 +1958,25 @@ def _parse_seed_list(raw: str) -> List[int]:
     return seeds
 
 
-# Order matches the stats returned by metrics.confusion_matrix().
-SWEEP_METRIC_LABELS = ["Diagonal Accuracy", "Final Accuracy", "Backward", "Forward"]
+# Classification F1 fields recorded per seed, paired with display labels.
+SWEEP_F1_FIELDS = [
+    ("val_cls_f1", "Validation cls_f1"),
+    ("tr_cls_f1", "Training cls_f1"),
+]
 
 
-def _stats_to_floats(stats):
-    """Convert a confusion_matrix stats list (tensors) to plain floats.
-
-    Returns None when stats is falsy (e.g. test stats were not computed).
-    """
-    if not stats:
-        return None
-    out = []
-    for s in stats:
-        try:
-            out.append(float(s))
-        except (TypeError, ValueError):
-            out.append(None)
-    return out
-
-
-def _write_seed_metrics(args, val_stats, test_stats, spent_time):
+def _write_seed_metrics(args, spent_time):
     """Write a small machine-readable metrics file into the seed's log dir.
 
-    The multi-seed launcher reads these back to build the cross-seed summary.
+    Records the headline classification F1 (cls_f1) values stashed on ``args``
+    by life_experience. The multi-seed launcher reads these back to build the
+    cross-seed summary.
     """
     payload = {
         "seed": args.seed,
-        "val": _stats_to_floats(val_stats),
-        "test": _stats_to_floats(test_stats),
+        "val_cls_f1": getattr(args, "final_val_cls_f1", None),
+        "tr_cls_f1": getattr(args, "final_tr_cls_f1", None),
         "runtime_seconds": float(spent_time),
-        "labels": SWEEP_METRIC_LABELS,
     }
     path = os.path.join(args.log_dir, "seed_metrics.json")
     try:
@@ -1992,10 +1987,10 @@ def _write_seed_metrics(args, val_stats, test_stats, spent_time):
 
 
 def _write_sweep_summary(experiment_root, seeds):
-    """Aggregate per-seed metrics into a cross-seed results.txt summary.
+    """Aggregate per-seed cls_f1 into a cross-seed results.txt summary.
 
-    Reads each seed's seed_metrics.json and writes mean +/- std for every
-    metric (and runtime) to ``<experiment_root>/results.txt``.
+    Reads each seed's seed_metrics.json and writes mean +/- std of the
+    classification F1 (and runtime) to ``<experiment_root>/results.txt``.
     """
     per_seed = []
     for seed in seeds:
@@ -2004,44 +1999,40 @@ def _write_sweep_summary(experiment_root, seeds):
             with open(path, "r", encoding="utf-8") as f:
                 per_seed.append(json.load(f))
         except (OSError, ValueError):
-            per_seed.append(
-                {"seed": seed, "val": None, "test": None, "runtime_seconds": None}
-            )
+            per_seed.append({"seed": seed})
 
     lines = [
-        "Seed-sweep summary",
+        "Seed-sweep summary (classification F1)",
         "Seeds: {}".format(", ".join(str(s) for s in seeds)),
         "Runs:  {}".format(len(seeds)),
         "",
+        "cls_f1 mean +/- std:",
     ]
 
-    for split in ("val", "test"):
-        vectors = [m.get(split) for m in per_seed if m.get(split)]
-        if not vectors:
+    for field, label in SWEEP_F1_FIELDS:
+        vals = [
+            m.get(field) for m in per_seed if isinstance(m.get(field), (int, float))
+        ]
+        if not vals:
             continue
-        lines.append("[{}] mean +/- std (n={})".format(split.upper(), len(vectors)))
-        for i, label in enumerate(SWEEP_METRIC_LABELS):
-            vals = [v[i] for v in vectors if i < len(v) and v[i] is not None]
-            if not vals:
-                continue
-            mean = sum(vals) / len(vals)
-            if len(vals) > 1:
-                var = sum((x - mean) ** 2 for x in vals) / (len(vals) - 1)
-                std = var**0.5
-            else:
-                std = 0.0
-            per_seed_str = ", ".join("{:.4f}".format(x) for x in vals)
-            lines.append(
-                "  {:<18}: {:.4f} +/- {:.4f}   [{}]".format(
-                    label, mean, std, per_seed_str
-                )
+        mean = sum(vals) / len(vals)
+        if len(vals) > 1:
+            var = sum((x - mean) ** 2 for x in vals) / (len(vals) - 1)
+            std = var**0.5
+        else:
+            std = 0.0
+        per_seed_str = ", ".join("{:.4f}".format(x) for x in vals)
+        lines.append(
+            "  {:<20} (n={}): {:.4f} +/- {:.4f}   [{}]".format(
+                label, len(vals), mean, std, per_seed_str
             )
-        lines.append("")
+        )
+    lines.append("")
 
     runtimes = [
         m.get("runtime_seconds")
         for m in per_seed
-        if m.get("runtime_seconds") is not None
+        if isinstance(m.get("runtime_seconds"), (int, float))
     ]
     if runtimes:
         lines.append(
@@ -2330,7 +2321,7 @@ def main():
         spent_time_hours = spent_time / 3600.0
 
         # save results in files or print on terminal
-        val_stats, test_stats = save_results(
+        save_results(
             args,
             result_val_t,
             result_val_a,
@@ -2339,8 +2330,8 @@ def main():
             model,
             spent_time,
         )
-        # Emit a machine-readable per-seed metrics file for the sweep summary.
-        _write_seed_metrics(args, val_stats, test_stats, spent_time)
+        # Emit a machine-readable per-seed cls_f1 file for the sweep summary.
+        _write_seed_metrics(args, spent_time)
         log_state(
             args.state_logging,
             "Results saved; total runtime {:.2f}h".format(spent_time_hours),
