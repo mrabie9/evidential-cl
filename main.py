@@ -4,6 +4,7 @@ import importlib
 import datetime
 import argparse
 import atexit
+import json
 import time
 import os
 import sys
@@ -1950,6 +1951,117 @@ def _parse_seed_list(raw: str) -> List[int]:
     return seeds
 
 
+# Order matches the stats returned by metrics.confusion_matrix().
+SWEEP_METRIC_LABELS = ["Diagonal Accuracy", "Final Accuracy", "Backward", "Forward"]
+
+
+def _stats_to_floats(stats):
+    """Convert a confusion_matrix stats list (tensors) to plain floats.
+
+    Returns None when stats is falsy (e.g. test stats were not computed).
+    """
+    if not stats:
+        return None
+    out = []
+    for s in stats:
+        try:
+            out.append(float(s))
+        except (TypeError, ValueError):
+            out.append(None)
+    return out
+
+
+def _write_seed_metrics(args, val_stats, test_stats, spent_time):
+    """Write a small machine-readable metrics file into the seed's log dir.
+
+    The multi-seed launcher reads these back to build the cross-seed summary.
+    """
+    payload = {
+        "seed": args.seed,
+        "val": _stats_to_floats(val_stats),
+        "test": _stats_to_floats(test_stats),
+        "runtime_seconds": float(spent_time),
+        "labels": SWEEP_METRIC_LABELS,
+    }
+    path = os.path.join(args.log_dir, "seed_metrics.json")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+    except OSError:
+        pass
+
+
+def _write_sweep_summary(experiment_root, seeds):
+    """Aggregate per-seed metrics into a cross-seed results.txt summary.
+
+    Reads each seed's seed_metrics.json and writes mean +/- std for every
+    metric (and runtime) to ``<experiment_root>/results.txt``.
+    """
+    per_seed = []
+    for seed in seeds:
+        path = os.path.join(experiment_root, str(seed), "seed_metrics.json")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                per_seed.append(json.load(f))
+        except (OSError, ValueError):
+            per_seed.append(
+                {"seed": seed, "val": None, "test": None, "runtime_seconds": None}
+            )
+
+    lines = [
+        "Seed-sweep summary",
+        "Seeds: {}".format(", ".join(str(s) for s in seeds)),
+        "Runs:  {}".format(len(seeds)),
+        "",
+    ]
+
+    for split in ("val", "test"):
+        vectors = [m.get(split) for m in per_seed if m.get(split)]
+        if not vectors:
+            continue
+        lines.append("[{}] mean +/- std (n={})".format(split.upper(), len(vectors)))
+        for i, label in enumerate(SWEEP_METRIC_LABELS):
+            vals = [v[i] for v in vectors if i < len(v) and v[i] is not None]
+            if not vals:
+                continue
+            mean = sum(vals) / len(vals)
+            if len(vals) > 1:
+                var = sum((x - mean) ** 2 for x in vals) / (len(vals) - 1)
+                std = var**0.5
+            else:
+                std = 0.0
+            per_seed_str = ", ".join("{:.4f}".format(x) for x in vals)
+            lines.append(
+                "  {:<18}: {:.4f} +/- {:.4f}   [{}]".format(
+                    label, mean, std, per_seed_str
+                )
+            )
+        lines.append("")
+
+    runtimes = [
+        m.get("runtime_seconds")
+        for m in per_seed
+        if m.get("runtime_seconds") is not None
+    ]
+    if runtimes:
+        lines.append(
+            "Total runtime (all seeds): {:.2f} hours".format(sum(runtimes) / 3600.0)
+        )
+        lines.append(
+            "Per-seed runtime hours: {}".format(
+                ", ".join("{:.2f}".format(r / 3600.0) for r in runtimes)
+            )
+        )
+
+    out = os.path.join(experiment_root, "results.txt")
+    try:
+        with open(out, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        print("[seed-sweep] wrote cross-seed summary to {}".format(out))
+    except OSError:
+        pass
+
+
 def _strip_argv_flags(argv: List[str], flags: set) -> List[str]:
     """Drop the given flags (and their values) from an argv list.
 
@@ -2033,6 +2145,13 @@ def main():
         import subprocess
 
         shared_timestamp = misc_utils.get_date_time()
+        # Reconstruct the shared experiment directory (parent of the per-seed
+        # dirs) using the same layout as misc_utils.log_dir().
+        sweep_config_name = Path(config_chain[-1]).stem if config_chain else None
+        dir_name = sweep_config_name if sweep_config_name else args.model
+        experiment_root = os.path.join(
+            args.log_dir, dir_name, "{}-{}".format(args.expt_name, shared_timestamp)
+        )
         base_argv = _strip_argv_flags(
             sys.argv[1:], {"--seeds", "--seed", "--single-seed", "--timestamp"}
         )
@@ -2055,6 +2174,7 @@ def main():
                     "[seed-sweep] seed {} failed with exit code {}; "
                     "aborting remaining seeds.".format(seed, code)
                 )
+        _write_sweep_summary(experiment_root, seeds)
         raise SystemExit(0)
 
     # Single-seed run: ensure args.seed reflects the resolved seed.
@@ -2210,7 +2330,7 @@ def main():
         spent_time_hours = spent_time / 3600.0
 
         # save results in files or print on terminal
-        save_results(
+        val_stats, test_stats = save_results(
             args,
             result_val_t,
             result_val_a,
@@ -2219,6 +2339,8 @@ def main():
             model,
             spent_time,
         )
+        # Emit a machine-readable per-seed metrics file for the sweep summary.
+        _write_seed_metrics(args, val_stats, test_stats, spent_time)
         log_state(
             args.state_logging,
             "Results saved; total runtime {:.2f}h".format(spent_time_hours),
