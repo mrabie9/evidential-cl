@@ -12,3 +12,9 @@ woe_centering_mode: centered_uniform
 woe_mu_momentum: 0.9
 woe_importance_stride: 1
 woe_conflict_weighting: false
+# Regularisation granularity / mechanism: parameter | channel | output.
+#   parameter -- per-weight SI path integral (original WoE-SI).
+#   channel   -- same path integral, omega collapsed to per-output-channel.
+#   output    -- DS evidence distillation against a frozen teacher (functional,
+#                NOT on the SI path-integral scale -> needs its own woe_lambda).
+woe_reg_level: parameter

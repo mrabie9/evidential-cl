@@ -60,6 +60,7 @@ def _make_args(loader: str, **overrides) -> object:
     o.woe_mu_momentum = overrides.get("woe_mu_momentum", 0.9)
     o.woe_importance_stride = overrides.get("woe_importance_stride", 1)
     o.woe_conflict_weighting = overrides.get("woe_conflict_weighting", False)
+    o.woe_reg_level = overrides.get("woe_reg_level", "parameter")
     return o
 
 
@@ -297,6 +298,118 @@ def test_importance_stride_runs_and_is_finite() -> None:
     for _ in range(6):
         model.observe(x, y1, 1)
     assert math.isfinite(_cumulative_omega(model))
+
+
+# ----------------------------------------------------------------------
+# Regularisation level: channel-grouped importance and output-level distillation
+# ----------------------------------------------------------------------
+def _max_within_channel_std(model: Net) -> float:
+    """Largest std *within* an output channel over all multi-dim Omega buffers.
+
+    For a channel-collapsed Omega every weight in a filter shares one value, so
+    this is ~0; for the per-parameter Omega the within-filter weights differ.
+    """
+    worst = 0.0
+    for name in model._tracked_names:
+        key = model._param_to_key[name]
+        omega = getattr(model, f"{key}_woe_omega")
+        if omega.dim() < 2:
+            continue
+        # std over the within-filter dims (everything except the channel axis 0).
+        per_channel_std = omega.flatten(1).std(dim=1)
+        worst = max(worst, float(per_channel_std.max().item()))
+    return worst
+
+
+def _run_two_tasks(model: Net) -> None:
+    x = torch.randn(8, 2, 128)
+    y0 = torch.randint(0, 3, (8,))
+    y1 = torch.randint(3, 6, (8,))
+    for _ in range(4):
+        model.observe(x, y0, 0)
+    for _ in range(4):
+        model.observe(x, y1, 1)
+    model.on_task_end()
+
+
+def test_invalid_reg_level_raises() -> None:
+    try:
+        Net(2, 6, 2, _make_args("task_incremental_loader", woe_reg_level="bogus"))
+    except ValueError:
+        return
+    raise AssertionError("woe_reg_level='bogus' should raise ValueError")
+
+
+def test_channel_mode_collapses_omega_within_channel() -> None:
+    """Channel mode makes every Omega buffer exactly uniform within each channel.
+
+    Contrasted against parameter mode on identical data/seed: the collapse drives
+    the within-channel spread to zero while the per-weight Omega genuinely varies
+    (the absolute scale is tiny because Omega is feature_dim**2-normalised, so the
+    two modes are compared relative to each other rather than to a fixed epsilon).
+    """
+    torch.manual_seed(20)
+    channel = Net(
+        2, 6, 2, _make_args("task_incremental_loader", woe_reg_level="channel")
+    )
+    _run_two_tasks(channel)
+    torch.manual_seed(20)
+    parameter = Net(
+        2, 6, 2, _make_args("task_incremental_loader", woe_reg_level="parameter")
+    )
+    _run_two_tasks(parameter)
+
+    channel_std = _max_within_channel_std(channel)
+    parameter_std = _max_within_channel_std(parameter)
+    assert _cumulative_omega(channel) > 0.0
+    # Channel collapse broadcasts one value per filter -> exactly uniform.
+    assert channel_std == 0.0
+    # Parameter mode keeps per-weight variation, so it is strictly less uniform.
+    assert parameter_std > channel_std
+
+
+def test_output_mode_distillation_zero_on_first_task() -> None:
+    """No teacher yet on task 0 -> the evidence-distillation penalty is exactly 0."""
+    torch.manual_seed(21)
+    model = Net(2, 6, 2, _make_args("task_incremental_loader", woe_reg_level="output"))
+    x = torch.randn(8, 2, 128)
+    y = torch.randint(0, 3, (8,))
+    for _ in range(4):
+        model.observe(x, y, 0)
+        assert model.teacher is None
+        assert float(model._evidence_distillation_loss(x, 0).item()) == 0.0
+
+
+def test_output_mode_distillation_positive_after_teacher() -> None:
+    """Once a teacher is frozen and the student moves, the penalty is > 0 and finite."""
+    torch.manual_seed(22)
+    model = Net(2, 6, 2, _make_args("task_incremental_loader", woe_reg_level="output"))
+    x = torch.randn(8, 2, 128)
+    y0 = torch.randint(0, 3, (8,))
+    y1 = torch.randint(3, 6, (8,))
+    for _ in range(4):
+        model.observe(x, y0, 0)
+    # Crossing to task 1 consolidates task 0 and snapshots the teacher.
+    for _ in range(4):
+        model.observe(x, y1, 1)
+    assert model.teacher is not None
+    penalty = float(model._evidence_distillation_loss(x, 1).item())
+    assert math.isfinite(penalty)
+    assert penalty > 0.0
+
+
+def test_output_mode_til_and_cil_paths_run_finite() -> None:
+    for loader in ("task_incremental_loader", "class_incremental_loader"):
+        torch.manual_seed(23)
+        model = Net(2, 6, 2, _make_args(loader, woe_reg_level="output"))
+        _run_two_tasks(model)
+        assert model.teacher is not None
+        x = torch.randn(8, 2, 128)
+        penalty = float(model._evidence_distillation_loss(x, 1).item())
+        assert math.isfinite(penalty)
+        assert penalty >= 0.0
+        # Output mode uses no path integral: Omega stays at zero.
+        assert _cumulative_omega(model) == 0.0
 
 
 # ----------------------------------------------------------------------

@@ -55,6 +55,7 @@ runnable in both TIL and CIL with no harness changes.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -76,6 +77,13 @@ from utils.class_weighted_loss import classification_cross_entropy
 # Pure functional core (imported directly by the unit tests)
 # ======================================================================
 _CENTERING_MODES = ("centered_uniform", "raw_uniform", "full_lc")
+# Granularity / mechanism of the anchor:
+#   "parameter" -- per-weight SI path integral (the original WoE-SI penalty).
+#   "channel"   -- the same path integral, but omega collapsed to per-output-channel
+#                  at consolidation so whole filters are protected, not single weights.
+#   "output"    -- no path integral at all: distil the DS output evidence
+#                  (w_plus / w_minus) of a frozen end-of-task teacher (LwF-style).
+_REG_LEVELS = ("parameter", "channel", "output")
 
 
 def compute_weights_of_evidence(
@@ -222,6 +230,11 @@ class WoeSiConfig:
     * ``woe_mu_momentum`` -- EMA momentum for feature means (default ``0.9``).
     * ``woe_importance_stride`` -- compute ``h_i`` every ``k`` steps (default 1).
     * ``woe_conflict_weighting`` -- enable the conflict ablation (default False).
+    * ``woe_reg_level`` -- regularisation granularity / mechanism, one of
+      ``{"parameter", "channel", "output"}`` (default ``"parameter"``). See
+      ``_REG_LEVELS``. ``"output"`` is a functional (evidence-distillation)
+      penalty and is *not* on the SI path-integral scale, so it needs its own
+      ``woe_lambda``.
     """
 
     inner_steps: int = 1
@@ -233,6 +246,7 @@ class WoeSiConfig:
     woe_mu_momentum: float = 0.9
     woe_importance_stride: int = 1
     woe_conflict_weighting: bool = False
+    woe_reg_level: str = "parameter"
 
     optimizer: str = "sgd"
     clipgrad: Optional[float] = 100.0
@@ -295,6 +309,12 @@ class Net(DetectionReplayMixin, nn.Module):
                 f"woe_centering_mode must be one of {_CENTERING_MODES}, "
                 f"got {self.cfg.woe_centering_mode!r}"
             )
+        if self.cfg.woe_reg_level not in _REG_LEVELS:
+            raise ValueError(
+                f"woe_reg_level must be one of {_REG_LEVELS}, "
+                f"got {self.cfg.woe_reg_level!r}"
+            )
+        self.reg_level = str(self.cfg.woe_reg_level)
         self.woe_lambda = float(self.cfg.woe_lambda)
         self.xi = float(self.cfg.woe_xi)
         self.centering_mode = str(self.cfg.woe_centering_mode)
@@ -319,6 +339,11 @@ class Net(DetectionReplayMixin, nn.Module):
         # Transient per-window scratch (h at window start, params at window start).
         self._window_h: Dict[str, torch.Tensor] = {}
         self._window_p_start: Dict[str, torch.Tensor] = {}
+        # Output-mode (evidence-distillation) state: frozen end-of-task snapshot of
+        # the net and the feature mean used to centre its evidence. Both stay None
+        # until the first consolidation, so the penalty is exactly 0 on task 0.
+        self.teacher: Optional[nn.Module] = None
+        self.teacher_feature_mean: Optional[torch.Tensor] = None
         self._initialise_woe_state()
 
     # ------------------------------------------------------------------
@@ -349,12 +374,15 @@ class Net(DetectionReplayMixin, nn.Module):
 
         self.net.train()
         metric_logits = None
+        # "parameter"/"channel" anchor a per-weight SI path integral; "output"
+        # uses a functional evidence-distillation penalty with no path integral.
+        use_path_integral = self.reg_level in ("parameter", "channel")
         for _ in range(self.cfg.inner_steps):
             # ----- 1) DS importance gradient h_i = dI_2/dtheta_i -----------
             # Computed at the *pre-step* parameters on a dedicated backward so it
             # never pollutes the CE gradient. Sampled once per importance window.
             window_start = self._step_in_task % self.importance_stride == 0
-            if window_start:
+            if use_path_integral and window_start:
                 self._capture_importance_gradient(x, t)
 
             # ----- 2) Standard CE update (drives the parameters) -----------
@@ -385,7 +413,11 @@ class Net(DetectionReplayMixin, nn.Module):
             else:
                 cls_tr_rec = 0.0
 
-            loss = self.cls_lambda * loss_ce + self.woe_lambda * self._surrogate_loss()
+            if self.reg_level == "output":
+                reg = self._evidence_distillation_loss(x, t)
+            else:
+                reg = self._surrogate_loss()
+            loss = self.cls_lambda * loss_ce + self.woe_lambda * reg
 
             loss.backward()
             if self.clipgrad is not None:
@@ -397,7 +429,7 @@ class Net(DetectionReplayMixin, nn.Module):
                 self._step_in_task % self.importance_stride
                 == self.importance_stride - 1
             )
-            if window_end:
+            if use_path_integral and window_end:
                 self._accumulate_path_integral()
 
             self._step_in_task += 1
@@ -474,16 +506,8 @@ class Net(DetectionReplayMixin, nn.Module):
             self._update_feature_mean(features.detach())
 
         active = self._active_class_indices(t, features.device)
-        readout = self.net.model.fc
-        active_weight = readout.weight[active]
-        active_bias = readout.bias[active]
-
-        weights = compute_weights_of_evidence(
-            features,
-            active_weight,
-            active_bias,
-            self.woe_feature_mean,
-            centering_mode=self.centering_mode,
+        weights = self._weights_of_evidence(
+            features, self.net.model.fc, active, self.woe_feature_mean
         )
         i2_per_sample = information_content(
             weights, conflict_weighting=self.conflict_weighting
@@ -507,6 +531,30 @@ class Net(DetectionReplayMixin, nn.Module):
         feature_count = features.shape[1]
         i2_per_sample = i2_per_sample / float(feature_count * feature_count)
         return i2_per_sample.mean()
+
+    # ------------------------------------------------------------------
+    def _weights_of_evidence(
+        self,
+        features: torch.Tensor,
+        readout: nn.Module,
+        active: torch.Tensor,
+        feature_mean: torch.Tensor,
+    ) -> torch.Tensor:
+        """Denoeux Eq 25 weights of evidence ``w_jk`` over the ``active`` classes.
+
+        Shared by the importance path (``_compute_information_content``) and the
+        output-mode distillation (``_evidence_distillation_loss``) so both centre
+        and slice the readout identically.
+        """
+        active_weight = readout.weight[active]
+        active_bias = readout.bias[active]
+        return compute_weights_of_evidence(
+            features,
+            active_weight,
+            active_bias,
+            feature_mean,
+            centering_mode=self.centering_mode,
+        )
 
     # ------------------------------------------------------------------
     def _capture_importance_gradient(self, x: torch.Tensor, t: int) -> None:
@@ -549,6 +597,12 @@ class Net(DetectionReplayMixin, nn.Module):
         because we protect only parameters that *built* committed evidence
         (positive path-integral contribution). The anchor and per-task
         accumulator are reset for the next task, as is the feature mean ``mu``.
+
+        In ``"channel"`` mode each multi-dim ``Omega`` buffer is collapsed to a
+        per-output-channel scalar (mean over the within-filter dims) and broadcast
+        back, so the quadratic anchor protects whole filters rather than single
+        weights. In ``"output"`` mode the path integral is unused; instead a frozen
+        teacher snapshot is taken here for the evidence-distillation penalty.
         """
         if self.current_task is None:
             return
@@ -560,14 +614,40 @@ class Net(DetectionReplayMixin, nn.Module):
             w_buf = getattr(self, f"{key}_woe_w")
             delta_total = param.detach() - prev
             omega.add_(torch.relu(w_buf) / (delta_total.pow(2) + self.xi))
+            if self.reg_level == "channel" and omega.dim() >= 2:
+                # Collapse to per-output-channel (dim 0 is the filter/class axis),
+                # mirroring model.eucr_consolidation.to_channel. Idempotent across
+                # tasks: an already-channel-uniform Omega stays uniform.
+                reduce_dims = tuple(range(1, omega.dim()))
+                per_channel = omega.mean(dim=reduce_dims, keepdim=True)
+                omega.copy_(per_channel.expand_as(omega))
             prev.copy_(param.detach())
             w_buf.zero_()
+        # Output mode distils a frozen end-of-task snapshot; capture it (and the
+        # feature mean it must centre with) *before* the per-task stats are reset.
+        if self.reg_level == "output":
+            self._snapshot_teacher()
         # Reset running feature stats for the next task.
         self.woe_feature_mean.zero_()
         self.woe_feature_mean_initialised.zero_()
         self._step_in_task = 0
         self._window_h.clear()
         self._window_p_start.clear()
+
+    # ------------------------------------------------------------------
+    def _snapshot_teacher(self) -> None:
+        """Freeze the current net + feature mean as the distillation teacher.
+
+        Mirrors ``model.lwf.Net._update_teacher``: a ``deepcopy`` in eval mode with
+        gradients disabled. The feature mean is snapshotted so the teacher centres
+        its evidence with the statistics of the task it was frozen on.
+        """
+        self.teacher = copy.deepcopy(self.net)
+        self.teacher.to(self._device())
+        self.teacher.eval()
+        for param in self.teacher.parameters():
+            param.requires_grad = False
+        self.teacher_feature_mean = self.woe_feature_mean.detach().clone()
 
     # ------------------------------------------------------------------
     def _surrogate_loss(self) -> torch.Tensor:
@@ -587,6 +667,58 @@ class Net(DetectionReplayMixin, nn.Module):
             prev = getattr(self, f"{key}_woe_prev")
             loss = loss + (omega * (param - prev).pow(2)).sum()
         return loss
+
+    # ------------------------------------------------------------------
+    def _evidence_distillation_loss(self, x: torch.Tensor, t: int) -> torch.Tensor:
+        """Output-level penalty: drift of the DS evidence vs. a frozen teacher.
+
+        Penalises how far the current net's per-class total evidence
+        ``(w_plus, w_minus)`` on previously-seen classes has moved from the frozen
+        end-of-task teacher's, on the current batch (and, when the detector replay
+        buffer is enabled and non-empty, on a replay batch too)::
+
+            L = mean_b  sum_{k in old}  (w+_s - w+_t)^2 + (w-_s - w-_t)^2
+
+        ``J^2``-normalised to match the ``I_2`` importance signal's scale (see
+        ``_compute_information_content``). Returns exactly ``0`` before the first
+        teacher exists, mirroring the SI penalty being 0 on the first task. The
+        running feature mean is EMA-updated here so output mode (which skips the
+        importance path) still tracks ``mu`` for centring.
+        """
+        features = self.net.forward_features(x, bn_training=False)
+        self._update_feature_mean(features.detach())
+        if self.teacher is None:
+            return torch.zeros(1, device=features.device)
+        active = self._previous_class_indices(t, features.device)
+        if active.numel() == 0:
+            return torch.zeros(1, device=features.device)
+
+        distill_x = x
+        if self.det_enabled:
+            replay = self._sample_det_memory()
+            if replay is not None:
+                distill_x = torch.cat([x, replay[0].to(x.device)], dim=0)
+                features = self.net.forward_features(distill_x, bn_training=False)
+
+        student_w = self._weights_of_evidence(
+            features, self.net.model.fc, active, self.woe_feature_mean
+        )
+        w_plus_s, w_minus_s = per_class_total_evidence(student_w)
+        with torch.no_grad():
+            teacher_features = self.teacher.forward_features(
+                distill_x, bn_training=False
+            )
+            teacher_w = self._weights_of_evidence(
+                teacher_features,
+                self.teacher.model.fc,
+                active,
+                self.teacher_feature_mean,
+            )
+            w_plus_t, w_minus_t = per_class_total_evidence(teacher_w)
+
+        feature_count = features.shape[1]
+        drift = (w_plus_s - w_plus_t).pow(2) + (w_minus_s - w_minus_t).pow(2)
+        return drift.sum(dim=1).mean() / float(feature_count * feature_count)
 
     # ------------------------------------------------------------------
     def _update_feature_mean(self, batch_features: torch.Tensor) -> None:
@@ -614,6 +746,26 @@ class Net(DetectionReplayMixin, nn.Module):
             indices = list(range(0, offset2))
         else:
             indices = list(range(offset1, offset2))
+        if self.noise_label is not None:
+            noise = int(self.noise_label)
+            if 0 <= noise < self.n_outputs and noise not in indices:
+                indices.append(noise)
+        indices = sorted(set(indices))
+        return torch.tensor(indices, dtype=torch.long, device=device)
+
+    # ------------------------------------------------------------------
+    def _previous_class_indices(self, t: int, device: torch.device) -> torch.Tensor:
+        """Output columns of classes from *completed* tasks ``< t`` (plus noise).
+
+        Used by the output-mode distillation to penalise evidence drift only on
+        previously-seen classes (analogous to ``model.lwf``'s previous-class ids).
+        The cumulative prior-class span is ``[0, offset1)`` in both TIL and CIL,
+        where ``offset1`` is the first column of the current task. Returns an empty
+        tensor on the first task.
+        """
+        offset1, _ = misc_utils.compute_offsets(t, self.classes_per_task)
+        offset1 = min(self.n_outputs, offset1)
+        indices = list(range(0, offset1))
         if self.noise_label is not None:
             noise = int(self.noise_label)
             if 0 <= noise < self.n_outputs and noise not in indices:

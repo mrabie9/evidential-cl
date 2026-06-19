@@ -661,6 +661,19 @@ def get_parser():
         action="store_true",
         help="WoE-SI: enable the kappa-style conflict-weighting ablation (default off).",
     )
+    parser.add_argument(
+        "--woe_reg_level",
+        type=str,
+        default="parameter",
+        choices=["parameter", "channel", "output"],
+        help=(
+            "WoE-SI regularisation granularity / mechanism. 'parameter': per-weight "
+            "SI path integral. 'channel': same path integral, omega collapsed to "
+            "per-output-channel. 'output': DS evidence distillation against a frozen "
+            "teacher (functional, not on the SI path-integral scale -> needs its own "
+            "woe_lambda)."
+        ),
+    )
 
     return parser
 
