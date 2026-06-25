@@ -289,12 +289,14 @@ def init_seed(seed):
     """
     print("Set seed", seed)
     random.seed(seed)
-    torch.cuda.cudnn_enabled = False
+    torch.cuda.cudnn_enabled = True
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
 
-    torch.backends.cudnn.enabled = False
+    torch.backends.cudnn.enabled = True
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def find_latest_checkpoint_name(folder_path):
