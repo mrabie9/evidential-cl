@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hyperparameter tuning harness for the ER Algorithm 4 learner."""
+"""Hyperparameter tuning harness for the C-MAML learner."""
 
 from __future__ import annotations
 import sys
@@ -9,12 +9,12 @@ try:
     from tuning.hyperparam_tuner import make_main
     from tuning.presets import TUNING_PRESETS
 except ModuleNotFoundError:
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(repo_root))
     from tuning.hyperparam_tuner import make_main
     from tuning.presets import TUNING_PRESETS
 
-main = make_main(TUNING_PRESETS["eralg4"])
+main = make_main(TUNING_PRESETS["cmaml"])
 
 if __name__ == "__main__":
     main()
