@@ -993,6 +993,7 @@ def life_experience(model, inc_loader, args):
     result_test_a = []
     result_val_prec = []
     result_val_f1 = []
+    result_test_f1 = []
     result_val_det_a = []
     result_test_det_a = []
     result_val_det_fa = []
@@ -1656,6 +1657,8 @@ def life_experience(model, inc_loader, args):
                 _split_eval_output(test_acc)
             )
             result_test_a.append(test_acc)
+            if test_f1 is not None:
+                result_test_f1.append(test_f1)
             if test_det_acc is not None:
                 result_test_det_a.append(test_det_acc)
             if test_det_fa is not None:
@@ -1708,6 +1711,8 @@ def life_experience(model, inc_loader, args):
     # record them for the cross-seed sweep summary. Both default to None.
     args.final_val_cls_f1 = None
     args.final_tr_cls_f1 = None
+    args.final_val_det = None
+    args.final_val_fa = None
 
     if (
         last_tr_cls_rec is not None
@@ -1741,6 +1746,8 @@ def life_experience(model, inc_loader, args):
         args.final_val_cls_f1 = te_f1
         te_det = _mean(result_val_det_a[-1]) if result_val_det_a else None
         te_fa = _mean(result_val_det_fa[-1]) if result_val_det_fa else None
+        args.final_val_det = te_det
+        args.final_val_fa = te_fa
         parts = ["cls_rec={:.4f}".format(te_rec)]
         if te_prec is not None:
             parts.append("cls_prec={:.4f}".format(te_prec))
@@ -1834,6 +1841,8 @@ def life_experience(model, inc_loader, args):
         _pad_results(result_val_det_fa),
         _pad_results(result_test_det_a),
         _pad_results(result_test_det_fa),
+        _pad_results(result_val_f1),
+        _pad_results(result_test_f1),
         time_spent,
     )
 
@@ -1876,10 +1885,34 @@ def estimate_memory_buffer_size_bytes(model: torch.nn.Module) -> int:
 
 
 def save_results(
-    args, result_val_t, result_val_a, result_test_t, result_test_a, model, spent_time
+    args,
+    result_val_t,
+    result_val_a,
+    result_test_t,
+    result_test_a,
+    model,
+    spent_time,
+    result_val_f1=None,
+    result_test_f1=None,
 ):
     fname = os.path.join(args.log_dir, "results")
     log_state(args.state_logging, "Saving results to {}".format(fname))
+
+    def _pick_metric_matrix(acc_matrix, f1_matrix, ref_t):
+        """Prefer the per-task F1 matrix for the confusion matrix when available.
+
+        Falls back to the accuracy/recall matrix if no F1 values were recorded
+        (e.g. evaluators that do not return F1) or if the F1 matrix row count
+        does not line up with the per-eval task ids in ``ref_t``.
+        """
+        if (
+            f1_matrix is not None
+            and torch.is_tensor(f1_matrix)
+            and f1_matrix.numel() > 0
+            and f1_matrix.size(0) == torch.as_tensor(ref_t).numel()
+        ):
+            return f1_matrix, "F1"
+        return acc_matrix, "Accuracy"
 
     size_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
     size_gb = size_bytes / (1024**3)
@@ -1888,9 +1921,17 @@ def save_results(
     print("Model size: {:.4f} GB".format(size_gb))
     print("Memory buffer size: {:.4f} GB".format(buffer_gb))
 
-    # save confusion matrix and print one line of stats
+    # save confusion matrix and print one line of stats. Prefer per-task F1
+    # over recall/accuracy in the seed-level results.txt when F1 is available.
+    val_matrix, val_metric_name = _pick_metric_matrix(
+        result_val_a, result_val_f1, result_val_t
+    )
     val_stats = confusion_matrix(
-        result_val_t, result_val_a, args.log_dir, "results.txt"
+        result_val_t,
+        val_matrix,
+        args.log_dir,
+        "results.txt",
+        metric_name=val_metric_name,
     )
 
     one_liner = str(vars(args)) + " # val: "
@@ -1898,8 +1939,15 @@ def save_results(
 
     test_stats = 0
     if args.calc_test_accuracy:
+        test_matrix, test_metric_name = _pick_metric_matrix(
+            result_test_a, result_test_f1, result_test_t
+        )
         test_stats = confusion_matrix(
-            result_test_t, result_test_a, args.log_dir, "results.txt"
+            result_test_t,
+            test_matrix,
+            args.log_dir,
+            "results.txt",
+            metric_name=test_metric_name,
         )
         one_liner += " # test: " + " ".join(["%.3f" % stat for stat in test_stats])
     one_liner += " # sizes: model_gb={:.4f} mem_gb={:.4f}".format(size_gb, buffer_gb)
@@ -1964,6 +2012,13 @@ SWEEP_F1_FIELDS = [
     ("tr_cls_f1", "Training cls_f1"),
 ]
 
+# Detection fields (detection recall ``det`` and false-alarm rate ``fa``)
+# recorded per seed, paired with display labels.
+SWEEP_DET_FIELDS = [
+    ("val_det", "Validation det"),
+    ("val_fa", "Validation fa"),
+]
+
 
 def _write_seed_metrics(args, spent_time):
     """Write a small machine-readable metrics file into the seed's log dir.
@@ -1976,6 +2031,8 @@ def _write_seed_metrics(args, spent_time):
         "seed": args.seed,
         "val_cls_f1": getattr(args, "final_val_cls_f1", None),
         "tr_cls_f1": getattr(args, "final_tr_cls_f1", None),
+        "val_det": getattr(args, "final_val_det", None),
+        "val_fa": getattr(args, "final_val_fa", None),
         "runtime_seconds": float(spent_time),
     }
     path = os.path.join(args.log_dir, "seed_metrics.json")
@@ -2001,6 +2058,24 @@ def _write_sweep_summary(experiment_root, seeds):
         except (OSError, ValueError):
             per_seed.append({"seed": seed})
 
+    def _summary_line(field, label):
+        """Build a 'mean +/- std [per-seed]' line for one metric, or None."""
+        vals = [
+            m.get(field) for m in per_seed if isinstance(m.get(field), (int, float))
+        ]
+        if not vals:
+            return None
+        mean = sum(vals) / len(vals)
+        if len(vals) > 1:
+            var = sum((x - mean) ** 2 for x in vals) / (len(vals) - 1)
+            std = var**0.5
+        else:
+            std = 0.0
+        per_seed_str = ", ".join("{:.4f}".format(x) for x in vals)
+        return "  {:<20} (n={}): {:.4f} +/- {:.4f}   [{}]".format(
+            label, len(vals), mean, std, per_seed_str
+        )
+
     lines = [
         "Seed-sweep summary (classification F1)",
         "Seeds: {}".format(", ".join(str(s) for s in seeds)),
@@ -2010,24 +2085,20 @@ def _write_sweep_summary(experiment_root, seeds):
     ]
 
     for field, label in SWEEP_F1_FIELDS:
-        vals = [
-            m.get(field) for m in per_seed if isinstance(m.get(field), (int, float))
-        ]
-        if not vals:
-            continue
-        mean = sum(vals) / len(vals)
-        if len(vals) > 1:
-            var = sum((x - mean) ** 2 for x in vals) / (len(vals) - 1)
-            std = var**0.5
-        else:
-            std = 0.0
-        per_seed_str = ", ".join("{:.4f}".format(x) for x in vals)
-        lines.append(
-            "  {:<20} (n={}): {:.4f} +/- {:.4f}   [{}]".format(
-                label, len(vals), mean, std, per_seed_str
-            )
-        )
+        line = _summary_line(field, label)
+        if line is not None:
+            lines.append(line)
     lines.append("")
+
+    det_lines = [
+        line
+        for field, label in SWEEP_DET_FIELDS
+        if (line := _summary_line(field, label)) is not None
+    ]
+    if det_lines:
+        lines.append("detection (det / fa) mean +/- std:")
+        lines.extend(det_lines)
+        lines.append("")
 
     runtimes = [
         m.get("runtime_seconds")
@@ -2315,6 +2386,8 @@ def main():
             _,
             _,
             _,
+            result_val_f1,
+            result_test_f1,
             spent_time,
         ) = life_experience(model, loader, args)
 
@@ -2329,6 +2402,8 @@ def main():
             result_test_a,
             model,
             spent_time,
+            result_val_f1=result_val_f1,
+            result_test_f1=result_test_f1,
         )
         # Emit a machine-readable per-seed cls_f1 file for the sweep summary.
         _write_seed_metrics(args, spent_time)

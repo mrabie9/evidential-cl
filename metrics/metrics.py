@@ -28,7 +28,7 @@ def task_changes(result_t):
     return n_tasks, changes
 
 
-def confusion_matrix(result_t, result_a, log_dir, fname=None):
+def confusion_matrix(result_t, result_a, log_dir, fname=None, metric_name="Accuracy"):
     nt, changes = task_changes(result_t)
     fname = os.path.join(log_dir, fname)
 
@@ -55,8 +55,8 @@ def confusion_matrix(result_t, result_a, log_dir, fname=None):
         for row in range(result.size(0)):
             print(" ".join(["%.4f" % r for r in result[row]]), file=f)
         print("", file=f)
-        print("Diagonal Accuracy: %.4f" % acc.mean(), file=f)
-        print("Final Accuracy: %.4f" % fin.mean(), file=f)
+        print("Diagonal %s: %.4f" % (metric_name, acc.mean()), file=f)
+        print("Final %s: %.4f" % (metric_name, fin.mean()), file=f)
         print("Backward: %.4f" % bwt.mean(), file=f)
         print("Forward:  %.4f" % fwt.mean(), file=f)
         f.close()
@@ -72,7 +72,7 @@ def confusion_matrix(result_t, result_a, log_dir, fname=None):
             range(data.shape[0]), data[:, i], label=str(i), color=colors[i], linewidth=2
         )
 
-    plt.savefig(log_dir + "/" + "task_wise_accuracy.png")
+    plt.savefig(log_dir + "/" + "task_wise_f1.png")
 
     stats = []
     stats.append(acc.mean())

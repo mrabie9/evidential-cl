@@ -589,6 +589,8 @@ def run_single_trial(
                 result_val_det_fa,
                 result_test_det_a,
                 result_test_det_fa,
+                _result_val_f1,
+                _result_test_f1,
                 spent,
             ) = life_experience(model, loader, args)
     finally:
