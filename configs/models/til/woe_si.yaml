@@ -1,8 +1,8 @@
 model: woe_si
 loader: task_incremental_loader
 lr: 0.001
-woe_lambda: 30000.0
-woe_xi: 0.01
+woe_lambda: 3000.0
+woe_xi: 0.001
 woe_centering_mode: centered_uniform
 woe_mu_momentum: 0.9
 woe_importance_stride: 1
@@ -12,4 +12,4 @@ woe_conflict_weighting: false
 #   channel   -- same path integral, omega collapsed to per-output-channel.
 #   output    -- DS evidence distillation against a frozen teacher (functional,
 #                NOT on the SI path-integral scale -> needs its own woe_lambda).
-woe_reg_level: parameter
+woe_reg_level: channel

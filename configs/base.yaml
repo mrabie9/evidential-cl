@@ -9,6 +9,7 @@ data_scaling: normalize
 # it (e.g. rcn) are unfiltered.
 # snr_range: [0, 20]
 task_order_files: "t2-rcn,t0-rcn,t2-uclresm-25noise,t0-deeprad,t1-deeprad,t1-uclresm-25noise,t3-deeprad,t0-uclresm-25noise,t1-rcn,t2-deeprad"
+# task_order_files: "t0-deeprad,t1-deeprad,t3-deeprad,t2-deeprad"
 dataset: iq
 classes_per_it: 6
 val_rate: 1000

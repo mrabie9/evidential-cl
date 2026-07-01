@@ -1,20 +1,10 @@
-# Model-specific overrides for woe_si (Weight-of-Evidence Synaptic Intelligence).
 model: woe_si
 loader: class_incremental_loader
-
-lr: 0.001
-# Provisional, pending a re-tune: I_2 is now normalised by feature_dim**2 in
-# model/woe_si.py, so the old woe_lambda (0.9) gives a negligible penalty. See
-# the corrected sweep range in tuning/presets.py (~[1e2, 1e5]).
-woe_lambda: 1000.0
-woe_xi: 0.01
+lr: 0.01
+woe_lambda: 30000.0
+woe_xi: 0.001
 woe_centering_mode: centered_uniform
 woe_mu_momentum: 0.9
 woe_importance_stride: 1
 woe_conflict_weighting: false
-# Regularisation granularity / mechanism: parameter | channel | output.
-#   parameter -- per-weight SI path integral (original WoE-SI).
-#   channel   -- same path integral, omega collapsed to per-output-channel.
-#   output    -- DS evidence distillation against a frozen teacher (functional,
-#                NOT on the SI path-integral scale -> needs its own woe_lambda).
-woe_reg_level: parameter
+woe_reg_level: channel

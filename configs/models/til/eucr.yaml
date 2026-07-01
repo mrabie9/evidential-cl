@@ -5,7 +5,7 @@ amp: false
 lr: 0.003
 inner_steps: 1
 grad_clip_norm: 5.0
-reg_lambda: 1000
+reg_lambda: 0.09
 reg_granularity: channel
 importance_batches: 20
 eucr_uncertainty: both
