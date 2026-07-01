@@ -1665,12 +1665,13 @@ def life_experience(model, inc_loader, args):
                 result_test_det_fa.append(test_det_fa)
             result_test_t.append(task_info["task"])
 
-        checkpoint_path = _save_task_checkpoint(model, args.log_dir, current_task)
-        print("Saved task checkpoint: {}".format(checkpoint_path))
-        log_state(
-            args.state_logging,
-            "Saved task checkpoint to {}".format(checkpoint_path),
-        )
+        if getattr(args, "save_checkpoints", True):
+            checkpoint_path = _save_task_checkpoint(model, args.log_dir, current_task)
+            print("Saved task checkpoint: {}".format(checkpoint_path))
+            log_state(
+                args.state_logging,
+                "Saved task checkpoint to {}".format(checkpoint_path),
+            )
 
         log_state(
             args.state_logging,

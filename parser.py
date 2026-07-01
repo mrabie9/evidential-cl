@@ -135,6 +135,12 @@ def get_parser():
     # experiment parameters
     parser.add_argument("--cuda", default=True, action="store_true", help="Use GPU")
     parser.add_argument(
+        "--save_checkpoints",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Save per-task model checkpoints (use --no-save_checkpoints to disable).",
+    )
+    parser.add_argument(
         "--amp",
         dest="amp",
         action="store_true",

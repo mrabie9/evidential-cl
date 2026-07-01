@@ -514,6 +514,10 @@ def run_single_trial(
 
     args.model = model_name
 
+    # Tuning runs many short trials; per-task checkpoints are large and unused
+    # by the tuner (it reads metrics from task*.npz), so never write them.
+    args.save_checkpoints = False
+
     args.log_dir = str(runs_root)
     seed_base = int(getattr(base_args, "seed", 0) + seed_offset)
     args.seed = seed_base + (trial_idx if vary_seed else 0)
