@@ -17,7 +17,6 @@ from torch.autograd import Variable
 import numpy as np
 
 import random
-from random import shuffle
 import warnings
 import math
 
@@ -46,6 +45,7 @@ class ErAlgConfig:
     grad_clip_norm: Optional[float] = 2.0
     second_order: bool = False
     meta_batches: int = 3
+    eralg4_masked_loss: bool = True
 
     arch: str = "resnet1d"
     dataset: str = "tinyimagenet"
@@ -141,18 +141,24 @@ class Net(DetectionReplayMixin, nn.Module):
             yield param
 
     def take_multitask_loss(self, bt, logits, y):
-        if len(bt) == 0:
+        """Batched CE over global labels, per-sample task-masked by default.
+
+        Masking (``eralg4_masked_loss``, default on) confines each row's softmax
+        to its own task's classes, matching er_ring / lamaml_cifar; the unmasked
+        global softmax is kept only as an ablation (`--eralg4_unmasked_loss`).
+        Class weights are inverse-frequency over this batch — the per-row loop
+        this replaces silently collapsed them to 1.0 (single-row batches), so
+        weighting only takes effect with the batched call.
+        """
+        if logits.size(0) == 0:
             return torch.zeros((), device=logits.device, dtype=logits.dtype)
-        loss = torch.zeros((), device=logits.device, dtype=logits.dtype)
-        for i, _ti in enumerate(bt):
-            row = logits[i : i + 1]
-            y_i = int(y[i].item())
-            loss = loss + classification_cross_entropy(
-                row,
-                torch.tensor([y_i], device=logits.device, dtype=torch.long),
-                class_weighted_ce=self.class_weighted_ce,
-            )
-        return loss / len(bt)
+        if self.cfg.eralg4_masked_loss:
+            logits = self._mask_logits_for_sample_tasks(logits, bt)
+        return classification_cross_entropy(
+            logits,
+            y.long(),
+            class_weighted_ce=self.class_weighted_ce,
+        )
 
     def forward(self, x, t, *, cil_all_seen_upto_task=None):
         output = self.net.forward(x)
@@ -187,11 +193,11 @@ class Net(DetectionReplayMixin, nn.Module):
         current_t = []
 
         if len(self.M) > 0:
-            order = [i for i in range(0, len(self.M))]
             osize = min(self.batchSize, len(self.M))
-            for j in range(0, osize):
-                shuffle(order)
-                k = order[j]
+            # The original loop reshuffled the full index list once per draw and
+            # took position ``j`` — uniform sampling-with-replacement, which
+            # ``random.choices`` reproduces without O(N * osize) shuffling.
+            for k in random.choices(range(len(self.M)), k=osize):
                 x, y, t = self.M[k]
                 xi = np.array(x)
                 yi_scalar = int(torch.as_tensor(y).long().flatten()[0].item())
@@ -224,6 +230,29 @@ class Net(DetectionReplayMixin, nn.Module):
             bts = bts.cuda()
 
         return bxs, bys, bts, replay_count
+
+    def _mask_logits_for_sample_tasks(
+        self, raw_logits: torch.Tensor, sample_task_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply TIL masking per sample task id (mirrors lamaml_cifar.meta_loss)."""
+        if sample_task_indices.numel() == 0:
+            return raw_logits
+        masked_logits = raw_logits.clone()
+        for task_id in torch.unique(sample_task_indices).tolist():
+            row_selector = sample_task_indices == int(task_id)
+            if not torch.any(row_selector):
+                continue
+            masked_logits[row_selector] = misc_utils.apply_task_incremental_logit_mask(
+                raw_logits[row_selector],
+                int(task_id),
+                self.classes_per_task,
+                self.n_outputs,
+                cil_all_seen_upto_task=int(task_id),
+                global_noise_label=self.noise_label,
+                fill_value=-10e10,
+                loader=self.incremental_loader_name,
+            )
+        return masked_logits
 
     def _weighted_multitask_loss(
         self,
@@ -386,8 +415,8 @@ class Net(DetectionReplayMixin, nn.Module):
             bx, by, bt, replay_count = self.getBatch(x, y, t)
 
             bx = bx.squeeze()
-            # Unmasked logits: replay rows may span tasks; global CE targets index
-            # the full ``n_outputs`` vector (including shared noise class).
+            # Raw logits; per-sample task masking happens inside
+            # ``take_multitask_loss`` (global CE targets index ``n_outputs``).
             prediction = self.net.forward(bx)
             loss = self._weighted_multitask_loss(prediction, by, bt, replay_count)
             cls_tr_rec.append(self._batch_accuracy(bt, prediction, by))

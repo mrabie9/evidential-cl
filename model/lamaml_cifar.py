@@ -29,22 +29,19 @@ class Net(DetectionReplayMixin, BaseNet):  # noqa: F405
         return self._classification_loss(logits, y_cls)
 
     def take_multitask_loss(self, bt, t, logits, y):
-        # compute loss on data from a multiple tasks
-        # separate from take_loss() since the output positions for each task's
-        # logit vector are different and we nly want to compute loss on the relevant positions
-        # since this is a task incremental setting
+        """Batched CE over global labels on per-sample task-masked logits.
 
-        if len(bt) == 0:
+        ``meta_loss`` masks each row to its own task's classes before calling
+        this, so one batched call over the mixed replay+current batch is exact.
+        The per-row loop this replaces fed single-element batches through the
+        weighted CE, where inverse-frequency weights collapse to 1.0 — it
+        silently trained unweighted. The batched call makes
+        ``class_weighted_ce`` effective and removes ~|batch| Python-level CE
+        calls per meta step.
+        """
+        if logits.size(0) == 0:
             return torch.zeros((), device=logits.device, dtype=logits.dtype)
-        loss = torch.zeros((), device=logits.device, dtype=logits.dtype)
-        for i, _ti in enumerate(bt):
-            row = logits[i : i + 1]
-            y_i = int(y[i].item())
-            loss = loss + self._classification_loss(
-                row,
-                torch.tensor([y_i], device=logits.device, dtype=torch.long),
-            )
-        return loss / len(bt)
+        return self._classification_loss(logits, y.long())
 
     def forward(self, x, t, *, cil_all_seen_upto_task=None):
         output = self.net.forward(x)

@@ -131,6 +131,22 @@ def get_parser():
         ),
     )
     parser.set_defaults(class_weighted_ce=True)
+    parser.add_argument(
+        "--eralg4_masked_loss",
+        action="store_true",
+        help="eralg4 (ER-reservoir): apply per-sample TIL/CIL logit masking in "
+        "the training loss (as er_ring and C-MAML do). Now the DEFAULT; this "
+        "flag is kept for script compatibility.",
+    )
+    parser.add_argument(
+        "--eralg4_unmasked_loss",
+        dest="eralg4_masked_loss",
+        action="store_false",
+        help="eralg4: ablation switch restoring the legacy unmasked global-softmax "
+        "training loss (cross-task interference; ~-6 F1 / -3 BWT in single-epoch "
+        "TIL). See docs/cmaml_bcl_ablations.md.",
+    )
+    parser.set_defaults(eralg4_masked_loss=True)
 
     # experiment parameters
     parser.add_argument("--cuda", default=True, action="store_true", help="Use GPU")
