@@ -30,6 +30,7 @@ class BclDualConfig:
     memory_strength: float = 1.0
     temperature: float = 5.0
     n_memories: int = 2000
+    mem_sampling: str = "ring"
     inner_steps: int = 5
     adapt_inner_steps: int = 5
 
@@ -159,6 +160,16 @@ class Net(DetectionReplayMixin, torch.nn.Module):
         self.task_mem_filled = torch.zeros(
             n_tasks, dtype=torch.long, device=self.memx.device
         )
+        # total stream items seen per task (reservoir sampling only)
+        self.task_mem_seen = torch.zeros(
+            n_tasks, dtype=torch.long, device=self.memx.device
+        )
+        self.mem_sampling = self.cfg.mem_sampling
+        if self.mem_sampling not in misc_utils.MEM_SAMPLING_MODES:
+            raise ValueError(
+                f"mem_sampling must be one of {misc_utils.MEM_SAMPLING_MODES}, "
+                f"got {self.mem_sampling!r}"
+            )
         self.task_val_ptr = torch.zeros(
             n_tasks, dtype=torch.long, device=self.valx.device
         )
@@ -324,6 +335,49 @@ class Net(DetectionReplayMixin, torch.nn.Module):
         sizes = (offsets[:, 1] - offsets[:, 0]).long()
         return xx, yy, feat, mask, t_idx.tolist(), sizes
 
+    def _store_replay(
+        self,
+        task_id: int,
+        x_src: torch.Tensor,
+        y_src: torch.Tensor,
+        capacity: int,
+    ):
+        """Write already-adapted new samples into task_id's replay buffer.
+
+        Dispatches on ``self.mem_sampling``: ``"ring"`` overwrites the oldest
+        samples via a wrapping write pointer; ``"reservoir"`` keeps a uniform
+        random sample of the whole task stream (see
+        :func:`utils.misc_utils.reservoir_slots`). Occupied slots stay dense in
+        ``[0, task_mem_filled[task_id])`` so distillation/replay slicing is
+        unchanged; the matching ``mem_feat`` targets are refreshed at the next
+        task boundary as before.
+        """
+        if self.mem_sampling == "reservoir":
+            slots, filled, seen = misc_utils.reservoir_slots(
+                x_src.size(0),
+                int(self.task_mem_filled[task_id].item()),
+                int(self.task_mem_seen[task_id].item()),
+                capacity,
+            )
+            for i, slot in enumerate(slots):
+                if slot >= 0:
+                    self.memx[task_id, slot].copy_(x_src[i])
+                    self.memy[task_id, slot] = y_src[i]
+            self.task_mem_filled[task_id] = filled
+            self.task_mem_seen[task_id] = seen
+            return
+
+        write_pointer = int(self.task_mem_ptr[task_id].item())
+        endcnt = min(write_pointer + x_src.size(0), capacity)
+        effbsz = endcnt - write_pointer
+        if effbsz > 0:
+            self.memx[task_id, write_pointer:endcnt].copy_(x_src[:effbsz])
+            self.memy[task_id, write_pointer:endcnt].copy_(y_src[:effbsz])
+            self.task_mem_filled[task_id] = min(
+                capacity, int(self.task_mem_filled[task_id].item()) + effbsz
+            )
+        self.task_mem_ptr[task_id] = 0 if endcnt == capacity else endcnt
+
     def observe(self, x, y, t):
         # noise_label = None
         # if class_counts is not None:
@@ -422,24 +476,16 @@ class Net(DetectionReplayMixin, torch.nn.Module):
         self.net.train()
         task_replay_capacity = int(self.task_replay_capacities[t])
         if task_replay_capacity > 0 and y_work.size(0) > 0:
-            replay_write = int(self.task_mem_ptr[t].item())
-            bsz = y_work.size(0)
-            n_new = (
-                bsz - n_rotated_in
-            )  # number of samples to write (exclude rotated-in)
-            endcnt = min(replay_write + n_new, task_replay_capacity)
-            effbsz = endcnt - replay_write
-            if effbsz > 0:
+            # Exclude the rotated-in val sample; it already lives in the val buffer.
+            n_new = y_work.size(0) - n_rotated_in
+            if n_new > 0:
                 replay_start = n_val_taken
-                self.memx[t, replay_write:endcnt].copy_(
-                    x_for_storage[replay_start : replay_start + effbsz]
-                )
-                self.memy[t, replay_write:endcnt].copy_(y_work[:effbsz])
-                self.task_mem_filled[t] = min(
+                self._store_replay(
+                    t,
+                    x_for_storage[replay_start : replay_start + n_new],
+                    y_work[:n_new],
                     task_replay_capacity,
-                    int(self.task_mem_filled[t].item()) + effbsz,
                 )
-                self.task_mem_ptr[t] = 0 if endcnt == task_replay_capacity else endcnt
 
         self.zero_grad()
         tt = t + 1

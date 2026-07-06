@@ -453,6 +453,17 @@ def get_parser():
         help="total replay-buffer capacity across all tasks",
     )
     parser.add_argument(
+        "--mem_sampling",
+        type=str,
+        default="ring",
+        choices=["ring", "reservoir"],
+        help=(
+            "Replay-buffer update policy (GEM | BCL-Dual): 'ring' keeps the most "
+            "recent samples per task; 'reservoir' keeps a uniform random sample of "
+            "the whole task stream."
+        ),
+    )
+    parser.add_argument(
         "--memory_strength",
         default=0,
         type=float,

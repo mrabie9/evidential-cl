@@ -39,6 +39,7 @@ class GemConfig:
     inner_steps: int = 1
     lr: float = 1e-3
     n_memories: int = 0
+    mem_sampling: str = "ring"
     arch: str = "resnet1d"
     dataset: str = "tinyimagenet"
     cuda: bool = True
@@ -192,12 +193,22 @@ class Net(DetectionReplayMixin, nn.Module):
             self.memory_data = self.memory_data.cuda()
             self.memory_labs = self.memory_labs.cuda()
 
+        self.mem_sampling = self.cfg.mem_sampling
+        if self.mem_sampling not in misc_utils.MEM_SAMPLING_MODES:
+            raise ValueError(
+                f"mem_sampling must be one of {misc_utils.MEM_SAMPLING_MODES}, "
+                f"got {self.mem_sampling!r}"
+            )
+
         # track how many exemplars each task has actually written
         self.task_mem_filled = torch.zeros(n_tasks, dtype=torch.long)
         self.task_mem_ptr = torch.zeros(n_tasks, dtype=torch.long)
+        # total stream items seen per task (reservoir sampling only)
+        self.task_mem_seen = torch.zeros(n_tasks, dtype=torch.long)
         if self.gpu:
             self.task_mem_filled = self.task_mem_filled.cuda()
             self.task_mem_ptr = self.task_mem_ptr.cuda()
+            self.task_mem_seen = self.task_mem_seen.cuda()
 
         # --- GEM gradient buffers ---
         self.grad_dims = [p.data.numel() for p in self._ll_params()]
@@ -326,6 +337,46 @@ class Net(DetectionReplayMixin, nn.Module):
         )
         return output
 
+    def _store_replay(self, task_id: int, x_data: torch.Tensor, y_data: torch.Tensor):
+        """Write the current batch into task_id's episodic buffer.
+
+        Dispatches on ``self.mem_sampling``: ``"ring"`` overwrites the oldest
+        samples via a wrapping write pointer; ``"reservoir"`` keeps a uniform
+        random sample of the whole task stream (see
+        :func:`utils.misc_utils.reservoir_slots`). Both keep occupied slots dense
+        in ``[0, task_mem_filled[task_id])`` so replay slicing is unchanged.
+        """
+        capacity = int(self.task_memory_capacities[task_id])
+        if capacity <= 0:
+            return
+        # Store adapter output (e.g. 3-ADC -> 2-channel) so replay matches forward.
+        mem_x = self._input_for_replay(x_data)
+
+        if self.mem_sampling == "reservoir":
+            slots, filled, seen = misc_utils.reservoir_slots(
+                mem_x.size(0),
+                int(self.task_mem_filled[task_id].item()),
+                int(self.task_mem_seen[task_id].item()),
+                capacity,
+            )
+            for i, slot in enumerate(slots):
+                if slot >= 0:
+                    self.memory_data[task_id, slot].copy_(mem_x[i])
+                    self.memory_labs[task_id, slot] = y_data[i]
+            self.task_mem_filled[task_id] = filled
+            self.task_mem_seen[task_id] = seen
+            return
+
+        write_pointer = int(self.task_mem_ptr[task_id].item())
+        endcnt = min(write_pointer + mem_x.size(0), capacity)
+        effbsz = endcnt - write_pointer
+        if effbsz > 0:
+            self.memory_data[task_id, write_pointer:endcnt].copy_(mem_x[:effbsz])
+            self.memory_labs[task_id, write_pointer:endcnt].copy_(y_data[:effbsz])
+            filled_before_update = int(self.task_mem_filled[task_id].item())
+            self.task_mem_filled[task_id] = min(capacity, filled_before_update + effbsz)
+        self.task_mem_ptr[task_id] = 0 if endcnt == capacity else endcnt
+
     def observe(self, x, y, t):
         """
         One optimization step on batch (x,y,t), with GEM constraints and inner_steps.
@@ -383,28 +434,7 @@ class Net(DetectionReplayMixin, nn.Module):
         for pass_itr in range(self.inner_steps):
             # push current batch once per batch (not each glance)
             if pass_itr == 0:
-                task_capacity = int(self.task_memory_capacities[t])
-                if task_capacity > 0:
-                    write_pointer = int(self.task_mem_ptr[t].item())
-                    bsz = y_work.size(0)
-                    endcnt = min(write_pointer + bsz, task_capacity)
-                    effbsz = endcnt - write_pointer
-                    # Store adapter output (e.g. 3-ADC -> 2-channel) so replay matches forward
-                    mem_x = self._input_for_replay(x.data[:effbsz])
-                    self.memory_data[t, write_pointer:endcnt].copy_(mem_x)
-
-                    if bsz == 1:
-                        self.memory_labs[t, write_pointer] = y_work.data[0]
-                    else:
-                        y_slice = y_work.data[:effbsz]
-                        self.memory_labs[t, write_pointer:endcnt].copy_(y_slice)
-
-                    if effbsz > 0:
-                        filled_before_update = int(self.task_mem_filled[t].item())
-                        self.task_mem_filled[t] = min(
-                            task_capacity, filled_before_update + effbsz
-                        )
-                    self.task_mem_ptr[t] = 0 if endcnt == task_capacity else endcnt
+                self._store_replay(t, x.data, y_work.data)
 
             # gradients on past tasks (replay)
             if len(self.observed_tasks) > 1:
