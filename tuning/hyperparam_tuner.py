@@ -162,6 +162,20 @@ def build_cli(preset: TuningPreset) -> argparse.ArgumentParser:
         help="If set, add the trial index to the base seed.",
     )
     parser.add_argument(
+        "--seeds",
+        type=str,
+        default=None,
+        metavar="S1,S2,...",
+        help="Comma-separated seeds to average each trial over (e.g. 0,39,55)."
+        " When set, every trial is run once per seed and the metrics are"
+        " averaged; --vary-seed and --seed-offset are ignored.",
+    )
+    parser.add_argument(
+        "--avg-seeds",
+        action="store_true",
+        help="Shortcut for --seeds 0,39,55.",
+    )
+    parser.add_argument(
         "--output-root",
         type=str,
         default=preset.resolve_output_root(),
@@ -326,6 +340,34 @@ def expand_trials(
 def parse_lr_keys(raw: str) -> List[str]:
     keys = [item.strip() for item in raw.split(",") if item.strip()]
     return keys or ["lr"]
+
+
+def parse_seeds(raw: str | None) -> List[int]:
+    """Parse a comma-separated seed list into de-duplicated integers.
+
+    Args:
+        raw: Comma-separated seeds (e.g. ``"0,39,55"``) or ``None``.
+
+    Returns:
+        Ordered list of unique integer seeds; empty when ``raw`` is falsy.
+
+    Usage:
+        seeds = parse_seeds("0,39,55")
+    """
+    if not raw:
+        return []
+    seeds: List[int] = []
+    seen: set[int] = set()
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        seed = int(item)
+        if seed in seen:
+            continue
+        seeds.append(seed)
+        seen.add(seed)
+    return seeds
 
 
 def parse_tune_only(specs: Sequence[str]) -> List[str]:
@@ -505,6 +547,7 @@ def run_single_trial(
     vary_seed: bool,
     keep_expt_name: bool,
     model_name: str,
+    seed_override: int | None = None,
 ) -> Dict[str, Any]:
     args = deepcopy(base_args)
     merged = dict(constant_overrides)
@@ -519,15 +562,24 @@ def run_single_trial(
     args.save_checkpoints = False
 
     args.log_dir = str(runs_root)
-    seed_base = int(getattr(base_args, "seed", 0) + seed_offset)
-    args.seed = seed_base + (trial_idx if vary_seed else 0)
+    if seed_override is not None:
+        # Explicit seed (from --seeds averaging) overrides the derived seed.
+        args.seed = int(seed_override)
+    else:
+        seed_base = int(getattr(base_args, "seed", 0) + seed_offset)
+        args.seed = seed_base + (trial_idx if vary_seed else 0)
 
     trial_slug = slugify_params(trial_overrides)
     if not keep_expt_name:
         base_name = getattr(base_args, "expt_name", model_name)
-        args.expt_name = f"{base_name}_tune_{trial_idx:03d}_{trial_slug}"[:120]
+        seed_tag = f"_seed{args.seed}" if seed_override is not None else ""
+        args.expt_name = f"{base_name}_tune_{trial_idx:03d}_{trial_slug}{seed_tag}"[
+            :120
+        ]
 
     trial_timestamp = f"{session_timestamp}-trial{trial_idx:03d}"
+    if seed_override is not None:
+        trial_timestamp = f"{trial_timestamp}-seed{args.seed}"
 
     misc_utils.init_seed(args.seed)
     log_dir, tf_dir = misc_utils.log_dir(args, trial_timestamp, model_name)
@@ -648,6 +700,154 @@ def run_single_trial(
     }
 
 
+def _mean_per_task(lists: Sequence[Sequence[float]]) -> List[float]:
+    """Elementwise-average per-task score lists, truncating to the shortest."""
+    non_empty = [list(lst) for lst in lists if lst]
+    if not non_empty:
+        return []
+    length = min(len(lst) for lst in non_empty)
+    return [
+        float(np.mean([lst[index] for lst in non_empty])) for index in range(length)
+    ]
+
+
+def _finite_mean(values: Sequence[float]) -> float:
+    finite = [
+        float(v) for v in values if isinstance(v, (int, float)) and not np.isnan(v)
+    ]
+    return float(np.mean(finite)) if finite else float("nan")
+
+
+def aggregate_seed_results(
+    per_seed_results: List[Dict[str, Any]], seeds: Sequence[int]
+) -> Dict[str, Any]:
+    """Average per-seed trial results into a single trial record.
+
+    Scalar metric fields (including the tuning ``score``) are averaged over the
+    finite seed values; per-task lists are averaged elementwise; ``duration_sec``
+    is summed to reflect the total wall time spent across seeds. Per-seed scores
+    and log directories are retained for inspection.
+
+    Args:
+        per_seed_results: Successful ``run_single_trial`` outputs, one per seed.
+        seeds: The seeds these results correspond to, in order.
+
+    Returns:
+        A trial record shaped like a single-seed result with added ``seeds``,
+        ``per_seed_scores``, ``score_std`` and ``per_seed_log_dirs`` fields.
+
+    Usage:
+        record = aggregate_seed_results([r0, r39, r55], [0, 39, 55])
+    """
+    scalar_keys = [
+        "val_mean",
+        "val_f1_mean",
+        "val_det_mean",
+        "val_pfa_mean",
+        "test_mean",
+        "test_det_mean",
+        "test_pfa_mean",
+        "score",
+    ]
+    list_keys = [
+        "val_per_task",
+        "val_det_per_task",
+        "val_pfa_per_task",
+        "test_per_task",
+        "test_det_per_task",
+        "test_pfa_per_task",
+    ]
+
+    aggregated = dict(per_seed_results[0])
+    for key in scalar_keys:
+        aggregated[key] = _finite_mean([r.get(key) for r in per_seed_results])
+    for key in list_keys:
+        aggregated[key] = _mean_per_task([r.get(key, []) for r in per_seed_results])
+    aggregated["duration_sec"] = float(
+        sum(float(r.get("duration_sec", 0.0)) for r in per_seed_results)
+    )
+
+    per_seed_scores = [r.get("score") for r in per_seed_results]
+    finite_scores = [
+        float(s)
+        for s in per_seed_scores
+        if isinstance(s, (int, float)) and not np.isnan(s)
+    ]
+    aggregated["seeds"] = list(seeds)
+    aggregated["per_seed_scores"] = per_seed_scores
+    aggregated["score_std"] = (
+        float(np.std(finite_scores)) if finite_scores else float("nan")
+    )
+    aggregated["per_seed_log_dirs"] = [r.get("log_dir") for r in per_seed_results]
+    return aggregated
+
+
+def run_trial_over_seeds(
+    base_args: argparse.Namespace,
+    constant_overrides: Dict[str, Any],
+    trial_overrides: Dict[str, Any],
+    trial_idx: int,
+    session_timestamp: str,
+    runs_root: Path,
+    seed_offset: int,
+    vary_seed: bool,
+    keep_expt_name: bool,
+    model_name: str,
+    seeds: Sequence[int],
+) -> Dict[str, Any]:
+    """Run one trial, optionally averaging its metrics over several seeds.
+
+    When ``seeds`` is empty the behaviour is identical to a single
+    ``run_single_trial`` call. Otherwise the trial is run once per seed and the
+    results are combined with :func:`aggregate_seed_results`.
+
+    Args:
+        seeds: Seeds to average over; empty for single-seed behaviour.
+        (Remaining args mirror :func:`run_single_trial`.)
+
+    Returns:
+        A single trial-result dict, averaged across seeds when requested.
+
+    Usage:
+        record = run_trial_over_seeds(..., seeds=[0, 39, 55])
+    """
+    if not seeds:
+        return run_single_trial(
+            base_args,
+            constant_overrides,
+            trial_overrides,
+            trial_idx,
+            session_timestamp,
+            runs_root,
+            seed_offset,
+            vary_seed,
+            keep_expt_name,
+            model_name,
+        )
+
+    per_seed_results: List[Dict[str, Any]] = []
+    for seed in seeds:
+        outcome = run_single_trial(
+            base_args,
+            constant_overrides,
+            trial_overrides,
+            trial_idx,
+            session_timestamp,
+            runs_root,
+            seed_offset,
+            vary_seed,
+            keep_expt_name,
+            model_name,
+            seed_override=seed,
+        )
+        print(
+            f"  seed {seed}: score={outcome['score']:.4f}"
+            f" (val_f1={outcome['val_f1_mean']:.4f}, val={outcome['val_mean']:.4f})"
+        )
+        per_seed_results.append(outcome)
+    return aggregate_seed_results(per_seed_results, seeds)
+
+
 def dump_summary(
     session_dir: Path, summary: Dict[str, Any], successes: List[Dict[str, Any]]
 ) -> None:
@@ -671,6 +871,9 @@ def dump_summary(
         "duration_sec",
         "log_dir",
     ]
+    seed_averaged = any("score_std" in trial for trial in successes)
+    if seed_averaged:
+        field_names.insert(field_names.index("score") + 1, "score_std")
     if any("stage" in trial for trial in successes):
         field_names.insert(1, "stage")
     param_keys = sorted({key for trial in successes for key in trial["params"].keys()})
@@ -692,6 +895,8 @@ def dump_summary(
                 "duration_sec": trial["duration_sec"],
                 "log_dir": trial["log_dir"],
             }
+            if seed_averaged:
+                row["score_std"] = trial.get("score_std")
             if "stage" in field_names:
                 row["stage"] = trial.get("stage")
             for key in param_keys:
@@ -791,6 +996,12 @@ def run_tuning(preset: TuningPreset) -> None:
     if cli.hierarchical and cli.lr_first:
         raise ValueError("Choose either --hierarchical or --lr-first, not both.")
 
+    seeds = parse_seeds(
+        "0,39,55" if getattr(cli, "avg_seeds", False) else getattr(cli, "seeds", None)
+    )
+    if seeds:
+        print(f"Averaging each trial over seeds: {seeds}")
+
     lr_keys = parse_lr_keys(cli.lr_key)
     lr_first = bool(cli.lr_first)
     lr_space = {key: search_space[key] for key in lr_keys if key in search_space}
@@ -877,7 +1088,7 @@ def run_tuning(preset: TuningPreset) -> None:
         for offset, trial_params in enumerate(trial_list):
             trial_idx = start_idx + offset
             try:
-                outcome = run_single_trial(
+                outcome = run_trial_over_seeds(
                     base_args,
                     overrides,
                     trial_params,
@@ -888,6 +1099,7 @@ def run_tuning(preset: TuningPreset) -> None:
                     cli.vary_seed,
                     cli.keep_expt_name,
                     preset.model_name,
+                    seeds,
                 )
             except Exception as exc:  # pylint: disable=broad-except
                 trace = traceback.format_exc()
@@ -998,6 +1210,7 @@ def run_tuning(preset: TuningPreset) -> None:
         "session_dir": str(session_dir.resolve()),
         "timestamp": session_timestamp,
         "fixed_overrides": constant_overrides,
+        "seeds": seeds,
         "search_space": full_search_space,
         "hierarchical": bool(cli.hierarchical),
         "hierarchical_final_params": hierarchical_final_params,
@@ -1038,8 +1251,13 @@ def run_tuning(preset: TuningPreset) -> None:
                     summary["updated_yaml_values"] = updated_yaml_values
                     dump_summary(session_dir, summary, successes)
 
+        best_score_note = f"score={best['score']:.4f}"
+        if "score_std" in best and not np.isnan(best["score_std"]):
+            best_score_note += (
+                f" +/- {best['score_std']:.4f} over seeds {best.get('seeds')}"
+            )
         print(
-            f"Best trial #{best['trial']} | score={best['score']:.4f} | params={best['trial_params']}"
+            f"Best trial #{best['trial']} | {best_score_note} | params={best['trial_params']}"
         )
         print(f"Logs stored in: {best['log_dir']}")
         if updated_yaml_path:
@@ -1067,4 +1285,7 @@ __all__ = [
     "run_tuning",
     "make_main",
     "select_best_trial",
+    "parse_seeds",
+    "run_trial_over_seeds",
+    "aggregate_seed_results",
 ]
