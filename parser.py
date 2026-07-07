@@ -708,6 +708,26 @@ def get_parser():
         ),
     )
 
+    # WoE-SI + reservoir experience replay (model: woe_si_replay).
+    parser.add_argument(
+        "--woe_replay_memories",
+        type=int,
+        default=5120,
+        help="woe_si_replay: reservoir buffer capacity (total stored exemplars).",
+    )
+    parser.add_argument(
+        "--woe_replay_batch_size",
+        type=int,
+        default=20,
+        help="woe_si_replay: number of replay exemplars drawn per optimiser step.",
+    )
+    parser.add_argument(
+        "--woe_replay_lambda",
+        type=float,
+        default=1.0,
+        help="woe_si_replay: weight on the reservoir-replay cross-entropy term.",
+    )
+
     return parser
 
 

@@ -1,0 +1,22 @@
+model: woe_si_replay
+loader: task_incremental_loader
+lr: 0.001
+woe_lambda: 3000.0
+woe_xi: 0.001
+woe_centering_mode: centered_uniform
+woe_mu_momentum: 0.9
+woe_importance_stride: 1
+woe_conflict_weighting: false
+# Regularisation granularity / mechanism: parameter | channel | output.
+#   parameter -- per-weight SI path integral (original WoE-SI).
+#   channel   -- same path integral, omega collapsed to per-output-channel.
+#   output    -- DS evidence distillation against a frozen teacher (functional,
+#                NOT on the SI path-integral scale -> needs its own woe_lambda).
+woe_reg_level: parameter
+# Reservoir experience replay (rehearsal) added on top of WoE-SI regularisation.
+#   woe_replay_memories    -- total exemplars kept in the reservoir buffer.
+#   woe_replay_batch_size  -- exemplars replayed per optimiser step.
+#   woe_replay_lambda      -- weight on the replay cross-entropy term.
+woe_replay_memories: 5120
+woe_replay_batch_size: 128
+woe_replay_lambda: 1.0

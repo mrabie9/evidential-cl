@@ -418,6 +418,10 @@ class Net(DetectionReplayMixin, nn.Module):
             else:
                 reg = self._surrogate_loss()
             loss = self.cls_lambda * loss_ce + self.woe_lambda * reg
+            # Rehearsal hook: no-op in base WoE-SI, a reservoir-replay CE term in
+            # the woe_si_replay subclass. Sampled before the current batch is
+            # written to the buffer so a sample never rehearses on itself.
+            loss = loss + self._classification_replay_loss(t)
 
             loss.backward()
             if self.clipgrad is not None:
@@ -435,6 +439,9 @@ class Net(DetectionReplayMixin, nn.Module):
             self._step_in_task += 1
             metric_logits = logits_for_loss.detach()
 
+        # Store the current batch after the update so the reservoir reflects the
+        # stream. No-op in base WoE-SI (see the rehearsal hooks below).
+        self._store_classification_replay(x, y, t)
         return float(loss.item()), cls_tr_rec, metric_logits
 
     # ------------------------------------------------------------------
@@ -805,6 +812,42 @@ class Net(DetectionReplayMixin, nn.Module):
     def _compute_offsets(self, task: int) -> Tuple[int, int]:
         offset1, offset2 = misc_utils.compute_offsets(task, self.classes_per_task)
         return offset1, min(self.n_outputs, offset2)
+
+    # ------------------------------------------------------------------
+    def _classification_replay_loss(self, t: int) -> torch.Tensor:
+        """Extra classification loss from a rehearsal buffer (hook).
+
+        Base WoE-SI is a pure regularisation method and keeps no rehearsal
+        buffer, so this returns exactly ``0``. The ``woe_si_replay`` subclass
+        overrides it to add an experience-replay cross-entropy term over a
+        reservoir sample of previously-seen batches.
+
+        Args:
+            t: Current task index (unused in the base no-op).
+
+        Returns:
+            A scalar loss contribution; zero in the base learner.
+        """
+        del t
+        return torch.zeros(1, device=self._device())
+
+    # ------------------------------------------------------------------
+    def _store_classification_replay(
+        self, x: torch.Tensor, y: torch.Tensor, t: int
+    ) -> None:
+        """Write the current batch into a rehearsal buffer (hook).
+
+        No-op in base WoE-SI; overridden by ``woe_si_replay`` to feed its
+        reservoir buffer. Kept separate from the detector-replay buffer that
+        ``DetectionReplayMixin`` maintains for the detection head.
+
+        Args:
+            x: Current input batch.
+            y: Current (possibly packed) labels.
+            t: Current task index.
+        """
+        del x, y, t
+        return None
 
     # ------------------------------------------------------------------
     def _device(self) -> torch.device:

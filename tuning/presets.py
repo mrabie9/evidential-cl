@@ -51,6 +51,10 @@ COMMON_TYPE_HINTS: Dict[str, type] = {
     "woe_mu_momentum": float,
     "woe_importance_stride": int,
     "woe_conflict_weighting": bool,
+    "woe_reg_level": str,
+    "woe_replay_memories": int,
+    "woe_replay_batch_size": int,
+    "woe_replay_lambda": float,
     "clipgrad_norm": float,
     "optimizer": str,
     "smax": float,
@@ -779,6 +783,62 @@ TUNING_PRESETS: Dict[str, TuningPreset] = {
                     "min": 1e-5,
                     "fallback": 1e-3,
                     "values": [1e-4, 1e-3, 1e-2],
+                },
+            }
+        ),
+    ),
+    "woe_si_replay": TuningPreset(
+        model_name="woe_si_replay",
+        description=(
+            "Run grid or random search over Weight-of-Evidence SI + reservoir "
+            "replay hyperparameters."
+        ),
+        default_config="configs/models/til/woe_si_replay.yaml",
+        default_output_root="logs/tuning/woe_si_replay",
+        type_hints=COMMON_TYPE_HINTS,
+        grid_factory=make_grid_factory(
+            {
+                # Shared WoE-SI regularisation knobs (see the "woe_si" preset).
+                "lr": {
+                    "kind": "float",
+                    "factors": (0.5, 1.0, 2.0),
+                    "min": 1e-5,
+                    "fallback": 1e-3,
+                    "values": [
+                        0.03,
+                        0.01,
+                        0.003,
+                        0.001,
+                        0.0003,
+                        0.0001,
+                        0.00003,
+                        0.00001,
+                    ],
+                },
+                "woe_lambda": {
+                    "kind": "float",
+                    "factors": (0.5, 1.0, 2.0),
+                    "min": 1.0,
+                    "fallback": 1000.0,
+                    "values": [
+                        100.0,
+                        300.0,
+                        1000.0,
+                        3000.0,
+                        10000.0,
+                        30000.0,
+                        100000.0,
+                    ],
+                },
+                # Replay-specific knobs. woe_replay_lambda weights the rehearsal
+                # cross-entropy against the DS regularisation; woe_replay_memories
+                # is the reservoir buffer capacity.
+                "woe_replay_lambda": {
+                    "kind": "float",
+                    "factors": (0.5, 1.0, 2.0),
+                    "min": 0.0,
+                    "fallback": 1.0,
+                    "values": [0.25, 0.5, 1.0, 2.0, 5.0],
                 },
             }
         ),
