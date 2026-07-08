@@ -8,6 +8,12 @@ from typing import Final
 import numpy as np
 import torch
 
+# Valid strategies for choosing which stream samples to keep in a per-task
+# episodic memory buffer. Must stay in sync with the ``--mem_sampling`` choices
+# in ``parser.py``. ``"ring"`` keeps the most recent samples per task;
+# ``"reservoir"`` keeps a uniform random sample of the whole task stream.
+MEM_SAMPLING_MODES: Final = ("ring", "reservoir")
+
 
 def _parse_class_list(value):
     """Convert string/list/tuple values into a list of ints."""
