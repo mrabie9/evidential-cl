@@ -27,6 +27,7 @@ from utils.class_weighted_loss import classification_cross_entropy
 class BclDualConfig:
     lr: float = 1e-3
     beta: float = 1.0
+    no_bilevel: bool = False
     memory_strength: float = 1.0
     temperature: float = 5.0
     n_memories: int = 2000
@@ -34,6 +35,7 @@ class BclDualConfig:
     inner_steps: int = 5
     adapt_inner_steps: int = 5
 
+    val_fraction: float = 0.2
     cuda: bool = True
     replay_batch_size: int = 20
     det_lambda: float = 10.0
@@ -87,6 +89,7 @@ class Net(DetectionReplayMixin, torch.nn.Module):
         # setup optimizer
         self.inner_lr = self.cfg.lr
         self.beta = self.cfg.beta
+        self.no_bilevel = bool(self.cfg.no_bilevel)
         # self.outer_opt = torch.optim.SGD(self.net.parameters(), lr=self.outer_lr)
         self.inner_opt = torch.optim.SGD(
             self.net.parameters(), lr=self.inner_lr, momentum=0.9
@@ -122,7 +125,7 @@ class Net(DetectionReplayMixin, torch.nn.Module):
             total_memories,
             n_tasks,
         )
-        val_fraction = 0.2
+        val_fraction = float(self.cfg.val_fraction)
         self.task_val_capacities = [
             max(0, int(cap * val_fraction)) for cap in self.task_total_capacities
         ]
@@ -278,44 +281,40 @@ class Net(DetectionReplayMixin, torch.nn.Module):
         """
         n_tasks = t
         if valid:
-            filled = [int(self.task_val_filled[i].item()) for i in range(n_tasks)]
+            filled = self.task_val_filled[:n_tasks]
             mem_x = self.valx[:n_tasks]
             mem_y = self.valy[:n_tasks]
             mem_feat = self.mem_feat[:n_tasks]
         else:
-            filled = [int(self.task_mem_filled[i].item()) for i in range(n_tasks)]
+            filled = self.task_mem_filled[:n_tasks]
             mem_x = self.memx[:n_tasks]
             mem_y = self.memy[:n_tasks]
             mem_feat = self.mem_feat[:n_tasks]
 
-        if sum(filled) == 0:
+        if int(filled.sum().item()) == 0:
             return None
 
-        # Build flat index -> (task_idx, slot_idx); skip padding / global noise for CE
-        flat_to_task_slot = []
-        for task_idx in range(n_tasks):
-            for slot in range(filled[task_idx]):
-                lab = int(mem_y[task_idx, slot].item())
-                if lab < 0:
-                    continue
-                if self.noise_label is not None and lab == self.noise_label:
-                    continue
-                flat_to_task_slot.append((task_idx, slot))
-        flat_to_task_slot = np.array(flat_to_task_slot)
-        total_filled = len(flat_to_task_slot)
+        # Vectorized flat (task, slot) index construction; skip padding / global
+        # noise for CE. Row-major ``nonzero`` ordering (task-major, then slot) is
+        # identical to the original nested loop, so ``np.random.choice`` selects
+        # the same rows — without one GPU sync per filled slot.
+        device = mem_x.device
+        slot_ids = torch.arange(mem_y.size(1), device=device).unsqueeze(0)
+        valid_mask = (slot_ids < filled.unsqueeze(1)) & (mem_y >= 0)
+        if self.noise_label is not None:
+            valid_mask &= mem_y != self.noise_label
+        tk, sm = torch.nonzero(valid_mask, as_tuple=True)
+        total_filled = int(tk.numel())
         if total_filled == 0:
             return None
 
         sz = min(total_filled, self.sz)
         chosen = np.random.choice(total_filled, size=sz, replace=False)
-        t_idx_np = flat_to_task_slot[chosen, 0]
-        s_idx_np = flat_to_task_slot[chosen, 1]
         if valid:
             self.valid_id = chosen.tolist()
-
-        device = mem_x.device
-        t_idx = torch.from_numpy(t_idx_np).to(device)
-        s_idx = torch.from_numpy(s_idx_np).to(device)
+        sel = torch.as_tensor(chosen, device=device, dtype=torch.long)
+        t_idx = tk[sel]
+        s_idx = sm[sel]
 
         offsets = torch.tensor(
             [self.compute_offsets(int(i)) for i in t_idx.tolist()],
@@ -496,7 +495,8 @@ class Net(DetectionReplayMixin, torch.nn.Module):
                 x_train = torch.cat(
                     [x_train, rotated_validation_sample_for_meta], dim=0
                 )
-            weights_before = deepcopy(self.net.state_dict())
+            if not self.no_bilevel:
+                weights_before = deepcopy(self.net.state_dict())
             pred = self.forward(x_train, t)
             signal_mask = signal_mask_exclude_noise(y_work, self.noise_label)
             logits_for_loss = pred
@@ -544,6 +544,13 @@ class Net(DetectionReplayMixin, torch.nn.Module):
                 loss = self.cls_lambda * loss1
             loss.backward()
             self.inner_opt.step()
+            if self.no_bilevel:
+                # Bilevel ablation: a single fused step (current CE + replay CE +
+                # distill) per round, no validation-buffer outer step and no Reptile
+                # interpolation. Reduces BCL-Dual to plain replay + distillation.
+                self.zero_grad()
+                outer_loss = loss
+                continue
             sampled_validation = self.memory_sampling(tt, valid=True)
             if sampled_validation is not None:
                 xval, yval, _, mask_val, list_t, class_sizes_val = sampled_validation

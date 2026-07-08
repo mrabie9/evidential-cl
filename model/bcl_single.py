@@ -241,38 +241,34 @@ class Net(DetectionReplayMixin, torch.nn.Module):
         """
         del valid
         n_tasks = t
-        filled = [int(self.task_mem_filled[i].item()) for i in range(n_tasks)]
+        filled = self.task_mem_filled[:n_tasks]
         mem_x = self.memx[:n_tasks]
         mem_y = self.memy[:n_tasks]
         mem_feat = self.mem_feat[:n_tasks]
 
-        if sum(filled) == 0:
+        if int(filled.sum().item()) == 0:
             return None
 
-        # Build flat index -> (task_idx, slot_idx); skip padding / global noise for CE
-        flat_to_task_slot = []
-        for task_idx in range(n_tasks):
-            for slot in range(filled[task_idx]):
-                lab = int(mem_y[task_idx, slot].item())
-                if lab < 0:
-                    continue
-                if self.noise_label is not None and lab == self.noise_label:
-                    continue
-                flat_to_task_slot.append((task_idx, slot))
-        flat_to_task_slot = np.array(flat_to_task_slot)
-        total_filled = len(flat_to_task_slot)
+        # Vectorized flat (task, slot) index construction; skip padding / global
+        # noise for CE. Row-major ``nonzero`` ordering (task-major, then slot) is
+        # identical to the original nested loop, so ``np.random.choice`` selects
+        # the same rows — without one GPU sync per filled slot.
+        device = mem_x.device
+        slot_ids = torch.arange(mem_y.size(1), device=device).unsqueeze(0)
+        valid_mask = (slot_ids < filled.unsqueeze(1)) & (mem_y >= 0)
+        if self.noise_label is not None:
+            valid_mask &= mem_y != self.noise_label
+        tk, sm = torch.nonzero(valid_mask, as_tuple=True)
+        total_filled = int(tk.numel())
         if total_filled == 0:
             return None
 
         sz = min(total_filled, self.sz)
         chosen = np.random.choice(total_filled, size=sz, replace=False)
-        t_idx_np = flat_to_task_slot[chosen, 0]
-        s_idx_np = flat_to_task_slot[chosen, 1]
         self.valid_id = chosen.tolist()
-
-        device = mem_x.device
-        t_idx = torch.from_numpy(t_idx_np).to(device)
-        s_idx = torch.from_numpy(s_idx_np).to(device)
+        sel = torch.as_tensor(chosen, device=device, dtype=torch.long)
+        t_idx = tk[sel]
+        s_idx = sm[sel]
 
         offsets = torch.tensor(
             [self.compute_offsets(int(i)) for i in t_idx.tolist()],

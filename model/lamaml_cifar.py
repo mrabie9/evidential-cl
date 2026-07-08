@@ -249,23 +249,38 @@ class Net(DetectionReplayMixin, BaseNet):  # noqa: F405
                     )
                 meta_loss, logits = self.meta_loss(bx, fast_weights, by, bt, t)
                 with torch.no_grad():
-                    preds_list = []
-                    target_list = []
-                    for sample_idx, task_idx in enumerate(bt):
-                        y_s = int(by[sample_idx].item())
-                        if self.noise_label is not None and y_s == self.noise_label:
-                            continue
-                        offset1_s, offset2_s = self.compute_offsets(int(task_idx))
-                        preds = torch.argmax(
-                            logits[sample_idx, offset1_s:offset2_s], dim=0
+                    # Vectorized equivalent of the per-sample argmax loop: for
+                    # each row, argmax within its own task's class slice
+                    # [offset1, offset2) and record the local prediction/target.
+                    # Masking non-task columns to -inf makes a single batched
+                    # argmax exact, avoiding one GPU sync per sample.
+                    by_dev = by.long().view(-1)
+                    bt_list = bt.long().view(-1).tolist()
+                    offsets = {
+                        tid: self.compute_offsets(tid) for tid in set(bt_list)
+                    }
+                    o1 = torch.tensor(
+                        [offsets[tid][0] for tid in bt_list],
+                        device=logits.device,
+                    )
+                    o2 = torch.tensor(
+                        [offsets[tid][1] for tid in bt_list],
+                        device=logits.device,
+                    )
+                    cols = torch.arange(logits.size(1), device=logits.device)
+                    valid = (cols.unsqueeze(0) >= o1.unsqueeze(1)) & (
+                        cols.unsqueeze(0) < o2.unsqueeze(1)
+                    )
+                    masked = logits.masked_fill(~valid, float("-inf"))
+                    preds = masked.argmax(dim=1) - o1
+                    targets = by_dev - o1
+                    keep = torch.ones_like(by_dev, dtype=torch.bool)
+                    if self.noise_label is not None:
+                        keep &= by_dev != self.noise_label
+                    if keep.any():
+                        cls_tr_rec.append(
+                            macro_recall(preds[keep], targets[keep])
                         )
-                        target = by[sample_idx] - offset1_s
-                        preds_list.append(preds.detach().cpu())
-                        target_list.append(target.detach().cpu())
-                    if preds_list:
-                        stacked_preds = torch.stack(preds_list).view(-1)
-                        stacked_targets = torch.stack(target_list).view(-1)
-                        cls_tr_rec.append(macro_recall(stacked_preds, stacked_targets))
 
                 meta_losses[i] += meta_loss
 

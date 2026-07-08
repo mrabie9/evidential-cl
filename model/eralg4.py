@@ -387,23 +387,32 @@ class Net(DetectionReplayMixin, nn.Module):
     def _batch_accuracy(self, bt, logits, labels):
         if len(bt) == 0:
             return 0.0
-        preds_list = []
-        target_list = []
         with torch.no_grad():
-            for idx, task_idx in enumerate(bt):
-                offset1, offset2 = self.compute_offsets(int(task_idx))
-                y_g = int(labels[idx].item())
-                if self.noise_label is not None and y_g == self.noise_label:
-                    continue
-                preds = torch.argmax(logits[idx, offset1:offset2], dim=0)
-                target = labels[idx] - offset1
-                preds_list.append(preds.detach().cpu())
-                target_list.append(target.detach().cpu())
-        if not preds_list:
-            return 0.0
-        stacked_preds = torch.stack(preds_list).view(-1)
-        stacked_targets = torch.stack(target_list).view(-1)
-        return macro_recall(stacked_preds, stacked_targets)
+            # Vectorized per-sample argmax within each row's task class slice
+            # [offset1, offset2). Masking non-task columns to -inf makes a single
+            # batched argmax exact, avoiding one GPU sync per sample.
+            labels_dev = labels.long().view(-1)
+            bt_list = bt.long().view(-1).tolist()
+            offsets = {tid: self.compute_offsets(tid) for tid in set(bt_list)}
+            o1 = torch.tensor(
+                [offsets[tid][0] for tid in bt_list], device=logits.device
+            )
+            o2 = torch.tensor(
+                [offsets[tid][1] for tid in bt_list], device=logits.device
+            )
+            cols = torch.arange(logits.size(1), device=logits.device)
+            valid = (cols.unsqueeze(0) >= o1.unsqueeze(1)) & (
+                cols.unsqueeze(0) < o2.unsqueeze(1)
+            )
+            masked = logits.masked_fill(~valid, float("-inf"))
+            preds = masked.argmax(dim=1) - o1
+            targets = labels_dev - o1
+            keep = torch.ones_like(labels_dev, dtype=torch.bool)
+            if self.noise_label is not None:
+                keep &= labels_dev != self.noise_label
+            if not keep.any():
+                return 0.0
+            return macro_recall(preds[keep], targets[keep])
 
     def ER(self, x, y, t):
         cls_tr_rec = []

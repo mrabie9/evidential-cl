@@ -1,8 +1,5 @@
 import random
-from random import shuffle
-import numpy as np
 import torch
-from torch.autograd import Variable
 from dataclasses import dataclass
 from typing import Optional
 from model.resnet1d import ResNet1D
@@ -144,20 +141,13 @@ class BaseNet(torch.nn.Module):
         """
         Given the new data points, create a batch of old + new data,
         where old data is sampled from the memory buffer
+
+        Sampling is uniform with replacement, identical in distribution to the
+        original ``shuffle(order); k = order[j]`` draw, but ``random.choices``
+        avoids the O(len(MEM) * osize) reshuffling. Replay tensors (already
+        tensors in the buffer) are stacked directly and the current batch is
+        concatenated on-device, removing the per-element numpy round-trip.
         """
-
-        if x is not None:
-            mxi = np.array(x)
-            myi = np.array(y)
-            mti = np.ones(x.shape[0], dtype=int) * t
-        else:
-            mxi = np.empty(shape=(0, 0))
-            myi = np.empty(shape=(0, 0))
-            mti = np.empty(shape=(0, 0))
-
-        bxs = []
-        bys = []
-        bts = []
 
         if self.cfg.use_old_task_memory and t > 0:
             MEM = self.M
@@ -166,33 +156,35 @@ class BaseNet(torch.nn.Module):
 
         batch_size = self.batchSize if batch_size is None else batch_size
 
+        replay_x = []
+        replay_y = []
+        replay_t = []
         # Sample from memory buffer if not empty
         if len(MEM) > 0:
-            order = [i for i in range(0, len(MEM))]
             osize = min(batch_size, len(MEM))
-            for j in range(0, osize):
+            for k in random.choices(range(len(MEM)), k=osize):
+                mx, my, mt = MEM[k]
+                replay_x.append(torch.as_tensor(mx))
+                replay_y.append(int(torch.as_tensor(my).long().flatten()[0].item()))
+                replay_t.append(int(torch.as_tensor(mt).long().flatten()[0].item()))
 
-                # randomly sample from self.M_new memory buffer
-                shuffle(order)
-                k = order[j]
-                x, y, t = MEM[k]
-
-                xi = np.array(x)
-                yi_scalar = int(torch.as_tensor(y).long().flatten()[0].item())
-                ti = np.array(t)
-                bxs.append(xi)
-                bys.append(yi_scalar)
-                bts.append(ti)
+        parts_x, parts_y, parts_t = [], [], []
+        if replay_x:
+            parts_x.append(torch.stack(replay_x).float())
+            parts_y.append(torch.tensor(replay_y, dtype=torch.long))
+            parts_t.append(torch.tensor(replay_t, dtype=torch.long))
 
         # add new data points - ratio of old to new becomes up to 1:1
-        for j in range(len(myi)):
-            bxs.append(mxi[j])
-            bys.append(myi[j])
-            bts.append(mti[j])
+        if x is not None:
+            cur_x = torch.as_tensor(x).float()
+            n_cur = cur_x.shape[0]
+            parts_x.append(cur_x)
+            parts_y.append(torch.as_tensor(y).long().reshape(-1))
+            parts_t.append(torch.full((n_cur,), int(t), dtype=torch.long))
 
-        bxs = Variable(torch.from_numpy(np.array(bxs))).float()
-        bys = Variable(torch.from_numpy(np.array(bys))).long().view(-1)
-        bts = Variable(torch.from_numpy(np.array(bts))).long().view(-1)
+        bxs = torch.cat([p.cpu() for p in parts_x], dim=0).float()
+        bys = torch.cat([p.cpu() for p in parts_y], dim=0).long().view(-1)
+        bts = torch.cat([p.cpu() for p in parts_t], dim=0).long().view(-1)
 
         # handle gpus if specified
         if self.use_cuda:

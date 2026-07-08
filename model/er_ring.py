@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import copy
 from dataclasses import dataclass
 
 import torch
@@ -15,6 +16,7 @@ from model.detection_replay import (
     unpack_y_to_class_labels,
 )
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from utils.training_metrics import macro_recall
 from utils import misc_utils
@@ -31,7 +33,10 @@ class ErRingConfig:
 
     batch_size: int = 128
     cuda: bool = True
-    # temperature: float = 2.0
+    temperature: float = 5.0
+    er_distill: bool = False
+    er_lwf: bool = False
+    er_replay_noise: bool = False
     det_lambda: float = 1.0
     cls_lambda: float = 1.0
     det_memories: int = 2000
@@ -53,7 +58,13 @@ class Net(DetectionReplayMixin, torch.nn.Module):
         super(Net, self).__init__()
         self.cfg = ErRingConfig.from_args(args)
         self.reg = self.cfg.memory_strength
-        # self.temp = self.cfg.temperature
+        self.temp = self.cfg.temperature
+        self.use_distill = bool(self.cfg.er_distill)
+        self.use_lwf = bool(self.cfg.er_lwf)
+        self.replay_noise = bool(self.cfg.er_replay_noise)
+        if self.replay_noise and self.use_distill:
+            raise ValueError("--er_replay_noise does not support --er_distill")
+        self.teacher = None  # frozen model snapshot for LwF (current-data distillation)
         # setup network
         self.is_task_incremental = True
         self.net = ResNet1D(n_outputs, args)
@@ -184,37 +195,28 @@ class Net(DetectionReplayMixin, torch.nn.Module):
         return output
 
     def memory_sampling(self, t):
-        filled_counts = [int(self.task_mem_filled[i].item()) for i in range(t)]
-        total = sum(filled_counts)
-        if total == 0:
+        # Vectorized construction of valid (task, slot) replay indices. The
+        # row-major ``nonzero`` ordering (task-major, then slot) is identical to
+        # the original nested Python loop, so ``np.random.choice`` selects the
+        # same rows — but without one GPU sync per filled slot.
+        device = self.memx.device
+        filled = self.task_mem_filled[:t]
+        if int(filled.sum().item()) == 0:
             return None
-        cum = np.cumsum([0] + filled_counts)
-        valid_flat: list[int] = []
-        for task_idx in range(t):
-            for sample_idx in range(filled_counts[task_idx]):
-                lab = int(self.memy[task_idx, sample_idx].item())
-                if lab < 0:
-                    continue
-                if self.noise_label is not None and lab == self.noise_label:
-                    continue
-                valid_flat.append(int(cum[task_idx] + sample_idx))
-        if not valid_flat:
+        labs = self.memy[:t]
+        slot_ids = torch.arange(labs.size(1), device=device).unsqueeze(0)
+        valid = (slot_ids < filled.unsqueeze(1)) & (labs >= 0)
+        if self.noise_label is not None:
+            valid &= labs != self.noise_label
+        tk, sm = torch.nonzero(valid, as_tuple=True)
+        n_valid = int(tk.numel())
+        if n_valid == 0:
             return None
-        sz = int(min(len(valid_flat), self.sz))
-        flat_indices = np.random.choice(len(valid_flat), sz, replace=False)
-        chosen = [valid_flat[i] for i in flat_indices]
-
-        # map flat indices to task/sample indices
-        t_idx_list = []
-        s_idx_list = []
-        for fi in chosen:
-            task_idx = max(i for i in range(len(cum) - 1) if cum[i] <= fi)
-            sample_idx = fi - cum[task_idx]
-            t_idx_list.append(task_idx)
-            s_idx_list.append(sample_idx)
-
-        t_idx = torch.tensor(t_idx_list, dtype=torch.long, device=self.memx.device)
-        s_idx = torch.tensor(s_idx_list, dtype=torch.long, device=self.memx.device)
+        sz = int(min(n_valid, self.sz))
+        flat_indices = np.random.choice(n_valid, sz, replace=False)
+        sel = torch.as_tensor(flat_indices, device=device, dtype=torch.long)
+        t_idx = tk[sel]
+        s_idx = sm[sel]
 
         offsets = torch.tensor(
             [self.compute_offsets(int(i)) for i in t_idx.tolist()],
@@ -231,6 +233,54 @@ class Net(DetectionReplayMixin, torch.nn.Module):
             )
         sizes = (offsets[:, 1] - offsets[:, 0]).long()
         return xx, yy, feat, mask.long(), sizes
+
+    def memory_sampling_global(self, t):
+        """Sample replay rows keeping GLOBAL labels, noise included.
+
+        Counterpart to `memory_sampling` for the --er_replay_noise ablation:
+        rows are scored on task-masked global logits (the shared noise class
+        stays visible under each task's mask), so noise samples can replay.
+        """
+        # Vectorized: valid rows are all filled slots with a non-negative label
+        # (noise included). Row-major nonzero ordering matches the original
+        # task-major/slot loop, so np.random.choice selects identical rows.
+        device = self.memx.device
+        filled = self.task_mem_filled[:t]
+        if int(filled.sum().item()) == 0:
+            return None
+        labs = self.memy[:t]
+        slot_ids = torch.arange(labs.size(1), device=device).unsqueeze(0)
+        valid = (slot_ids < filled.unsqueeze(1)) & (labs >= 0)
+        tk, sm = torch.nonzero(valid, as_tuple=True)
+        n_valid = int(tk.numel())
+        if n_valid == 0:
+            return None
+        sz = int(min(n_valid, self.sz))
+        chosen = np.random.choice(n_valid, sz, replace=False)
+        sel = torch.as_tensor(chosen, device=device, dtype=torch.long)
+        t_idx = tk[sel]
+        s_idx = sm[sel]
+        return self.memx[t_idx, s_idx], self.memy[t_idx, s_idx], t_idx
+
+    def _masked_global_replay_loss(self, xx, yy_global, t_idx):
+        """CE on replay rows with each row masked to its own task's logits."""
+        raw = self.net(xx)
+        masked = raw.clone()
+        for task_id in torch.unique(t_idx).tolist():
+            rows = t_idx == int(task_id)
+            masked[rows] = misc_utils.apply_task_incremental_logit_mask(
+                raw[rows],
+                int(task_id),
+                self.classes_per_task,
+                self.n_outputs,
+                cil_all_seen_upto_task=int(task_id),
+                global_noise_label=self.noise_label,
+                fill_value=-10e10,
+                loader=self.incremental_loader_name,
+            )
+        return classification_cross_entropy(
+            masked, yy_global, class_weighted_ce=self.class_weighted_ce
+        )
 
     def observe(self, x, y, t):
         # t = info[0]
@@ -288,9 +338,27 @@ class Net(DetectionReplayMixin, torch.nn.Module):
 
         if t != self.current_task:
             tt = self.current_task
-            offset1, offset2 = self.compute_offsets(tt)
-            # out = self.forward(self.memx[tt],tt, True)
-            # self.mem_feat[tt] = F.softmax(out[:, offset1:offset2] / self.temp, dim=1 ).data.clone()
+            # Distillation: freeze softmax soft targets on the finished task's buffer,
+            # mirroring BCL-Dual / gem_distill. No-op when distillation is disabled.
+            if self.use_distill:
+                previous_filled = int(self.task_mem_filled[tt].item())
+                if previous_filled > 0:
+                    offset1, offset2 = self.compute_offsets(tt)
+                    cls_size = int(offset2 - offset1)
+                    out = self.forward(self.memx[tt, :previous_filled], tt, True)
+                    feat = self.mem_feat[tt, :previous_filled]
+                    feat.zero_()
+                    feat[:, :cls_size] = F.softmax(
+                        out[:, offset1:offset2] / self.temp, dim=1
+                    ).data.clone()
+            # LwF: snapshot the just-finished model as a frozen teacher. Unlike the
+            # distill term above (frozen soft targets on buffer samples), the LwF term
+            # distills on the CURRENT task's incoming data against this teacher.
+            if self.use_lwf:
+                self.teacher = copy.deepcopy(self.net)
+                self.teacher.eval()
+                for param in self.teacher.parameters():
+                    param.requires_grad = False
             self.current_task = t
 
         cls_tr_rec = []
@@ -316,10 +384,16 @@ class Net(DetectionReplayMixin, torch.nn.Module):
                 targets,
                 class_weighted_ce=self.class_weighted_ce,
             )
-            if t > 0:
+            loss3 = torch.tensor(0.0).cuda()
+            if t > 0 and self.replay_noise:
+                sampled = self.memory_sampling_global(t)
+                if sampled is not None:
+                    xx, yy_g, t_idx = sampled
+                    loss2 += self._masked_global_replay_loss(xx, yy_g, t_idx)
+            elif t > 0:
                 sampled = self.memory_sampling(t)
                 if sampled is not None:
-                    xx, yy, target, mask, class_sizes = sampled
+                    xx, yy, feat, mask, class_sizes = sampled
                     pred_ = self.net(xx)
                     pred = torch.gather(pred_, 1, mask)
                     for row, size in enumerate(class_sizes):
@@ -333,8 +407,27 @@ class Net(DetectionReplayMixin, torch.nn.Module):
                     loss2 += classification_cross_entropy(
                         pred, yy, class_weighted_ce=self.class_weighted_ce
                     )
+                    if self.use_distill:
+                        # KL distillation against frozen soft targets (matches BCL-Dual loss3).
+                        loss3 = self.reg * self.kl(
+                            F.log_softmax(pred / self.temp, dim=1), feat
+                        )
 
-            loss = loss1 + (self.memory_loss_lambda * loss2)
+            loss_lwf = torch.tensor(0.0).cuda()
+            if self.use_lwf and self.teacher is not None and offset1 > 0:
+                # LwF: distill student->teacher over PREVIOUS-task classes [0, offset1)
+                # on the CURRENT batch x (not buffer samples). Matched to the distill
+                # term's weighting (self.reg, self.temp, same KL norm) so the only
+                # difference is the data/teacher source.
+                student_prev = self.net(x)[:, :offset1]
+                with torch.no_grad():
+                    teacher_prev = self.teacher(x)[:, :offset1]
+                    teacher_probs = F.softmax(teacher_prev / self.temp, dim=1)
+                loss_lwf = self.reg * self.kl(
+                    F.log_softmax(student_prev / self.temp, dim=1), teacher_probs
+                )
+
+            loss = loss1 + (self.memory_loss_lambda * loss2) + loss3 + loss_lwf
             loss.backward()
             self.opt.step()
             metric_logits = logits.detach()
