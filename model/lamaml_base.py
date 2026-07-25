@@ -29,6 +29,20 @@ class LamamlBaseConfig:
     n_layers: int = 2
     n_hiddens: int = 100
     input_channels: int = 1
+    # PROBE: twin of eralg4's --eralg4_joint_er. Split the meta-loss forward into
+    # separate replay/current passes so BatchNorm does not mix their statistics.
+    cmaml_joint_er: bool = False
+    # How the meta loss combines replay and current rows. "split" (default) is
+    # eralg4's ``current + memory_loss_lambda * replay`` -- two separately
+    # normalized CEs, so replay's share of the loss is pinned at 1:1. "pooled" is
+    # the legacy single CE over the concatenated batch, whose inverse-frequency
+    # class weights are computed over that pooled batch: old-task classes are rare
+    # there, so replay's share escalates with task count (0.34 at task 0 to 0.85
+    # by task 9) and starves the current task. "split_norm" divides "split" by
+    # ``1 + memory_loss_lambda`` to pin the share without doubling the loss scale.
+    # See docs/cmaml_vs_reser_til.md.
+    cmaml_replay_loss_mode: str = "split"
+    memory_loss_lambda: float = 1.0
 
     @staticmethod
     def from_args(args: object) -> "LamamlBaseConfig":

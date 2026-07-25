@@ -56,16 +56,76 @@ class Net(DetectionReplayMixin, BaseNet):  # noqa: F405
             loader=self.incremental_loader_name,
         )
 
-    def meta_loss(self, x, fast_weights, y, bt, t):
+    def meta_loss(self, x, fast_weights, y, bt, t, replay_count=None):
         """
         differentiate the loss through the network updates wrt alpha
+
+        With ``--cmaml_joint_er`` (PROBE, twin of eralg4's ``--eralg4_joint_er``)
+        the concatenated getBatch batch ``x`` is forwarded in two separate
+        passes -- replay rows (``x[:replay_count]``) then current rows
+        (``x[replay_count:]``) -- so backbone BatchNorm normalizes each with its
+        own statistics instead of the pooled replay+current mixture. The two
+        logit blocks are concatenated (preserving replay-first alignment with
+        ``bt``/``y``) and scored with the identical mask + single CE, so the ONLY
+        change vs the default single forward is the BN statistics split. This
+        isolates the concat BN-mixing retention effect eralg4's probe revealed.
+
+        ``--cmaml_replay_loss_mode`` controls how the replay and current blocks
+        are combined *after* the forward; it defaults to ``split``, matching
+        eralg4's ``_weighted_multitask_loss``.
         """
 
-        raw = self.net.forward(x, fast_weights)
+        if (
+            self.cfg.cmaml_joint_er
+            and replay_count is not None
+            and 0 < int(replay_count) < x.size(0)
+        ):
+            rc = int(replay_count)
+            replay_raw = self.net.forward(x[:rc], fast_weights)
+            current_raw = self.net.forward(x[rc:], fast_weights)
+            raw = torch.cat([replay_raw, current_raw], dim=0)
+        else:
+            raw = self.net.forward(x, fast_weights)
         logits = self._mask_logits_for_sample_tasks(raw, bt)
-        loss_q = self.take_multitask_loss(bt, t, logits, y)
+        loss_q = self._combine_replay_current_loss(bt, t, logits, y, replay_count)
 
         return loss_q, logits
+
+    def _combine_replay_current_loss(self, bt, t, logits, y, replay_count):
+        """Meta-loss reduction over the replay-then-current getBatch layout.
+
+        ``split`` (default) mirrors eralg4's
+        ``current + memory_loss_lambda * replay``: each block gets its own mean,
+        pinning replay's share of the loss at 1:1. ``split_norm`` renormalizes by
+        ``1 + memory_loss_lambda`` to hold the total loss scale fixed as well.
+
+        ``pooled`` is the legacy single CE over every row. It looks like a
+        neutral bookkeeping choice but is not: the inverse-frequency class
+        weights are derived from the pooled batch, where the ~256 current rows
+        span one task's classes while the ~128 replay rows spread over every task
+        seen so far. Old-task classes are therefore rare and collect much larger
+        per-row weights, so replay's share of the loss escalates with task count
+        -- 0.34 at task 0 rising to 0.85 by task 9, at which point the current
+        task receives 15% of the gradient. Worth ~3 F1 of plasticity in
+        single-epoch TIL (docs/cmaml_vs_reser_til.md); retained only to reproduce
+        runs logged before 2026-07-25.
+        """
+        mode = self.cfg.cmaml_replay_loss_mode
+        rc = (
+            0
+            if replay_count is None
+            else max(0, min(int(replay_count), logits.size(0)))
+        )
+        if mode == "pooled" or rc == 0 or rc == logits.size(0):
+            return self.take_multitask_loss(bt, t, logits, y)
+
+        replay_loss = self.take_multitask_loss(bt[:rc], t, logits[:rc], y[:rc])
+        current_loss = self.take_multitask_loss(bt[rc:], t, logits[rc:], y[rc:])
+        mll = float(self.cfg.memory_loss_lambda)
+        total = current_loss + mll * replay_loss
+        if mode == "split_norm":
+            total = total / (1.0 + mll)
+        return total
 
     def _mask_logits_for_sample_tasks(
         self, raw_logits: torch.Tensor, sample_task_indices: torch.Tensor
@@ -231,6 +291,10 @@ class Net(DetectionReplayMixin, BaseNet):  # noqa: F405
             # computing meta-loss
             y_np = unpack_y_to_class_labels(y).long().cpu().numpy()
             bx, by, bt = self.getBatch(x.detach().cpu().numpy(), y_np, t)
+            # getBatch appends the current batch (``x.size(0)`` rows) after the
+            # replay rows, so the replay block is the leading remainder. Used by
+            # the --cmaml_joint_er probe to split the meta-loss forward.
+            replay_count = max(0, bx.size(0) - x.size(0))
 
             for i in range(n_batches):
 
@@ -247,7 +311,9 @@ class Net(DetectionReplayMixin, BaseNet):  # noqa: F405
                         batch_y,
                         torch.tensor(t),
                     )
-                meta_loss, logits = self.meta_loss(bx, fast_weights, by, bt, t)
+                meta_loss, logits = self.meta_loss(
+                    bx, fast_weights, by, bt, t, replay_count=replay_count
+                )
                 with torch.no_grad():
                     # Vectorized equivalent of the per-sample argmax loop: for
                     # each row, argmax within its own task's class slice
@@ -256,9 +322,7 @@ class Net(DetectionReplayMixin, BaseNet):  # noqa: F405
                     # argmax exact, avoiding one GPU sync per sample.
                     by_dev = by.long().view(-1)
                     bt_list = bt.long().view(-1).tolist()
-                    offsets = {
-                        tid: self.compute_offsets(tid) for tid in set(bt_list)
-                    }
+                    offsets = {tid: self.compute_offsets(tid) for tid in set(bt_list)}
                     o1 = torch.tensor(
                         [offsets[tid][0] for tid in bt_list],
                         device=logits.device,
@@ -278,9 +342,7 @@ class Net(DetectionReplayMixin, BaseNet):  # noqa: F405
                     if self.noise_label is not None:
                         keep &= by_dev != self.noise_label
                     if keep.any():
-                        cls_tr_rec.append(
-                            macro_recall(preds[keep], targets[keep])
-                        )
+                        cls_tr_rec.append(macro_recall(preds[keep], targets[keep]))
 
                 meta_losses[i] += meta_loss
 
