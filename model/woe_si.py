@@ -84,6 +84,14 @@ _CENTERING_MODES = ("centered_uniform", "raw_uniform", "full_lc")
 #   "output"    -- no path integral at all: distil the DS output evidence
 #                  (w_plus / w_minus) of a frozen end-of-task teacher (LwF-style).
 _REG_LEVELS = ("parameter", "channel", "output")
+# How the quadratic anchor is applied to the parameters:
+#   "loss"     -- add lambda * sum_i Omega_i (theta_i - theta_i*)^2 to the training
+#                 loss and let the optimiser descend it (the original behaviour).
+#   "proximal" -- keep the anchor out of the backward pass entirely and apply its
+#                 closed-form minimiser as a post-step update. See
+#                 ``Net._apply_proximal_anchor`` for the derivation and why it is
+#                 unconditionally stable where the loss form is not.
+_ANCHOR_MODES = ("loss", "proximal")
 
 
 def compute_weights_of_evidence(
@@ -235,6 +243,13 @@ class WoeSiConfig:
       ``_REG_LEVELS``. ``"output"`` is a functional (evidence-distillation)
       penalty and is *not* on the SI path-integral scale, so it needs its own
       ``woe_lambda``.
+    * ``woe_omega_winsorise`` -- quantile in ``(0, 1)`` at which the cumulative
+      ``Omega`` is capped after each consolidation; ``0`` (default) disables it.
+      The path integral is extremely heavy-tailed in practice, so a handful of
+      parameters can otherwise carry curvature the optimiser cannot integrate.
+    * ``woe_anchor_mode`` -- ``"loss"`` (default) or ``"proximal"``; see
+      ``_ANCHOR_MODES``. Ignored when ``woe_reg_level`` is ``"output"``, which is
+      a functional penalty with no per-parameter anchor to apply.
     """
 
     inner_steps: int = 1
@@ -247,6 +262,8 @@ class WoeSiConfig:
     woe_importance_stride: int = 1
     woe_conflict_weighting: bool = False
     woe_reg_level: str = "parameter"
+    woe_omega_winsorise: float = 0.0
+    woe_anchor_mode: str = "loss"
 
     optimizer: str = "sgd"
     clipgrad: Optional[float] = 100.0
@@ -314,6 +331,23 @@ class Net(DetectionReplayMixin, nn.Module):
                 f"woe_reg_level must be one of {_REG_LEVELS}, "
                 f"got {self.cfg.woe_reg_level!r}"
             )
+        if self.cfg.woe_anchor_mode not in _ANCHOR_MODES:
+            raise ValueError(
+                f"woe_anchor_mode must be one of {_ANCHOR_MODES}, "
+                f"got {self.cfg.woe_anchor_mode!r}"
+            )
+        self.omega_winsorise = float(self.cfg.woe_omega_winsorise)
+        if not 0.0 <= self.omega_winsorise < 1.0:
+            raise ValueError(
+                "woe_omega_winsorise must lie in [0, 1) (0 disables capping), "
+                f"got {self.omega_winsorise!r}"
+            )
+        self.anchor_mode = str(self.cfg.woe_anchor_mode)
+        # "output" is a functional penalty with no per-parameter anchor, so the
+        # proximal path never applies there.
+        self.use_proximal_anchor = (
+            self.anchor_mode == "proximal" and self.cfg.woe_reg_level != "output"
+        )
         self.reg_level = str(self.cfg.woe_reg_level)
         self.woe_lambda = float(self.cfg.woe_lambda)
         self.xi = float(self.cfg.woe_xi)
@@ -415,6 +449,11 @@ class Net(DetectionReplayMixin, nn.Module):
 
             if self.reg_level == "output":
                 reg = self._evidence_distillation_loss(x, t)
+            elif self.use_proximal_anchor:
+                # The anchor is applied in closed form after the optimiser step
+                # instead, so it contributes nothing to this backward pass -- and
+                # therefore nothing to the global gradient-norm clip budget.
+                reg = torch.zeros(1, device=self._device())
             else:
                 reg = self._surrogate_loss()
             loss = self.cls_lambda * loss_ce + self.woe_lambda * reg
@@ -427,6 +466,8 @@ class Net(DetectionReplayMixin, nn.Module):
             if self.clipgrad is not None:
                 torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.clipgrad)
             self.opt.step()
+            if self.use_proximal_anchor:
+                self._apply_proximal_anchor()
 
             # ----- 3) Accumulate the I_2 path integral over the window -----
             window_end = (
@@ -630,6 +671,9 @@ class Net(DetectionReplayMixin, nn.Module):
                 omega.copy_(per_channel.expand_as(omega))
             prev.copy_(param.detach())
             w_buf.zero_()
+        # Cap the tail once every buffer for this task has been folded in, so the
+        # quantile is taken over the final cumulative Omega.
+        self._winsorise_omega()
         # Output mode distils a frozen end-of-task snapshot; capture it (and the
         # feature mean it must centre with) *before* the per-task stats are reset.
         if self.reg_level == "output":
@@ -674,6 +718,76 @@ class Net(DetectionReplayMixin, nn.Module):
             prev = getattr(self, f"{key}_woe_prev")
             loss = loss + (omega * (param - prev).pow(2)).sum()
         return loss
+
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def _apply_proximal_anchor(self) -> None:
+        """Apply the quadratic anchor as a closed-form post-step update.
+
+        The loss form takes an explicit gradient step on ``lambda*Omega*(theta -
+        theta*)^2``, whose curvature is ``k = 2*lambda*Omega``. Explicit descent on
+        a quadratic is stable only while ``lr*k < 2``; the path integral is heavy
+        tailed enough that a few parameters land far outside that window, diverge,
+        and -- because ``clip_grad_norm_`` rescales every gradient by one global
+        scalar -- drag the whole network's effective learning rate down with them.
+
+        The proximal (backward-Euler) form evaluates the anchor gradient at the
+        *new* point, ``theta_new = theta+ - lr*2*lambda*Omega*(theta_new -
+        theta*)``, which solves in closed form to a convex combination::
+
+            b = 2 * lr * lambda * Omega
+            theta_new = (theta+ + b * theta*) / (1 + b)
+                      = (1 - a) * theta+ + a * theta*,   a = b/(1+b) in [0, 1)
+
+        Because ``a`` saturates at 1 for any ``Omega``, the update can never
+        overshoot the anchor: ``Omega -> 0`` leaves the parameter free and
+        ``Omega -> inf`` pins it exactly to ``theta*``. It is also a no-op on the
+        first task, where ``Omega`` is still all zeros.
+        """
+        learning_rate = float(self.opt.param_groups[0]["lr"])
+        scale = 2.0 * learning_rate * self.woe_lambda
+        if scale == 0.0:
+            return
+        for name in self._tracked_names:
+            param = self._tracked_params[name]
+            key = self._param_to_key[name]
+            omega = getattr(self, f"{key}_woe_omega")
+            prev = getattr(self, f"{key}_woe_prev")
+            b = omega * scale
+            param.copy_((param + b * prev) / (1.0 + b))
+
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def _winsorise_omega(self) -> None:
+        """Cap cumulative ``Omega`` at a global quantile across all buffers.
+
+        The per-parameter path integral is heavy tailed -- in practice a handful
+        of weights accumulate importance orders of magnitude above the 99th
+        percentile, which is what pushes the loss-form anchor outside its
+        stability window. Capping at ``woe_omega_winsorise`` bounds the curvature
+        while leaving the relative ordering of every other parameter untouched.
+
+        The quantile is taken over the concatenation of all tracked buffers, not
+        per tensor, because the tail is concentrated in one layer -- a per-tensor
+        cap would simply rescale that layer's own outliers against each other.
+        ``kthvalue`` is used rather than ``torch.quantile`` so the computation is
+        exact regardless of parameter count (``quantile`` caps out around 2**24).
+        """
+        if self.omega_winsorise <= 0.0:
+            return
+        buffers = [
+            getattr(self, f"{self._param_to_key[name]}_woe_omega")
+            for name in self._tracked_names
+        ]
+        if not buffers:
+            return
+        flat = torch.cat([buf.reshape(-1) for buf in buffers])
+        index = max(
+            1, min(flat.numel(), int(round(self.omega_winsorise * flat.numel())))
+        )
+        cap = torch.kthvalue(flat.float(), index).values
+        for buf in buffers:
+            buf.clamp_(max=cap.to(buf.dtype))
 
     # ------------------------------------------------------------------
     def _evidence_distillation_loss(self, x: torch.Tensor, t: int) -> torch.Tensor:

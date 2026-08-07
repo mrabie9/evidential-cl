@@ -708,6 +708,31 @@ def get_parser():
         ),
     )
 
+    parser.add_argument(
+        "--woe_omega_winsorise",
+        type=float,
+        default=0.0,
+        help=(
+            "WoE-SI: cap cumulative Omega at this global quantile after each "
+            "consolidation (e.g. 0.999). 0 (default) disables capping. The path "
+            "integral is heavy tailed; a few outliers otherwise carry curvature "
+            "the optimiser cannot integrate."
+        ),
+    )
+    parser.add_argument(
+        "--woe_anchor_mode",
+        type=str,
+        default="loss",
+        choices=["loss", "proximal"],
+        help=(
+            "WoE-SI: how to apply the quadratic anchor. 'loss' adds it to the "
+            "training loss (original). 'proximal' applies its closed-form "
+            "minimiser after the optimiser step, keeping it out of the backward "
+            "pass and the gradient-norm clip budget; unconditionally stable for "
+            "any Omega. Ignored when woe_reg_level='output'."
+        ),
+    )
+
     # WoE-SI + reservoir experience replay (model: woe_si_replay).
     parser.add_argument(
         "--woe_replay_memories",

@@ -61,6 +61,8 @@ def _make_args(loader: str, **overrides) -> object:
     o.woe_importance_stride = overrides.get("woe_importance_stride", 1)
     o.woe_conflict_weighting = overrides.get("woe_conflict_weighting", False)
     o.woe_reg_level = overrides.get("woe_reg_level", "parameter")
+    o.woe_omega_winsorise = overrides.get("woe_omega_winsorise", 0.0)
+    o.woe_anchor_mode = overrides.get("woe_anchor_mode", "loss")
     return o
 
 
@@ -506,3 +508,134 @@ def test_integration_woe_si_reduces_forgetting_vs_naive() -> None:
     assert woe["omega"] > 0.0
     assert woe["bwt"] >= naive["bwt"] - 0.05
     assert woe["task0_retained"] >= naive["task0_retained"] - 0.05
+
+
+# ----------------------------------------------------------------------
+# Proximal anchor and Omega winsorisation
+# ----------------------------------------------------------------------
+def _set_omega(model: Net, name: str, value: float) -> None:
+    """Force one tracked buffer's cumulative ``Omega`` to a constant."""
+    key = model._param_to_key[name]
+    getattr(model, f"{key}_woe_omega").fill_(value)
+
+
+def test_proximal_anchor_matches_closed_form() -> None:
+    """The post-step update equals ``(theta + b*theta*) / (1 + b)`` exactly."""
+    model = Net(
+        1, 6, 2, _make_args("task_incremental_loader", woe_anchor_mode="proximal")
+    )
+    name = model._tracked_names[0]
+    key = model._param_to_key[name]
+    param = model._tracked_params[name]
+
+    omega_value, lr, lam = (
+        0.25,
+        float(model.opt.param_groups[0]["lr"]),
+        model.woe_lambda,
+    )
+    _set_omega(model, name, omega_value)
+    getattr(model, f"{key}_woe_prev").fill_(0.5)
+
+    before = param.detach().clone()
+    model._apply_proximal_anchor()
+
+    b = 2.0 * lr * lam * omega_value
+    expected = (before + b * 0.5) / (1.0 + b)
+    assert torch.allclose(param.detach(), expected, atol=1e-6)
+
+
+def test_proximal_anchor_never_overshoots() -> None:
+    """For any Omega the result stays on the segment between theta and theta*."""
+    model = Net(
+        1, 6, 2, _make_args("task_incremental_loader", woe_anchor_mode="proximal")
+    )
+    name = model._tracked_names[0]
+    key = model._param_to_key[name]
+    param = model._tracked_params[name]
+    anchor = 0.5
+
+    # 1e6 puts lr*k ~ 1e7, far outside the explicit-step stability window lr*k < 2.
+    for omega_value in (0.0, 1.0, 1e3, 1e6):
+        with torch.no_grad():
+            param.fill_(2.0)
+        _set_omega(model, name, omega_value)
+        getattr(model, f"{key}_woe_prev").fill_(anchor)
+        model._apply_proximal_anchor()
+
+        updated = param.detach()
+        assert torch.isfinite(updated).all()
+        # Convex combination of 2.0 and 0.5 => must lie within [0.5, 2.0].
+        assert (updated >= anchor - 1e-6).all() and (updated <= 2.0 + 1e-6).all()
+
+
+def test_proximal_anchor_pins_as_omega_grows() -> None:
+    """Omega -> inf drives the parameter onto its anchor; Omega = 0 leaves it free."""
+    model = Net(
+        1, 6, 2, _make_args("task_incremental_loader", woe_anchor_mode="proximal")
+    )
+    name = model._tracked_names[0]
+    key = model._param_to_key[name]
+    param = model._tracked_params[name]
+    getattr(model, f"{key}_woe_prev").fill_(0.5)
+
+    with torch.no_grad():
+        param.fill_(2.0)
+    _set_omega(model, name, 0.0)
+    model._apply_proximal_anchor()
+    assert torch.allclose(param.detach(), torch.full_like(param, 2.0))
+
+    with torch.no_grad():
+        param.fill_(2.0)
+    _set_omega(model, name, 1e12)
+    model._apply_proximal_anchor()
+    assert torch.allclose(param.detach(), torch.full_like(param, 0.5), atol=1e-4)
+
+
+def test_proximal_mode_keeps_anchor_out_of_the_backward_pass() -> None:
+    """In proximal mode the surrogate penalty contributes no gradient."""
+    args = _make_args("task_incremental_loader", woe_anchor_mode="proximal")
+    model = Net(1, 6, 2, args)
+    name = model._tracked_names[0]
+    _set_omega(model, name, 10.0)
+    getattr(model, f"{model._param_to_key[name]}_woe_prev").fill_(0.5)
+
+    assert model.use_proximal_anchor
+    # The loss-form penalty would be large here; proximal mode must not add it.
+    assert model._surrogate_loss().item() > 0.0
+    x = torch.randn(4, 2, 1024)
+    y = torch.randint(0, 3, (4,))
+    loss, _, _ = model.observe(x, y, 0)
+    assert torch.isfinite(torch.tensor(loss))
+
+
+def test_winsorise_caps_omega_at_the_requested_quantile() -> None:
+    """Capping bounds the tail without disturbing sub-quantile entries."""
+    model = Net(1, 6, 2, _make_args("task_incremental_loader", woe_omega_winsorise=0.9))
+    for name in model._tracked_names:
+        _set_omega(model, name, 1e-4)
+    spike_name = model._tracked_names[0]
+    spike_key = model._param_to_key[spike_name]
+    getattr(model, f"{spike_key}_woe_omega").reshape(-1)[0] = 1e6
+
+    model._winsorise_omega()
+
+    flat = torch.cat(
+        [
+            getattr(model, f"{model._param_to_key[n]}_woe_omega").reshape(-1)
+            for n in model._tracked_names
+        ]
+    )
+    assert flat.max().item() <= 1e-4 + 1e-9
+    assert torch.isfinite(flat).all()
+
+
+def test_winsorise_disabled_by_default() -> None:
+    """``woe_omega_winsorise = 0`` leaves the tail untouched."""
+    model = Net(1, 6, 2, _make_args("task_incremental_loader"))
+    name = model._tracked_names[0]
+    key = model._param_to_key[name]
+    _set_omega(model, name, 1e-4)
+    getattr(model, f"{key}_woe_omega").reshape(-1)[0] = 1e6
+
+    model._winsorise_omega()
+    assert getattr(model, f"{key}_woe_omega").reshape(-1)[0].item() == 1e6
