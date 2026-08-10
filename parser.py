@@ -94,6 +94,47 @@ def get_parser():
         "current-task loss). 0 disables distillation (pure GEM).",
     )
     parser.add_argument(
+        "--gembob_dynamic_ring",
+        action="store_true",
+        help="gem_bob: fully-utilised ring buffer (ablation row E2). Re-splits the replay "
+        "budget across only the tasks seen so far instead of pre-partitioning into n_tasks "
+        "fixed 1/T slices, so the buffer is always full; converges to the same final split. "
+        "Ported from --er_dynamic_ring.",
+    )
+    parser.add_argument(
+        "--gembob_distill",
+        action="store_true",
+        help="gem_bob: KL distillation on frozen per-task soft targets (ablation rows B1/T2), "
+        "weighted by --distill_lambda at --temperature. Gated separately from "
+        "--distill_lambda because that flag defaults to 1.0, which would otherwise switch "
+        "distillation on in the add-one baseline.",
+    )
+    parser.add_argument(
+        "--gembob_bilevel",
+        action="store_true",
+        help="gem_bob: bilevel inner/outer round (ablation row B5b). Each round takes an "
+        "inner step on the training objective (QP-projected) followed by an outer step on a "
+        "held-out validation buffer (unprojected), then a Reptile interpolation at --beta. "
+        "Costs 2 SGD steps per round: budget-match by halving --inner_steps.",
+    )
+    parser.add_argument(
+        "--gembob_val_memories",
+        default=512,
+        type=int,
+        help="gem_bob: total held-out validation budget for the --gembob_bilevel outer step, "
+        "split evenly across tasks. Rows are removed from the training stream, not copied, "
+        "so the validation buffer stays disjoint.",
+    )
+    parser.add_argument(
+        "--gembob_meta_batches",
+        default=1,
+        type=int,
+        help="gem_bob: meta-batch averaging (ablation row M3). Accumulates the current-batch "
+        "CE gradient over K chunks before a single projected step, so it is budget-neutral. "
+        "1 disables it (single full-batch pass). Separate from --meta_batches, which defaults "
+        "to 3 and would otherwise switch this on in the add-one baseline.",
+    )
+    parser.add_argument(
         "--gem_lwf",
         action="store_true",
         help="gem_distill: add a Learning-without-Forgetting term — KL over previous-task "
