@@ -65,6 +65,20 @@ def get_parser():
         help="Ablation: disable GEM's QP gradient-projection constraint (and the past-task "
         "replay-gradient pass it feeds); reduces GEM to plain fine-tuning at matched buffer size.",
     )
+    parser.add_argument(
+        "--ctn_disable_film",
+        default=False,
+        action="store_true",
+        help="Ablation: disable CTN's task-embedding->FiLM modulation (use base features only), "
+        "isolating the FiLM head's contribution to BWT.",
+    )
+    parser.add_argument(
+        "--ctn_disable_distill",
+        default=False,
+        action="store_true",
+        help="Ablation: disable CTN's KL-distillation replay term (loss3 against frozen soft "
+        "targets); plain replay CE is kept. Isolates distillation's contribution to BWT.",
+    )
 
     # optimizer parameters influencing all models
     parser.add_argument(

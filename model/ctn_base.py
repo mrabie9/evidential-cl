@@ -93,8 +93,10 @@ class ContextNet(nn.Module):
         use_iq_aug_features: bool = False,
         iq_aug_scaling_mode: str = "none",
         iq_aug_feature_type: str = "power",
+        use_film: bool = True,
     ):
         super(ContextNet, self).__init__()
+        self.use_film = use_film
         self.in_planes = nf = 64
         # self.conv1 = conv3x3(3, nf * 1)
         # self.bn1 = nn.BatchNorm2d(nf * 1)
@@ -153,6 +155,10 @@ class ContextNet(nn.Module):
     def _apply_film(self, h4, t, use_all=True):
         device = h4.device
         B, C, _ = h4.shape
+
+        if not self.use_film:
+            # Ablation: drop the task-embedding->FiLM modulation entirely.
+            return relu(h4)
 
         if t is None:
             gamma4 = torch.zeros((B, C, 1), device=device, dtype=h4.dtype)
@@ -220,6 +226,7 @@ def ContextNet18(
     use_iq_aug_features: bool = False,
     iq_aug_scaling_mode: str = "none",
     iq_aug_feature_type: str = "power",
+    use_film: bool = True,
 ):
     return ContextNet(
         num_classes,
@@ -229,4 +236,5 @@ def ContextNet18(
         use_iq_aug_features=use_iq_aug_features,
         iq_aug_scaling_mode=iq_aug_scaling_mode,
         iq_aug_feature_type=iq_aug_feature_type,
+        use_film=use_film,
     )

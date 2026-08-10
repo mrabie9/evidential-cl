@@ -29,6 +29,7 @@ from utils.class_weighted_loss import classification_cross_entropy
 class CtnConfig:
     memory_strength: float = 0.5
     temperature: float = 5.0
+    ctn_disable_distill: bool = False  # ablation: drop the KL-distillation replay term
     task_emb: int = 64
     lr: float = 0.01
     ctx_lr: float = 0.05
@@ -74,6 +75,9 @@ class Net(DetectionReplayMixin, torch.nn.Module):
         self.cfg = CtnConfig.from_args(args)
         self.reg = self.cfg.memory_strength
         self.temp = self.cfg.temperature
+        # Ablation toggle: when False, skip the KL-distillation replay term (loss3) while
+        # keeping plain replay CE (loss2), isolating distillation's contribution to BWT.
+        self.use_distill = not bool(self.cfg.ctn_disable_distill)
         # setup network
         if self.cfg.arch == "resnet1d":
             # self.net = ResNet1D(n_outputs, args)
@@ -87,6 +91,7 @@ class Net(DetectionReplayMixin, torch.nn.Module):
                 )
             )
             in_channels = 3 if use_iq_aug_features else 2
+            use_film = not bool(getattr(args, "ctn_disable_film", False))
             self.net = ContextNet18(
                 n_outputs,
                 in_channels=in_channels,
@@ -95,6 +100,7 @@ class Net(DetectionReplayMixin, torch.nn.Module):
                 use_iq_aug_features=use_iq_aug_features,
                 iq_aug_scaling_mode=iq_aug_scaling_mode,
                 iq_aug_feature_type=iq_aug_feature_type,
+                use_film=use_film,
             )
         # self.net.define_task_lr_params(alpha_init=args.alpha_init)
         else:
@@ -522,9 +528,10 @@ class Net(DetectionReplayMixin, torch.nn.Module):
                     loss2 = classification_cross_entropy(
                         replay_pred, yy, class_weighted_ce=self.class_weighted_ce
                     )
-                    loss3 = self.reg * self.kl(
-                        F.log_softmax(replay_pred / self.temp, dim=1), feat
-                    )
+                    if self.use_distill:
+                        loss3 = self.reg * self.kl(
+                            F.log_softmax(replay_pred / self.temp, dim=1), feat
+                        )
                 loss = (
                     self.cls_lambda * loss1
                     + self.det_lambda * det_loss_value
