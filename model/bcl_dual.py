@@ -497,18 +497,9 @@ class Net(DetectionReplayMixin, torch.nn.Module):
                 )
             if not self.no_bilevel:
                 weights_before = deepcopy(self.net.state_dict())
-            pred = self.forward(x_train, t)
+            pred = self.forward(x_train, t, cil_all_seen_upto_task=t)
             signal_mask = signal_mask_exclude_noise(y_work, self.noise_label)
             logits_for_loss = pred
-            if self.is_task_incremental:
-                logits_for_loss = misc_utils.apply_task_incremental_logit_mask(
-                    pred,
-                    t,
-                    self.nc_per_task,
-                    self.n_outputs,
-                    cil_all_seen_upto_task=t,
-                    global_noise_label=self.noise_label,
-                )
             targets = y_work.long()
             preds = torch.argmax(logits_for_loss, dim=1)
             if signal_mask.any():
@@ -568,19 +559,8 @@ class Net(DetectionReplayMixin, torch.nn.Module):
                     x_train = torch.cat(
                         [x_train, rotated_validation_sample_for_meta], dim=0
                     )
-                pred = self.forward(x_train, t)
+                pred = self.forward(x_train, t, cil_all_seen_upto_task=t)
                 logits_outer_for_loss = pred
-                if self.is_task_incremental:
-                    logits_outer_for_loss = (
-                        misc_utils.apply_task_incremental_logit_mask(
-                            pred,
-                            t,
-                            self.nc_per_task,
-                            self.n_outputs,
-                            cil_all_seen_upto_task=t,
-                            global_noise_label=self.noise_label,
-                        )
-                    )
                 outer_loss = classification_cross_entropy(
                     logits_outer_for_loss,
                     targets,
