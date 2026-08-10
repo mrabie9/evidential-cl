@@ -517,6 +517,17 @@ def get_parser():
         "whether replaying noise explains C-MAML's lower p_fa vs plain replay.",
     )
     parser.add_argument(
+        "--er_dynamic_ring",
+        action="store_true",
+        help="ER-ring: dynamically re-split the replay budget across only the tasks "
+        "seen so far instead of pre-partitioning into n_tasks fixed slices. Task 0 "
+        "occupies the whole buffer; at each task boundary every prior task is shrunk to "
+        "n_memories/(seen_tasks) and the freed room is given to the new task, so the "
+        "buffer is always fully utilised (eralg4-style) while converging to the same "
+        "final per-task split. Isolates whether er_ring's deficit vs eralg4 is buffer "
+        "under-utilisation on early tasks.",
+    )
+    parser.add_argument(
         "--steps_per_sample", default=1, type=int, help="training steps per batch"
     )
 

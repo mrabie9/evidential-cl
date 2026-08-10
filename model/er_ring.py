@@ -37,6 +37,7 @@ class ErRingConfig:
     er_distill: bool = False
     er_lwf: bool = False
     er_replay_noise: bool = False
+    er_dynamic_ring: bool = False
     det_lambda: float = 1.0
     cls_lambda: float = 1.0
     det_memories: int = 2000
@@ -106,11 +107,21 @@ class Net(DetectionReplayMixin, torch.nn.Module):
         self.fisher = {}
         self.optpar = {}
         self.n_memories = int(self.cfg.n_memories)
-        self.task_memory_capacities = self._build_task_memory_capacities(
-            self.n_memories,
-            n_tasks,
-        )
-        self.max_task_memories = max(self.task_memory_capacities, default=0)
+        self.n_tasks = n_tasks
+        self.dynamic_ring = bool(self.cfg.er_dynamic_ring)
+        if self.dynamic_ring:
+            # Dynamic ring: the budget is re-split across only the tasks seen so far,
+            # so a single task (task 0) may transiently occupy the entire buffer.
+            # Storage must therefore hold n_memories rows per task; capacities start
+            # with task 0 owning everything and are shrunk at each task boundary.
+            self.task_memory_capacities = self._dynamic_task_capacities(num_seen=1)
+            self.max_task_memories = self.n_memories
+        else:
+            self.task_memory_capacities = self._build_task_memory_capacities(
+                self.n_memories,
+                n_tasks,
+            )
+            self.max_task_memories = max(self.task_memory_capacities, default=0)
 
         # Replay buffer stores canonical shape (2, 512) from _input_for_replay (2-channel or adapter output).
         seq_len = n_inputs // 2
@@ -165,6 +176,51 @@ class Net(DetectionReplayMixin, torch.nn.Module):
             base_capacity + (1 if task_index < remainder_capacity else 0)
             for task_index in range(n_tasks)
         ]
+
+    def _dynamic_task_capacities(self, num_seen: int) -> list[int]:
+        """Split the whole budget equally across the first ``num_seen`` tasks.
+
+        Tasks not yet seen get capacity 0. The remainder from an uneven division
+        is handed to the earliest seen tasks, mirroring
+        ``_build_task_memory_capacities`` so the final split (num_seen == n_tasks)
+        is identical to the static allocation.
+
+        Args:
+            num_seen: Number of tasks encountered so far (>= 1).
+
+        Returns:
+            Per-task capacities of length ``n_tasks`` summing to ``n_memories``.
+        """
+        num_seen = max(1, min(int(num_seen), self.n_tasks))
+        base_capacity = self.n_memories // num_seen
+        remainder_capacity = self.n_memories % num_seen
+        return [
+            (
+                (base_capacity + (1 if task_index < remainder_capacity else 0))
+                if task_index < num_seen
+                else 0
+            )
+            for task_index in range(self.n_tasks)
+        ]
+
+    def _reallocate_dynamic_ring(self, num_seen: int) -> None:
+        """Re-split the buffer across ``num_seen`` tasks and shrink prior tasks.
+
+        Called at each task boundary. Every already-seen task whose stored count
+        now exceeds its reduced capacity is truncated to the first ``capacity``
+        slots (the ring's current occupancy), freeing room for the new task. The
+        retained slots keep their samples and frozen distillation targets, so no
+        recompute is needed for older tasks.
+        """
+        self.task_memory_capacities = self._dynamic_task_capacities(num_seen)
+        for task_index in range(min(num_seen, self.n_tasks)):
+            capacity = self.task_memory_capacities[task_index]
+            filled = int(self.task_mem_filled[task_index].item())
+            if filled > capacity:
+                self.task_mem_filled[task_index] = capacity
+                # Occupancy is now exactly `capacity` (full); wrap the write
+                # pointer so any further writes overwrite from the start.
+                self.task_mem_ptr[task_index] = 0
 
     def compute_offsets(self, task):
         if self.is_task_incremental:
@@ -320,6 +376,11 @@ class Net(DetectionReplayMixin, torch.nn.Module):
         # x = x[signal_mask]
         # y = y_cls[signal_mask]
         y_work = unpack_y_to_class_labels(y).long()
+        if self.dynamic_ring and t != self.current_task:
+            # Re-split the budget across the tasks seen so far (task t included) and
+            # shrink prior tasks BEFORE storing this batch, so task t has room and the
+            # distillation snapshot below runs over each prior task's retained slots.
+            self._reallocate_dynamic_ring(num_seen=t + 1)
         task_capacity = int(self.task_memory_capacities[t])
         if task_capacity > 0:
             write_pointer = int(self.task_mem_ptr[t].item())
