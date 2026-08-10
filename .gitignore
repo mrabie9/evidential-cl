@@ -19,9 +19,14 @@ flo.md
 icarl.txt
 icarl2.txt
 icarl3.txt
-icarl4.txtplots/
+icarl4.txt
+plots/
 *.png
 *.pdf
 analysis/
 data
 docs/
+# Driver logs and per-experiment run output written next to the launch scripts
+scripts/logs/
+# Machine-local Claude Code settings (the shared CLAUDE.md is tracked)
+.claude/settings.local.json
