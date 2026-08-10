@@ -492,6 +492,31 @@ def get_parser():
         help="AGEM: scales replay/memory loss regularization strength.",
     )
     parser.add_argument(
+        "--er_distill",
+        action="store_true",
+        help="ER-ring: add a KL distillation penalty on replay samples (soft targets "
+        "frozen at each task boundary), weighted by --memory_strength at --temperature. "
+        "Isolates whether distillation accounts for BCL-Dual's edge over plain replay.",
+    )
+    parser.add_argument(
+        "--er_lwf",
+        action="store_true",
+        help="ER-ring: add a Learning-without-Forgetting penalty — KL distillation over "
+        "previous-task classes on the CURRENT batch against a frozen teacher snapshot "
+        "(taken at each task boundary), weighted by --memory_strength at --temperature. "
+        "Unlike --er_distill (on buffer samples) this acts on the new task's data, so it "
+        "tests whether functional regularization has leverage independent of replay. "
+        "Composable with --er_distill.",
+    )
+    parser.add_argument(
+        "--er_replay_noise",
+        action="store_true",
+        help="ER-ring: include noise-labeled buffer samples in replay, scoring replay "
+        "rows on task-masked global logits (C-MAML's meta-batch construction) instead "
+        "of the task-local gather that must exclude the shared noise class. Isolates "
+        "whether replaying noise explains C-MAML's lower p_fa vs plain replay.",
+    )
+    parser.add_argument(
         "--steps_per_sample", default=1, type=int, help="training steps per batch"
     )
 
