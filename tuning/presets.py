@@ -210,7 +210,7 @@ TUNING_PRESETS: Dict[str, TuningPreset] = {
                     "factors": (0.5, 1.0, 2.0),
                     "min": 0.1,
                     "fallback": 1.0,
-                    "values": [0.3, 1.0, 3.0, 10.0, 30.0],
+                    "values": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 3.0],
                 },
             }
         ),
