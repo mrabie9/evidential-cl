@@ -15,6 +15,42 @@ import torch
 MEM_SAMPLING_MODES: Final = ("ring", "reservoir")
 
 
+def reservoir_slots(batch_size, filled, seen, capacity):
+    """Assign destination slots for an incoming batch under reservoir sampling.
+
+    Textbook Vitter Algorithm R over a per-task buffer of ``capacity`` slots that
+    already holds ``filled`` items (dense in ``[0, filled)``) and has observed
+    ``seen`` stream items so far. Each incoming item is either written to a slot or
+    rejected, such that the buffer remains a uniform random sample of the whole
+    task stream and occupied slots stay dense in ``[0, filled)`` (so replay/
+    distillation slicing is unchanged).
+
+    Args:
+        batch_size: number of incoming items to place.
+        filled: currently occupied slot count (``0 <= filled <= capacity``).
+        seen: total stream items observed by this task's buffer so far.
+        capacity: total slots available for this task.
+
+    Returns:
+        ``(slots, filled, seen)`` where ``slots`` is a list of length
+        ``batch_size`` giving each item's destination index, or ``-1`` if the item
+        is not admitted; ``filled`` and ``seen`` are advanced past this batch.
+    """
+    slots = []
+    for _ in range(batch_size):
+        if filled < capacity:
+            # Buffer not yet full: fill the next dense slot deterministically.
+            slots.append(filled)
+            filled += 1
+        else:
+            # Buffer full: the (seen+1)-th item replaces a uniform slot with
+            # probability capacity/(seen+1), else it is dropped.
+            j = random.randint(0, seen)  # inclusive: seen+1 equally likely outcomes
+            slots.append(j if j < capacity else -1)
+        seen += 1
+    return slots, filled, seen
+
+
 def _parse_class_list(value):
     """Convert string/list/tuple values into a list of ints."""
     if value is None:
