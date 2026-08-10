@@ -1,5 +1,5 @@
 model: eralg4
 loader: task_incremental_loader
 learn_lr: false
-lr: 0.003
-memory_loss_lambda: 5
+lr: 0.01
+memory_loss_lambda: 1

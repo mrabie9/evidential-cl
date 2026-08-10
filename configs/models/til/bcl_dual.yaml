@@ -4,4 +4,4 @@ loader: task_incremental_loader
 
 lr: 0.001
 memory_strength: 1
-beta: 3.0
+beta: 1
