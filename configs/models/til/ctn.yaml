@@ -8,3 +8,4 @@ task_emb: 64
 memory_strength: 10
 
 validation: 0.3
+amp: false
