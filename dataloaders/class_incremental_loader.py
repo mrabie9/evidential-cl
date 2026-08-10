@@ -3,7 +3,7 @@ import random
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader, Subset
 from torchvision import transforms
 
 from dataloaders.idataset import _get_datasets, DummyDataset
@@ -22,6 +22,33 @@ from dataloaders.task_incremental_loader import (
 # --------
 # Datasets CIFAR and TINYIMAGENET
 # --------
+
+
+class _SharedCumulativeIQTestDataset(torch.utils.data.Dataset):
+    """Cumulative CIL test set assembled from per-task datasets by reference.
+
+    Wraps a :class:`~torch.utils.data.ConcatDataset` of per-task test datasets
+    (each referencing its task's IQ array via a :class:`Subset`) so that the many
+    retained per-task test loaders share a single resident copy of every task's
+    data instead of holding independent concatenated copies (the previous code
+    materialised an ``O(N^2)`` pile of unified/concatenated arrays across tasks).
+
+    Sample identity and ordering are unchanged versus ``np.concatenate`` of the
+    order-corrected per-task chunks, so batches (and therefore metrics) are
+    bit-identical. A real ``y`` label array is exposed because the evaluation
+    helpers (``_extract_task_labels`` / noise-label inference) introspect
+    ``loader.dataset.y``; ``ConcatDataset`` alone does not provide it.
+    """
+
+    def __init__(self, concat_dataset: ConcatDataset, y: np.ndarray):
+        self._dataset = concat_dataset
+        self.y = y
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+    def __getitem__(self, index):
+        return self._dataset[index]
 
 
 def _iq_test_arrays_can_stack_along_batch(x_chunks: list[np.ndarray]) -> bool:
@@ -96,12 +123,92 @@ class IncrementalLoader:
     def n_tasks(self):
         return len(self.increments)
 
+    def _iq_target_adc_channels(self):
+        """Mirror the ``target_adc_channels`` decision made in ``_get_loader``.
+
+        Kept in sync with the IQ branch of :meth:`_get_loader` so per-task test
+        datasets convert samples identically to the merged loader they replace.
+        """
+        iq_dataset = str(getattr(self._opt, "dataset", "")).lower() == "iq"
+        if iq_dataset and (
+            str(getattr(self._opt, "model", "")).lower() == "iid2"
+            or getattr(self._opt, "loader", "") == "class_incremental_loader"
+        ):
+            return 3
+        return None
+
+    def _iq_test_task_dataset(self, task_j):
+        """Return ``(subset, permuted_labels)`` for task ``task_j`` (cached).
+
+        The subset references ``self.iq_test[task_j]`` (no data copy) and applies
+        the fixed evaluation permutation lazily via :class:`Subset`, so every
+        cumulative loader that includes this task shares one resident copy.
+        """
+        cache = getattr(self, "_iq_test_task_dataset_cache", None)
+        if cache is None:
+            cache = {}
+            self._iq_test_task_dataset_cache = cache
+        cached = cache.get(task_j)
+        if cached is not None:
+            return cached
+        x_j, y_j = self.iq_test[task_j]
+        p_te_j = self.sample_permutations[task_j][1]
+        base = IQDataGenerator(
+            x_j, y_j, target_adc_channels=self._iq_target_adc_channels()
+        )
+        subset = Subset(base, list(p_te_j))
+        permuted_labels = np.asarray(y_j)[p_te_j]
+        cached = (subset, permuted_labels)
+        cache[task_j] = cached
+        return cached
+
+    def _build_shared_cumulative_iq_test_loader(self, current_task):
+        """Build the cumulative (tasks 0..current) IQ test loader by reference.
+
+        Returns ``(loader, n_samples)`` on success, or ``None`` when per-task
+        sample shapes are not uniform (mixed sequence lengths) — in which case
+        the caller falls back to the explicit-concatenation path so behaviour is
+        unchanged for those datasets.
+        """
+        subsets = []
+        label_chunks = []
+        sample_shape = None
+        for task_j in range(current_task + 1):
+            subset, permuted_labels = self._iq_test_task_dataset(task_j)
+            if len(subset) > 0:
+                first_sample, _ = subset[0]
+                shape = tuple(np.asarray(first_sample).shape)
+                if sample_shape is None:
+                    sample_shape = shape
+                elif shape != sample_shape:
+                    # Non-uniform shapes cannot be collated into one batch; defer
+                    # to the legacy unify/last-task-only handling.
+                    return None
+            subsets.append(subset)
+            label_chunks.append(permuted_labels)
+
+        dataset = _SharedCumulativeIQTestDataset(
+            ConcatDataset(subsets), np.concatenate(label_chunks)
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=self._test_batch_size,
+            shuffle=True,
+            num_workers=0,
+        )
+        return loader, len(dataset)
+
     def new_task(self, memory=None):
         if self._current_task >= len(self.increments):
             raise Exception("No more tasks.")
 
         min_class = sum(self.increments[: self._current_task])
         max_class = sum(self.increments[: self._current_task + 1])
+
+        # Set by the IQ shared-cumulative test path; when None the test loader is
+        # built from the materialised ``x_test``/``y_test`` arrays below.
+        precomputed_test_loader = None
+        precomputed_n_test = None
 
         if self._iq:
             x_train, y_train = self.iq_train[self._current_task]
@@ -111,47 +218,60 @@ class IncrementalLoader:
             else:
                 x_val, y_val = np.array([]), np.array([])
             # Cumulative CIL test: all samples from tasks 0..current (matches vision
-            # path using high_range=max_class with low_range=0).
-            x_test_chunks: list = []
-            y_test_chunks: list = []
-            for task_j in range(self._current_task + 1):
-                x_j, y_j = self.iq_test[task_j]
-                p_te_j = self.sample_permutations[task_j][1]
-                x_test_chunks.append(x_j[p_te_j])
-                y_test_chunks.append(y_j[p_te_j])
+            # path using high_range=max_class with low_range=0). Prefer a loader
+            # that references each task's test array once (shared across the many
+            # retained per-task loaders) instead of holding concatenated copies.
+            shared_cumulative = self._build_shared_cumulative_iq_test_loader(
+                self._current_task
+            )
+            if shared_cumulative is not None:
+                (
+                    precomputed_test_loader,
+                    precomputed_n_test,
+                ) = shared_cumulative
+            else:
+                # Legacy path: per-task shapes are non-uniform, so fall back to
+                # explicit unification / last-task-only handling (unchanged).
+                x_test_chunks: list = []
+                y_test_chunks: list = []
+                for task_j in range(self._current_task + 1):
+                    x_j, y_j = self.iq_test[task_j]
+                    p_te_j = self.sample_permutations[task_j][1]
+                    x_test_chunks.append(x_j[p_te_j])
+                    y_test_chunks.append(y_j[p_te_j])
 
-            x_merged: np.ndarray | None = None
-            y_merged: np.ndarray | None = None
-            if _iq_test_arrays_can_stack_along_batch(x_test_chunks):
-                x_merged = np.concatenate(x_test_chunks, axis=0)
-                y_merged = np.concatenate(y_test_chunks, axis=0)
-            else:
-                try:
-                    x_three = [
-                        iq_numpy_batch_to_three_adc_channel_first(c)
-                        for c in x_test_chunks
-                    ]
-                except ValueError:
-                    x_three = None
-                if x_three is not None and _iq_test_arrays_can_stack_along_batch(
-                    x_three
-                ):
-                    x_merged = np.concatenate(x_three, axis=0)
+                x_merged: np.ndarray | None = None
+                y_merged: np.ndarray | None = None
+                if _iq_test_arrays_can_stack_along_batch(x_test_chunks):
+                    x_merged = np.concatenate(x_test_chunks, axis=0)
                     y_merged = np.concatenate(y_test_chunks, axis=0)
+                else:
+                    try:
+                        x_three = [
+                            iq_numpy_batch_to_three_adc_channel_first(c)
+                            for c in x_test_chunks
+                        ]
+                    except ValueError:
+                        x_three = None
+                    if x_three is not None and _iq_test_arrays_can_stack_along_batch(
+                        x_three
+                    ):
+                        x_merged = np.concatenate(x_three, axis=0)
+                        y_merged = np.concatenate(y_test_chunks, axis=0)
+                        print(
+                            "Note: Unified mixed IQ test tensors to (N, 3, L) via "
+                            "ADC0 I/Q + zero-padded ADC1/2 (IID2-style) for cumulative CIL."
+                        )
+                if x_merged is not None:
+                    x_test, y_test = x_merged, y_merged
+                else:
                     print(
-                        "Note: Unified mixed IQ test tensors to (N, 3, L) via "
-                        "ADC0 I/Q + zero-padded ADC1/2 (IID2-style) for cumulative CIL."
+                        "Warning: IQ tasks use incompatible shapes even after 3-ADC "
+                        "unification (e.g. different sequence lengths). "
+                        "Using the current task test split only."
                     )
-            if x_merged is not None:
-                x_test, y_test = x_merged, y_merged
-            else:
-                print(
-                    "Warning: IQ tasks use incompatible shapes even after 3-ADC "
-                    "unification (e.g. different sequence lengths). "
-                    "Using the current task test split only."
-                )
-                x_test = x_test_chunks[-1]
-                y_test = y_test_chunks[-1]
+                    x_test = x_test_chunks[-1]
+                    y_test = y_test_chunks[-1]
             p_tr, _ = self.sample_permutations[self._current_task]
             x_train, y_train = x_train[p_tr], y_train[p_tr]
         else:
@@ -181,7 +301,10 @@ class IncrementalLoader:
         val_loader = (
             self._get_loader(x_val, y_val, mode="train") if len(x_val) > 0 else None
         )
-        test_loader = self._get_loader(x_test, y_test, mode="test")
+        if precomputed_test_loader is not None:
+            test_loader = precomputed_test_loader
+        else:
+            test_loader = self._get_loader(x_test, y_test, mode="test")
 
         task_name = None
         if (
@@ -199,7 +322,11 @@ class IncrementalLoader:
             "task_name": task_name,
             "max_task": len(self.increments),
             "n_train_data": x_train.shape[0],
-            "n_test_data": x_test.shape[0],
+            "n_test_data": (
+                precomputed_n_test
+                if precomputed_n_test is not None
+                else x_test.shape[0]
+            ),
         }
 
         self._current_task += 1
