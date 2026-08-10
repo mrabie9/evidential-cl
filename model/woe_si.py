@@ -800,11 +800,24 @@ class Net(DetectionReplayMixin, nn.Module):
 
             L = mean_b  sum_{k in old}  (w+_s - w+_t)^2 + (w-_s - w-_t)^2
 
+        Student and teacher are centred with the **same** feature mean -- the
+        teacher's snapshot. Centring is a choice of reference point for the
+        Least-Commitment decomposition (``w_jk = beta_kj (phi_j - mu_j) +
+        beta_0k/J``), so scoring the two networks against different ``mu`` leaves a
+        reference shift inside the measured "drift": an *unchanged* network then
+        scores a non-zero penalty. Measured on the 10-task TIL run, distilling a
+        network against an exact copy of itself accounted for 22-70% of the total
+        penalty before this was fixed. Using the teacher's ``mu`` for both also
+        keeps the target fixed for the duration of the task, where the live EMA
+        would drift under the student even though the teacher is frozen.
+
         ``J^2``-normalised to match the ``I_2`` importance signal's scale (see
         ``_compute_information_content``). Returns exactly ``0`` before the first
         teacher exists, mirroring the SI penalty being 0 on the first task. The
         running feature mean is EMA-updated here so output mode (which skips the
-        importance path) still tracks ``mu`` for centring.
+        importance path) still tracks ``mu`` -- not to centre this comparison, but
+        so the *next* ``_snapshot_teacher`` inherits the statistics of the task it
+        was frozen on.
         """
         features = self.net.forward_features(x, bn_training=False)
         self._update_feature_mean(features.detach())
@@ -821,8 +834,12 @@ class Net(DetectionReplayMixin, nn.Module):
                 distill_x = torch.cat([x, replay[0].to(x.device)], dim=0)
                 features = self.net.forward_features(distill_x, bn_training=False)
 
+        # Both networks are centred with the teacher's mu: a shared reference is
+        # what makes the difference measure evidence drift rather than a shift in
+        # centring statistics. See the docstring.
+        centring_mean = self.teacher_feature_mean
         student_w = self._weights_of_evidence(
-            features, self.net.model.fc, active, self.woe_feature_mean
+            features, self.net.model.fc, active, centring_mean
         )
         w_plus_s, w_minus_s = per_class_total_evidence(student_w)
         with torch.no_grad():
@@ -833,7 +850,7 @@ class Net(DetectionReplayMixin, nn.Module):
                 teacher_features,
                 self.teacher.model.fc,
                 active,
-                self.teacher_feature_mean,
+                centring_mean,
             )
             w_plus_t, w_minus_t = per_class_total_evidence(teacher_w)
 

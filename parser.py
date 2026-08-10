@@ -733,6 +733,30 @@ def get_parser():
         ),
     )
 
+    parser.add_argument(
+        "--woe_replay_mode",
+        type=str,
+        default="ce",
+        choices=["ce", "evidence", "both"],
+        help=(
+            "woe_si_replay: what the reservoir contributes to the loss. 'ce' "
+            "(default) rehearses stored samples with cross-entropy. 'evidence' "
+            "stores each item's DS total evidence at insertion time and applies a "
+            "one-sided penalty when that evidence later decays, leaving increases "
+            "free. 'both' sums the two."
+        ),
+    )
+    parser.add_argument(
+        "--woe_evidence_lambda",
+        type=float,
+        default=1.0,
+        help=(
+            "woe_si_replay: weight on the evidence-decay penalty (used when "
+            "woe_replay_mode is 'evidence' or 'both'). Not on the same scale as "
+            "woe_replay_lambda; needs its own sweep."
+        ),
+    )
+
     # WoE-SI + reservoir experience replay (model: woe_si_replay).
     parser.add_argument(
         "--woe_replay_memories",

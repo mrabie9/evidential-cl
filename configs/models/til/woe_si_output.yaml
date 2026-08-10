@@ -1,0 +1,18 @@
+model: woe_si
+loader: task_incremental_loader
+lr: 0.01
+# Output mode is a FUNCTIONAL penalty (evidence distillation against a frozen
+# teacher), not the SI path integral, so it lives on a completely different scale
+# from the parameter/channel modes and needs its own woe_lambda. Measured on the
+# 10-task TIL run, the raw penalty is 0.0009-0.038 against a cross-entropy of
+# 0.42-0.88, i.e. CE/reg spans 23-464 (geometric centre ~103), so lambda ~ 100
+# puts the two terms in the same range. The 3000 inherited from the parameter-mode grid over-weights the
+# penalty by one to two orders of magnitude.
+woe_lambda: 1000.0
+woe_centering_mode: centered_uniform
+woe_mu_momentum: 0.9
+woe_conflict_weighting: false
+woe_reg_level: output
+# woe_xi and woe_importance_stride are inert here: output mode sets
+# use_path_integral=False, so Omega is never accumulated.
+# woe_anchor_mode is likewise inert -- there is no per-parameter anchor to apply.

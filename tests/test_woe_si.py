@@ -639,3 +639,48 @@ def test_winsorise_disabled_by_default() -> None:
 
     model._winsorise_omega()
     assert getattr(model, f"{key}_woe_omega").reshape(-1)[0].item() == 1e6
+
+
+# ----------------------------------------------------------------------
+# Output mode: shared centring
+# ----------------------------------------------------------------------
+def test_output_mode_self_distillation_is_exactly_zero() -> None:
+    """A network distilled against a copy of itself must incur no penalty.
+
+    Before the centring fix the student used the live EMA ``woe_feature_mean``
+    while the teacher used its own snapshot, so the drift term absorbed the
+    difference between two reference points and an unchanged network scored a
+    non-zero loss (22-70% of the total on the 10-task run).
+    """
+
+    torch.manual_seed(7)
+    model = Net(1, 6, 2, _make_args("task_incremental_loader", woe_reg_level="output"))
+    x = torch.randn(8, 2, 1024)
+    y = torch.randint(0, 3, (8,))
+
+    # Establish a teacher and a live feature mean that deliberately disagree.
+    model.observe(x, y, 0)
+    model._snapshot_teacher()
+    model.woe_feature_mean.copy_(model.teacher_feature_mean + 3.0)
+
+    penalty = model._evidence_distillation_loss(x, 1)
+    assert float(penalty.item()) == 0.0
+
+
+def test_output_mode_still_detects_real_drift() -> None:
+    """The fix must not silence the penalty: a changed readout still registers."""
+    import copy
+
+    torch.manual_seed(8)
+    model = Net(1, 6, 2, _make_args("task_incremental_loader", woe_reg_level="output"))
+    x = torch.randn(8, 2, 1024)
+    y = torch.randint(0, 3, (8,))
+    model.observe(x, y, 0)
+    model._snapshot_teacher()
+
+    teacher_before = copy.deepcopy(model.teacher)
+    with torch.no_grad():
+        model.net.model.fc.weight.mul_(3.0)
+    model.teacher = teacher_before
+
+    assert float(model._evidence_distillation_loss(x, 1).item()) > 0.0
