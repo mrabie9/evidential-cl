@@ -86,6 +86,43 @@ def get_parser():
         help="QP margin for the GEM gradient-projection constraint in ctn_gem (B2). Kept "
         "separate from CTN's memory_strength, which is the KL-distillation weight.",
     )
+    parser.add_argument(
+        "--distill_lambda",
+        default=1.0,
+        type=float,
+        help="Weight of the KL-distillation replay term in gem_distill (added to GEM's "
+        "current-task loss). 0 disables distillation (pure GEM).",
+    )
+    parser.add_argument(
+        "--gem_lwf",
+        action="store_true",
+        help="gem_distill: add a Learning-without-Forgetting term — KL over previous-task "
+        "classes on the CURRENT batch vs a frozen teacher snapshot (taken at each task "
+        "boundary), weighted by --gem_lwf_lambda at --temperature. Unlike --distill_lambda "
+        "(on buffer samples) this acts on the new task's data, testing whether it stacks "
+        "with on-buffer distillation. Composable with distillation; subject to GEM's QP.",
+    )
+    parser.add_argument(
+        "--gem_lwf_lambda",
+        default=1.0,
+        type=float,
+        help="Weight of the gem_distill LwF term when --gem_lwf is set.",
+    )
+    parser.add_argument(
+        "--balanced_replay",
+        default=False,
+        action="store_true",
+        help="Use class-balanced reservoir sampling (CBRS) for the gem_distill buffer instead "
+        "of the per-task FIFO ring, so replay/distillation are not dominated by the noise/"
+        "frequent classes (A1).",
+    )
+    parser.add_argument(
+        "--balance_signal_only",
+        default=False,
+        action="store_true",
+        help="With --balanced_replay: exclude the noise/detection class from balancing so it "
+        "stays at its natural rate (avoids starving detection); only signal classes are balanced.",
+    )
 
     # optimizer parameters influencing all models
     parser.add_argument(

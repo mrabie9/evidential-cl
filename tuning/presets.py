@@ -487,6 +487,37 @@ TUNING_PRESETS: Dict[str, TuningPreset] = {
             }
         ),
     ),
+    "gem_distill": TuningPreset(
+        model_name="gem_distill",
+        description="Run grid or random search over GEM-Distill hyperparameters.",
+        default_output_root="logs/tuning/gem_distill",
+        type_hints=COMMON_TYPE_HINTS,
+        grid_factory=make_grid_factory(
+            {
+                "lr": {
+                    "kind": "float",
+                    "factors": (0.3, 1.0, 3.0),
+                    "min": 1e-5,
+                    "fallback": 1e-2,
+                    "values": [0.03, 0.01, 0.003, 0.001, 0.0003, 0.0001],
+                },
+                "memory_strength": {
+                    "kind": "float",
+                    "factors": (0.5, 1.0, 2.0),
+                    "min": 0.1,
+                    "fallback": 0.5,
+                    "values": [0.1, 0.5, 1, 5, 10, 50, 100, 500],
+                },
+                "distill_lambda": {
+                    "kind": "float",
+                    "factors": (0.3, 1.0, 3.0),
+                    "min": 0.0,
+                    "fallback": 1.0,
+                    "values": [0.0, 0.1, 0.5, 1, 2, 5, 10],
+                },
+            }
+        ),
+    ),
     "hat": TuningPreset(
         model_name="hat",
         description="Run grid or random search over hat hyperparameters.",
