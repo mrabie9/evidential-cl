@@ -32,7 +32,7 @@ while [ $# -gt 0 ]; do
 done
 
 # Edit this list to choose which buffer sizes to run (order is preserved).
-MEM_VALS=(512 2048 5120)
+MEM_VALS=(1024 2048 8192 16384)
 
 overall_exit=0
 
