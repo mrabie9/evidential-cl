@@ -1014,7 +1014,10 @@ def life_experience(model, inc_loader, args):
     args.task_epoch_schedule = task_epoch_schedule
 
     time_start = time.time()
-    train_task_loaders = []
+    # Only the current task's train loader is ever used; previously every task's
+    # train loader was retained for the whole run (each holding a permuted copy of
+    # that task's training set), which grew host memory as new tasks began
+    # training without ever being read. Keep only the per-task local below.
     test_task_loaders = []
     evaluator = eval_tasks
     if args.loader == "class_incremental_loader":
@@ -1065,7 +1068,6 @@ def life_experience(model, inc_loader, args):
         result_acc_val = []
         result_acc_tr = []
         task_info, train_loader, _, test_loader = inc_loader.new_task()
-        train_task_loaders.append(train_loader)
         test_task_loaders.append(test_loader)
         current_task = task_info["task"]
 
