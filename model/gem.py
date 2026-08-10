@@ -36,6 +36,10 @@ from utils.class_weighted_loss import classification_cross_entropy
 @dataclass
 class GemConfig:
     memory_strength: float = 0.0  # lambda in the paper
+    gem_disable_qp: bool = False  # ablation: skip QP projection + replay-gradient pass
+    gem_replay: bool = False  # add ER-style replay CE on buffer samples to the loss
+    gem_replay_lambda: float = 1.0  # weight of the replay CE term
+    replay_batch_size: float = 20  # rows sampled per step for the replay CE
     inner_steps: int = 1
     lr: float = 1e-3
     n_memories: int = 0
@@ -135,6 +139,9 @@ class Net(DetectionReplayMixin, nn.Module):
         super(Net, self).__init__()
         self.cfg = GemConfig.from_args(args)
         self.margin = self.cfg.memory_strength
+        # Ablation toggle: when False, skip both the past-task replay-gradient pass and the
+        # QP projection, reducing GEM to plain fine-tuning at matched buffer size.
+        self.use_qp = not bool(self.cfg.gem_disable_qp)
         self.is_cifar = (self.cfg.dataset == "cifar100") or (
             self.cfg.dataset == "tinyimagenet"
         )
@@ -215,6 +222,11 @@ class Net(DetectionReplayMixin, nn.Module):
         self.grads = torch.Tensor(sum(self.grad_dims), n_tasks)
         if self.gpu:
             self.grads = self.grads.cuda()
+
+        # --- optional ER-style replay CE on buffer samples ---
+        self.gem_replay = bool(self.cfg.gem_replay)
+        self.gem_replay_lambda = float(self.cfg.gem_replay_lambda)
+        self.replay_batch_size = int(self.cfg.replay_batch_size)
 
         # --- counters / bookkeeping ---
         self.observed_tasks = []
@@ -336,6 +348,48 @@ class Net(DetectionReplayMixin, nn.Module):
             loader=self.incremental_loader_name,
         )
         return output
+    
+    def _sample_replay_rows(self, current_task):
+        """Uniformly sample stored rows from past tasks for the replay CE."""
+        pairs = [
+            (past_task, row)
+            for past_task in self.observed_tasks
+            if past_task != current_task
+            for row in range(int(self.task_mem_filled[past_task].item()))
+        ]
+        if not pairs:
+            return None
+        sample_size = min(len(pairs), self.replay_batch_size)
+        chosen = np.random.choice(len(pairs), sample_size, replace=False)
+        device = self.memory_data.device
+        t_idx = torch.tensor([pairs[i][0] for i in chosen], dtype=torch.long, device=device)
+        s_idx = torch.tensor([pairs[i][1] for i in chosen], dtype=torch.long, device=device)
+        return self.memory_data[t_idx, s_idx], self.memory_labs[t_idx, s_idx], t_idx
+
+    def _masked_global_replay_loss(self, xx, yy_global, t_idx):
+        """CE on replay rows, each row masked to its own task's logits.
+
+        Mirrors er_ring/lamaml_cifar: raw logits + per-sample-task TIL/CIL mask
+        with GLOBAL labels, so mixed-task replay batches are scored exactly as
+        at eval time.
+        """
+        raw = self.netforward(self._ensure_iq_shape(xx) if self.is_iq else xx)
+        masked = raw.clone()
+        for task_id in torch.unique(t_idx).tolist():
+            rows = t_idx == int(task_id)
+            masked[rows] = misc_utils.apply_task_incremental_logit_mask(
+                raw[rows],
+                int(task_id),
+                self.classes_per_task,
+                self.n_outputs,
+                cil_all_seen_upto_task=int(task_id),
+                global_noise_label=self.noise_label,
+                fill_value=-10e10,
+                loader=self.incremental_loader_name,
+            )
+        return classification_cross_entropy(
+            masked, yy_global, class_weighted_ce=self.class_weighted_ce
+        )
 
     def _store_replay(self, task_id: int, x_data: torch.Tensor, y_data: torch.Tensor):
         """Write the current batch into task_id's episodic buffer.
@@ -437,7 +491,7 @@ class Net(DetectionReplayMixin, nn.Module):
                 self._store_replay(t, x.data, y_work.data)
 
             # gradients on past tasks (replay)
-            if len(self.observed_tasks) > 1:
+            if self.use_qp and len(self.observed_tasks) > 1:
                 for tt in range(len(self.observed_tasks) - 1):
                     self.zero_grad()
                     past_task = self.observed_tasks[tt]
@@ -492,6 +546,16 @@ class Net(DetectionReplayMixin, nn.Module):
             loss = classification_cross_entropy(
                 logits_full, targets, class_weighted_ce=self.class_weighted_ce
             )
+            # Optional ER-style replay CE: trains directly on buffer samples, in
+            # addition to the QP constraints those samples define. Added before
+            # backward so the projection acts on the combined gradient.
+            if self.gem_replay and len(self.observed_tasks) > 1:
+                replay = self._sample_replay_rows(t)
+                if replay is not None:
+                    xx, yy_global, t_idx = replay
+                    loss = loss + self.gem_replay_lambda * self._masked_global_replay_loss(
+                        xx, yy_global, t_idx
+                    )
             loss.backward()
             if self.cfg.grad_clip_norm:
                 torch.nn.utils.clip_grad_norm_(
@@ -499,7 +563,7 @@ class Net(DetectionReplayMixin, nn.Module):
                 )
 
             # GEM projection if needed
-            if len(self.observed_tasks) > 1:
+            if self.use_qp and len(self.observed_tasks) > 1:
                 store_grad(self._ll_params, self.grads, self.grad_dims, t)
                 device = torch.device("cuda") if self.gpu else torch.device("cpu")
                 indx = torch.tensor(

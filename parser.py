@@ -58,6 +58,13 @@ def get_parser():
         action="store_true",
         help="Use GroupNorm in compatible backbones instead of BatchNorm.",
     )
+    parser.add_argument(
+        "--gem_disable_qp",
+        default=False,
+        action="store_true",
+        help="Ablation: disable GEM's QP gradient-projection constraint (and the past-task "
+        "replay-gradient pass it feeds); reduces GEM to plain fine-tuning at matched buffer size.",
+    )
 
     # optimizer parameters influencing all models
     parser.add_argument(
@@ -200,6 +207,21 @@ def get_parser():
         "TIL -- keep it only to reproduce runs logged before 2026-07-25. "
         "'split_norm' divides 'split' by (1 + memory_loss_lambda), pinning the "
         "share without doubling the loss scale. See docs/cmaml_vs_reser_til.md.",
+    )
+    parser.add_argument(
+        "--gem_replay",
+        action="store_true",
+        help="GEM: add an ER-style replay CE on sampled buffer rows to the "
+        "current-task loss (weighted by --gem_replay_lambda, batch size "
+        "--replay_batch_size), in addition to the QP constraints those same "
+        "memories define. The QP projection acts on the combined gradient. "
+        "Tests whether training on the buffer stacks with constraining on it.",
+    )
+    parser.add_argument(
+        "--gem_replay_lambda",
+        type=float,
+        default=1.0,
+        help="Weight of the GEM replay CE term when --gem_replay is set.",
     )
 
     # experiment parameters
