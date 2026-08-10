@@ -432,6 +432,116 @@ def compute_mean(values: Sequence[float]) -> float:
     return float(sum(values) / len(values)) if values else float("nan")
 
 
+def _values_equivalent(expected: Any, actual: Any) -> bool:
+    """Compare an override value with the value echoed back from the model."""
+    if isinstance(expected, bool) or isinstance(actual, bool):
+        return bool(expected) == bool(actual)
+    try:
+        a, b = float(expected), float(actual)
+        return abs(a - b) <= 1e-12 + 1e-9 * max(abs(a), abs(b))
+    except (TypeError, ValueError):
+        return str(expected) == str(actual)
+
+
+def verify_trial_params_reached_model(
+    model: Any, trial_overrides: Dict[str, Any]
+) -> Dict[str, str]:
+    """Echo-back canary: assert swept values actually landed in the model config.
+
+    Models copy args into a ``cfg`` dataclass via ``hasattr`` filtering, a
+    mechanism that has silently dropped knobs before (BCL ``beta``, the inert
+    cmaml ``opt_wt`` sweep). For every swept key that is a field of
+    ``model.cfg``, verify the stored value equals the override and raise if it
+    does not. Keys that are not cfg fields are reported as ``unverified``
+    (consumed outside the model, e.g. ``n_epochs``); the sweep-level inert
+    check is the backstop for those.
+
+    Returns:
+        Mapping of key -> "verified" | "unverified".
+
+    Raises:
+        RuntimeError: If a swept key exists on ``model.cfg`` with a different
+            value than the trial override.
+    """
+    verification: Dict[str, str] = {}
+    cfg = getattr(model, "cfg", None)
+    cfg_fields = getattr(type(cfg), "__dataclass_fields__", {}) if cfg else {}
+    mismatches: List[str] = []
+    for key, expected in trial_overrides.items():
+        if key in cfg_fields:
+            actual = getattr(cfg, key)
+            if _values_equivalent(expected, actual):
+                verification[key] = "verified"
+            else:
+                mismatches.append(f"{key}: override={expected!r} but model.cfg has {actual!r}")
+        else:
+            verification[key] = "unverified"
+    if mismatches:
+        raise RuntimeError(
+            "[INERT KNOB] Swept parameter(s) did not reach the model config — "
+            "the trial would silently measure the default value(s): "
+            + "; ".join(mismatches)
+        )
+    return verification
+
+
+def detect_inert_sweep(successes: List[Dict[str, Any]]) -> bool:
+    """Detect a sweep whose knob(s) had no effect on the score.
+
+    Trials run with a fixed seed and deterministic init, so an inert knob
+    yields (near-)identical scores for every distinct parameter setting —
+    exactly what happened in the 2026-01-09 cmaml ``opt_wt`` sweep (0.3330 for
+    all 8 trials). Flags when >=2 trials with *distinct* trial_params all
+    score within 1e-4 of each other.
+    """
+    seen: Dict[str, float] = {}
+    for trial in successes:
+        score = trial.get("score")
+        if not isinstance(score, (int, float)) or not np.isfinite(score):
+            continue
+        params_key = json.dumps(trial.get("trial_params") or {}, sort_keys=True)
+        seen.setdefault(params_key, float(score))
+    distinct_scores = list(seen.values())
+    if len(distinct_scores) < 2:
+        return False
+    return (max(distinct_scores) - min(distinct_scores)) <= 1e-4
+
+
+def _mean_of_field(sources: List[Dict[str, Any]], key: str) -> float:
+    values = [
+        float(s[key])
+        for s in sources
+        if isinstance(s.get(key), (int, float)) and np.isfinite(s[key])
+    ]
+    return float(np.mean(values)) if values else float("nan")
+
+
+def parse_seed_list(raw: str) -> List[int]:
+    seeds = [int(tok) for tok in raw.replace(";", ",").split(",") if tok.strip()]
+    if not seeds:
+        raise ValueError(f"--stage2-seeds parsed to an empty list: {raw!r}")
+    return list(dict.fromkeys(seeds))
+
+
+def _candidate_pool(
+    successes: List[Dict[str, Any]],
+    search_space: Grid,
+    *,
+    hierarchical: bool,
+) -> List[Dict[str, Any]]:
+    """Trials eligible for best-selection / stage-2: final stage when hierarchical."""
+    if not hierarchical:
+        return successes
+    stage_keys = list(search_space.keys())
+    final_stage = stage_keys[-1] if stage_keys else None
+    final_stage_trials = (
+        [trial for trial in successes if trial.get("stage") == final_stage]
+        if final_stage
+        else []
+    )
+    return final_stage_trials or successes
+
+
 def _trial_rank_key(trial: Dict[str, Any]) -> tuple[float, int, int]:
     """Sort trials by score, then param completeness, then trial index."""
     score = trial.get("score")
@@ -465,17 +575,9 @@ def select_best_trial(
     """
     if not successes:
         return None
-    if not hierarchical:
-        return max(successes, key=_trial_rank_key)
-
-    stage_keys = list(search_space.keys())
-    final_stage = stage_keys[-1] if stage_keys else None
-    final_stage_trials = (
-        [trial for trial in successes if trial.get("stage") == final_stage]
-        if final_stage
-        else []
+    candidate_pool = _candidate_pool(
+        successes, search_space, hierarchical=hierarchical
     )
-    candidate_pool = final_stage_trials or successes
     return max(candidate_pool, key=_trial_rank_key)
 
 
@@ -600,6 +702,17 @@ def run_single_trial(
     model_mod = importlib.import_module(f"model.{args.model}")
     model = model_mod.Net(n_inputs, n_outputs, n_tasks, args)
 
+    # Inert-knob canary: fail the trial loudly if a swept value never reached
+    # the model config (the silent-drop class that produced the constant-score
+    # cmaml opt_wt sweep).
+    param_verification = verify_trial_params_reached_model(model, trial_overrides)
+    unverified = [k for k, v in param_verification.items() if v == "unverified"]
+    if unverified:
+        print(
+            f"[WARN] Trial {trial_idx}: swept key(s) not fields of model.cfg, cannot "
+            f"echo-back verify: {unverified}. The sweep-level inert check is the backstop."
+        )
+
     if getattr(args, "cuda", False) and torch.cuda.is_available():
         model = model.cuda()
 
@@ -677,6 +790,8 @@ def run_single_trial(
     return {
         "status": "ok",
         "trial": trial_idx,
+        "seed": int(args.seed),
+        "param_verification": param_verification,
         "log_dir": log_dir,
         "tf_dir": tf_dir,
         "params": merged,
@@ -861,6 +976,7 @@ def dump_summary(
 
     field_names = [
         "trial",
+        "seed",
         "score",
         "val_mean",
         "val_det_mean",
@@ -885,6 +1001,7 @@ def dump_summary(
         for trial in successes:
             row = {
                 "trial": trial["trial"],
+                "seed": trial.get("seed"),
                 "score": trial.get("score"),
                 "val_mean": trial.get("val_mean"),
                 "val_det_mean": trial.get("val_det_mean"),
@@ -1196,11 +1313,135 @@ def run_tuning(preset: TuningPreset) -> None:
         results.extend(run_trials(trials, constant_overrides, None, 0))
 
     successes = [r for r in results if r.get("status") == "ok"]
-    best = select_best_trial(
-        successes,
-        full_search_space,
-        hierarchical=bool(cli.hierarchical),
-    )
+
+    inert_sweep = detect_inert_sweep(successes)
+    if inert_sweep:
+        print(
+            "[INERT SWEEP] All distinct parameter settings scored within 1e-4 of "
+            "each other. Runs are seed-deterministic, so the swept knob(s) almost "
+            "certainly never took effect (cf. the constant-score cmaml opt_wt "
+            "sweep). Skipping stage-2 and refusing to write best params to YAML; "
+            "check param_verification in summary.json."
+        )
+
+    stage2_seeds = parse_seed_list(cli.stage2_seeds) if cli.stage2_top_k > 0 else []
+    stage2_aggregates: List[Dict[str, Any]] = []
+    if stage2_seeds and not inert_sweep and successes:
+        pool = _candidate_pool(
+            successes, full_search_space, hierarchical=bool(cli.hierarchical)
+        )
+        seen_params: set = set()
+        candidates: List[Dict[str, Any]] = []
+        for trial in sorted(pool, key=_trial_rank_key, reverse=True):
+            params_key = json.dumps(trial.get("trial_params") or {}, sort_keys=True)
+            if params_key in seen_params:
+                continue
+            seen_params.add(params_key)
+            candidates.append(trial)
+            if len(candidates) >= cli.stage2_top_k:
+                break
+
+        # Seed stage-1 ran with; its score is reused instead of re-running.
+        stage1_seed = (
+            int(getattr(base_args, "seed", 0) + cli.seed_offset)
+            if not cli.vary_seed
+            else None
+        )
+        next_idx = len(results)
+        for candidate in candidates:
+            per_seed_scores: Dict[int, float] = {}
+            per_seed_logs: List[str] = []
+            per_seed_sources: List[Dict[str, Any]] = []
+            for seed in stage2_seeds:
+                if (
+                    stage1_seed is not None
+                    and seed == stage1_seed
+                    and candidate.get("seed") == seed
+                ):
+                    per_seed_scores[seed] = float(candidate["score"])
+                    per_seed_logs.append(candidate["log_dir"])
+                    per_seed_sources.append(candidate)
+                    continue
+                try:
+                    outcome = run_single_trial(
+                        base_args,
+                        candidate.get("fixed_params") or {},
+                        candidate.get("trial_params") or {},
+                        next_idx,
+                        session_timestamp,
+                        runs_root,
+                        cli.seed_offset,
+                        False,
+                        cli.keep_expt_name,
+                        preset.model_name,
+                        seed_override=seed,
+                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    outcome = {
+                        "status": "failed",
+                        "stage": "stage2-seed",
+                        "trial": next_idx,
+                        "seed": seed,
+                        "params": dict(candidate.get("params") or {}),
+                        "error": str(exc),
+                        "traceback": traceback.format_exc(),
+                    }
+                    print(f"Stage-2 trial {next_idx} (seed {seed}) failed: {exc}")
+                else:
+                    outcome["stage"] = "stage2-seed"
+                    per_seed_scores[seed] = float(outcome["score"])
+                    per_seed_logs.append(outcome["log_dir"])
+                    per_seed_sources.append(outcome)
+                    print(
+                        f"[stage2] Trial {next_idx} (seed {seed}) finished |"
+                        f" score={outcome['score']:.4f} |"
+                        f" params={candidate.get('trial_params')}"
+                    )
+                results.append(outcome)
+                next_idx += 1
+
+            finite_scores = [v for v in per_seed_scores.values() if np.isfinite(v)]
+            if not finite_scores:
+                continue
+            stage2_aggregates.append(
+                {
+                    "status": "ok",
+                    "stage": "stage2",
+                    "trial": candidate.get("trial"),
+                    "trial_params": dict(candidate.get("trial_params") or {}),
+                    "fixed_params": dict(candidate.get("fixed_params") or {}),
+                    "params": dict(candidate.get("params") or {}),
+                    "stage2_scores_by_seed": {
+                        str(k): v for k, v in per_seed_scores.items()
+                    },
+                    "stage2_std": float(np.std(finite_scores)),
+                    "score": float(np.mean(finite_scores)),
+                    "val_mean": _mean_of_field(per_seed_sources, "val_mean"),
+                    "val_f1_mean": _mean_of_field(per_seed_sources, "val_f1_mean"),
+                    "val_det_mean": _mean_of_field(per_seed_sources, "val_det_mean"),
+                    "val_pfa_mean": _mean_of_field(per_seed_sources, "val_pfa_mean"),
+                    "duration_sec": _mean_of_field(per_seed_sources, "duration_sec"),
+                    "log_dir": per_seed_logs[0] if per_seed_logs else candidate.get("log_dir"),
+                    "stage2_log_dirs": per_seed_logs,
+                }
+            )
+
+        successes = [r for r in results if r.get("status") == "ok"]
+
+    if stage2_aggregates:
+        best = max(stage2_aggregates, key=_trial_rank_key)
+        print("Stage-2 (multi-seed) ranking:")
+        for agg in sorted(stage2_aggregates, key=_trial_rank_key, reverse=True):
+            print(
+                "  score=%.4f +/-%.4f | params=%s"
+                % (agg["score"], agg["stage2_std"], agg["trial_params"])
+            )
+    else:
+        best = select_best_trial(
+            successes,
+            full_search_space,
+            hierarchical=bool(cli.hierarchical),
+        )
 
     resolved_chain = [str(Path(path).resolve()) for path in config_sources]
     summary = {
@@ -1217,6 +1458,10 @@ def run_tuning(preset: TuningPreset) -> None:
         "lr_first": lr_first,
         "lr_first_keys": lr_keys if lr_first else None,
         "lr_first_best": lr_first_best,
+        "inert_sweep": inert_sweep,
+        "stage2_top_k": int(cli.stage2_top_k),
+        "stage2_seeds": stage2_seeds,
+        "stage2_aggregates": stage2_aggregates,
         "num_trials": len(results),
         "results": results,
         "best": best,
@@ -1228,9 +1473,14 @@ def run_tuning(preset: TuningPreset) -> None:
         updated_yaml_path: str | None = None
         updated_yaml_values: Dict[str, Any] | None = None
         yaml_update_error: str | None = None
-        if cli.config:
+        if cli.config and inert_sweep:
+            print(
+                "[INERT SWEEP] Not writing best params to YAML — the sweep was "
+                "uninformative."
+            )
+        if cli.config and not inert_sweep:
             target_yaml = resolve_cli_config_path(cli.config[-1])
-            if hierarchical_final_params:
+            if hierarchical_final_params and not stage2_aggregates:
                 values_to_write = dict(hierarchical_final_params)
             else:
                 values_to_write = dict(

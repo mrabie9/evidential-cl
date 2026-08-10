@@ -94,6 +94,8 @@ def flatten_results(results: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
             {
                 "trial": item.get("trial"),
                 "status": item.get("status"),
+                "stage": item.get("stage"),
+                "seed": item.get("seed"),
                 "params": params,
                 "score": item.get("score", float("nan")),
                 "val_mean": item.get("val_mean", float("nan")),
@@ -243,7 +245,13 @@ def print_header(
     best = summary.get("best") or {}
     best_params = resolve_best_display_params(summary, best, param_names)
     print("Best trial (from summary)")
-    if summary.get("hierarchical") and best.get("stage") != list(param_names)[-1]:
+    if best.get("stage") == "stage2":
+        print(
+            "  note: winner selected by stage-2 MEAN over seeds "
+            f"{summary.get('stage2_seeds')} (std {fmt_float(best.get('stage2_std'))}); "
+            "single-seed rows in 'Top trials' may rank differently."
+        )
+    elif summary.get("hierarchical") and best.get("stage") != list(param_names)[-1]:
         print(
             "  note: hierarchical sweep; displayed params are the final combined "
             f"values (best trial #{best.get('trial')} is from stage '{best.get('stage')}')."
@@ -289,10 +297,15 @@ def print_top_trials(
 
     valid_rows = sorted(rows, key=sort_key, reverse=True)
     print(f"\nTop trials by {metric_key}")
+    if any(row.get("stage") == "stage2-seed" for row in rows):
+        print(
+        "  note: rows are SINGLE-SEED runs (stage-2 re-runs included, seed column"
+        " set); the sweep's winner is chosen by the stage-2 mean, not this table."
+        )
     param_cols = [(name, max(len(name), 8)) for name in param_names]
     param_header = " ".join(f"{name:>{width}}" for name, width in param_cols)
     header = (
-        f"{'rank':>4} {'trial':>5} {metric_key:>10} {'val_mean':>10} "
+        f"{'rank':>4} {'trial':>5} {'seed':>5} {metric_key:>10} {'val_mean':>10} "
         f"{'det_mean':>10} {'pfa_mean':>10} {'val_std':>10} {'duration_s':>11}"
     )
     if param_header:
@@ -304,12 +317,41 @@ def print_top_trials(
         param_values = " ".join(
             f"{fmt_value(params.get(name), 5):>{width}}" for name, width in param_cols
         )
+        seed = row.get("seed")
         print(
-            f"{idx:>4} {row.get('trial', ''):>5} {fmt_float(row.get(metric_key)):>10} "
+            f"{idx:>4} {row.get('trial', ''):>5} {('' if seed is None else seed):>5} "
+            f"{fmt_float(row.get(metric_key)):>10} "
             f"{fmt_float(row.get('val_mean')):>10} {fmt_float(row.get('val_det_mean')):>10} "
             f"{fmt_float(row.get('val_pfa_mean')):>10} {fmt_float(row.get('val_std')):>10} "
             f"{fmt_float(row.get('duration_sec'), 2):>11}"
             f"{' ' + param_values if param_values else ''}"
+        )
+
+
+def print_stage2_ranking(summary: Dict[str, Any], param_names: Sequence[str]) -> None:
+    """Print the multi-seed stage-2 ranking; this is what selects the winner."""
+    aggregates = summary.get("stage2_aggregates") or []
+    if not aggregates:
+        return
+    seeds = summary.get("stage2_seeds") or []
+    print(f"\nStage-2 multi-seed ranking (seeds {seeds}) — selection basis")
+    header = f"{'rank':>4} {'mean':>10} {'std':>10} {'per-seed scores':>32}  params"
+    print(header)
+    print("-" * len(header))
+    ordered = sorted(
+        aggregates,
+        key=lambda a: a.get("score") if is_finite_number(a.get("score")) else float("-inf"),
+        reverse=True,
+    )
+    for idx, agg in enumerate(ordered, start=1):
+        by_seed = agg.get("stage2_scores_by_seed") or {}
+        per_seed = ", ".join(f"{k}:{fmt_float(v)}" for k, v in sorted(by_seed.items()))
+        param_text = ", ".join(
+            f"{k}={fmt_value(v, 5)}" for k, v in (agg.get("trial_params") or {}).items()
+        )
+        print(
+            f"{idx:>4} {fmt_float(agg.get('score')):>10} {fmt_float(agg.get('stage2_std')):>10} "
+            f"{per_seed:>32}  {param_text}"
         )
 
 
@@ -599,6 +641,7 @@ def main() -> None:
 
     metric_key = infer_primary_metric(rows)
     print_header(summary, rows, param_names)
+    print_stage2_ranking(summary, param_names)
     print_top_trials(rows, args.top_k, param_names, metric_key)
     print_param_summaries(rows, param_names, metric_key)
 
