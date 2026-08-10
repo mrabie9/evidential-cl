@@ -3,8 +3,8 @@
 Pools the probe rows launched by ``scripts/run_cmaml_reser_gap.sh`` and pairs
 each of them, by seed, against the M0 baseline and the E0 target:
 
-    M0          logs/ablations/cmaml/M0    pooled CE, opt_wt 0.01   (baseline)
-    E0          logs/ablations/res-er/E0   eralg4 split CE          (target)
+    M0          pre-fix C-MAML pool        pooled CE, opt_wt 0.01   (baseline)
+    E0          pre-joint-ER eralg4 pool    eralg4 split CE          (target)
     split       --cmaml_replay_loss_mode split       (eralg4's exact reduction)
     split_norm  --cmaml_replay_loss_mode split_norm  (1:1 replay share, same scale)
     pooled_lr02 --opt_wt 0.02                        (2x step, pooled ratio kept)
@@ -22,12 +22,22 @@ import re
 import statistics as st
 
 REPO = "/home/lunet/wsmr11/repos/evidential-cl"
-ABL = os.path.join(REPO, "logs", "ablations")
 METRICS = ["Final F1", "Diagonal F1", "Backward"]
 
+# This probe measures the gap as it stood BEFORE the split-CE and joint-ER fixes, so its
+# M0/E0 references are the pre-fix pools. Those were superseded as grid rows and returned
+# to logs/<stem>/ by scripts/organise_ablations.py; they are listed run by run here.
 ROWS = [
-    ("M0 pooled CE (baseline)", os.path.join(ABL, "cmaml", "M0")),
-    ("E0 Res-ER (target)", os.path.join(ABL, "res-er", "E0")),
+    ("M0 pooled CE (baseline)", [
+        os.path.join(REPO, "logs/cmaml/cmaml_cwfix_so_se_til-*"),
+        os.path.join(REPO, "logs/cmaml/cmaml_secondorder_s7-13-21-*"),
+        os.path.join(REPO, "logs/cmaml/cmaml_secondorder_topup-*"),
+    ]),
+    ("E0 Res-ER (target)", [
+        os.path.join(REPO, "logs/eralg4/eralg4_resER_s0-39-55-*"),
+        os.path.join(REPO, "logs/eralg4/eralg4_resER_s7-13-21-*"),
+        os.path.join(REPO, "logs/eralg4/eralg4_resER_topup-*"),
+    ]),
     (
         "split  (eralg4 reduction)",
         os.path.join(REPO, "logs/cmaml/cmaml_splitloss_se_til-*"),
@@ -52,10 +62,12 @@ def parse(path: str) -> dict[str, float]:
     return out
 
 
-def collect(pattern: str) -> dict[int, dict[str, float]]:
-    """Seed -> metrics, walking either an ablation ID tree or a glob of run dirs."""
+def collect(patterns: str | list[str]) -> dict[int, dict[str, float]]:
+    """Seed -> metrics, walking either an ablation ID tree or globs of run dirs."""
+    if isinstance(patterns, str):
+        patterns = [patterns]
     seeds: dict[int, dict[str, float]] = {}
-    for base in sorted(glob.glob(pattern)) or [pattern]:
+    for base in sorted(b for pat in patterns for b in (glob.glob(pat) or [pat])):
         for dirpath, _dirs, files in os.walk(base):
             leaf = os.path.basename(dirpath)
             if "results.txt" in files and leaf.isdigit():
