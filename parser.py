@@ -169,6 +169,38 @@ def get_parser():
         "Tests whether C-MAML's TIL edge over Res-ER is just this variance "
         "reduction. K=1 (default) is the historical behaviour.",
     )
+    parser.add_argument(
+        "--cmaml_joint_er",
+        action="store_true",
+        help="C-MAML / La-MAML (lamaml_cifar): PROBE flag, twin of "
+        "--eralg4_joint_er. Split the meta-loss forward into two separate "
+        "net.forward passes (replay rows and current rows) instead of the "
+        "default single forward over the concatenated getBatch batch, so "
+        "backbone BatchNorm normalizes replay and current rows with their own "
+        "statistics. Logits are concatenated and scored with the identical mask "
+        "+ single CE, so the ONLY change is the forward split -- isolating the "
+        "concat BN-mixing retention effect (see eralg4-bn-mixing memory / "
+        "docs/reduction_experiments.md).",
+    )
+    parser.set_defaults(cmaml_joint_er=False)
+    parser.add_argument(
+        "--cmaml_replay_loss_mode",
+        choices=["split", "split_norm", "pooled"],
+        default="split",
+        help="C-MAML / La-MAML (lamaml_cifar): how the meta loss combines the "
+        "replay and current blocks of the getBatch batch. 'split' (DEFAULT) "
+        "scores the two blocks separately and returns "
+        "current + --memory_loss_lambda * replay, matching eralg4's "
+        "_weighted_multitask_loss and every other replay model in the repo, so "
+        "the replay share is pinned at 1:1. 'pooled' is the legacy single CE "
+        "over the concatenated rows: because the inverse-frequency class weights "
+        "are computed over that pooled batch and old-task classes are rare in it, "
+        "replay's share of the loss ESCALATES with task count (measured 0.34 at "
+        "task 0 to 0.85 by task 9), costing ~3 F1 of plasticity in single-epoch "
+        "TIL -- keep it only to reproduce runs logged before 2026-07-25. "
+        "'split_norm' divides 'split' by (1 + memory_loss_lambda), pinning the "
+        "share without doubling the loss scale. See docs/cmaml_vs_reser_til.md.",
+    )
 
     # experiment parameters
     parser.add_argument("--cuda", default=True, action="store_true", help="Use GPU")
