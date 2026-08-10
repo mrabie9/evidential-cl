@@ -79,6 +79,13 @@ def get_parser():
         help="Ablation: disable CTN's KL-distillation replay term (loss3 against frozen soft "
         "targets); plain replay CE is kept. Isolates distillation's contribution to BWT.",
     )
+    parser.add_argument(
+        "--gem_margin",
+        default=0.5,
+        type=float,
+        help="QP margin for the GEM gradient-projection constraint in ctn_gem (B2). Kept "
+        "separate from CTN's memory_strength, which is the KL-distillation weight.",
+    )
 
     # optimizer parameters influencing all models
     parser.add_argument(

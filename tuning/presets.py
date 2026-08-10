@@ -418,6 +418,75 @@ TUNING_PRESETS: Dict[str, TuningPreset] = {
             }
         ),
     ),
+    "gem_ctn": TuningPreset(
+        model_name="gem_ctn",
+        description="Run grid or random search over GEM-CTN (flagship B1) hyperparameters.",
+        default_output_root="logs/tuning/gem_ctn",
+        type_hints=COMMON_TYPE_HINTS,
+        grid_factory=make_grid_factory(
+            {
+                "lr": {
+                    "kind": "float",
+                    "factors": (0.3, 1.0, 3.0),
+                    "min": 1e-5,
+                    "fallback": 1e-2,
+                    "values": [
+                        0.03,
+                        0.01,
+                        0.003,
+                        0.001,
+                        0.0003,
+                        0.0001,
+                    ],
+                },
+                "memory_strength": {
+                    "kind": "float",
+                    "factors": (0.5, 1.0, 2.0),
+                    "min": 0.1,
+                    "fallback": 0.5,
+                    "values": [0.1, 0.5, 1, 5, 10, 50, 100, 500],
+                },
+                "task_emb": {
+                    "kind": "int",
+                    "factors": (0.5, 1.0, 2.0),
+                    "min": 16,
+                    "fallback": 64,
+                    "values": [16, 32, 64, 128],
+                },
+            }
+        ),
+    ),
+    "ctn_gem": TuningPreset(
+        model_name="ctn_gem",
+        description="Run grid or random search over CTN-GEM (flagship B2) hyperparameters.",
+        default_output_root="logs/tuning/ctn_gem",
+        type_hints=COMMON_TYPE_HINTS,
+        grid_factory=make_grid_factory(
+            {
+                "lr": {
+                    "kind": "float",
+                    "factors": (0.5, 1.0, 2.0),
+                    "min": 1e-4,
+                    "fallback": 0.01,
+                    "values": [0.03, 0.01, 0.003, 0.001],
+                },
+                "memory_strength": {
+                    "kind": "float",
+                    "factors": (0.3, 1.0, 3.0),
+                    "min": 0.1,
+                    "fallback": 10.0,
+                    "values": [0.1, 0.5, 1, 5, 10, 50, 100],
+                },
+                "gem_margin": {
+                    "kind": "float",
+                    "factors": (0.5, 1.0, 2.0),
+                    "min": 0.1,
+                    "fallback": 0.5,
+                    "values": [0.1, 0.5, 1, 5, 10, 50],
+                },
+            }
+        ),
+    ),
     "hat": TuningPreset(
         model_name="hat",
         description="Run grid or random search over hat hyperparameters.",
