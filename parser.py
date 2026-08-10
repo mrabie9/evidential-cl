@@ -618,6 +618,41 @@ def get_parser():
         "under-utilisation on early tasks.",
     )
     parser.add_argument(
+        "--beta",
+        type=float,
+        default=1.0,
+        help="BCL-Dual: Reptile-style meta-step amplification coefficient "
+        "(new = before + (after-before)*beta). beta=1 makes the interpolation an "
+        "identity (no amplification); the inner/outer two-loop structure still runs. "
+        "Use --no_bilevel to ablate the two-loop structure itself.",
+    )
+    parser.add_argument(
+        "--no_bilevel",
+        action="store_true",
+        help="BCL-Dual: ablate the bilevel two-loop optimization. Each inner round "
+        "collapses to a single fused gradient step on cls_lambda*loss1 + loss2 + loss3 "
+        "(current CE + replay CE + KL distill); the separate validation-buffer outer "
+        "step and the Reptile interpolation are dropped. Reduces BCL-Dual to plain "
+        "experience replay + distillation. Budget-match by doubling --inner_steps "
+        "(B0 takes 2 SGD steps/round). See docs/cmaml_bcl_ablations.md.",
+    )
+    parser.add_argument(
+        "--bcl_global_reservoir",
+        action="store_true",
+        help="BCL-Dual: replace the per-task replay buffer with a single GLOBAL reservoir "
+        "pool (eralg4/Res-ER's mechanism, ablation E0). One flat n_memories buffer admitted "
+        "by Vitter reservoir over the whole stream, with a per-slot task id so distillation "
+        "soft targets are still frozen per task. Combined with --val_fraction 0 (B3, no dual "
+        "memory) this is the CIL 'best-of-best' combination: B3 + global reservoir.",
+    )
+    parser.add_argument(
+        "--val_fraction",
+        type=float,
+        default=0.2,
+        help="BCL-Dual: fraction of each task's memory reserved for the validation "
+        "(dual-memory) buffer used by the outer loss; 0 disables dual memory.",
+    )
+    parser.add_argument(
         "--steps_per_sample", default=1, type=int, help="training steps per batch"
     )
 

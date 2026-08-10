@@ -32,6 +32,12 @@ class BclDualConfig:
     temperature: float = 5.0
     n_memories: int = 2000
     mem_sampling: str = "ring"
+    # When True, replace the per-task replay buffer with a single GLOBAL reservoir pool
+    # (eralg4/Res-ER's mechanism, ablation E0): one flat buffer of n_memories slots,
+    # admitted by textbook Vitter reservoir over the whole stream, with a per-slot task id
+    # so distillation soft targets are still frozen per task. Intended for the CIL B3
+    # (bcl_nodualmem) config, where masking is global and there is no validation buffer.
+    bcl_global_reservoir: bool = False
     inner_steps: int = 5
     adapt_inner_steps: int = 5
 
@@ -173,6 +179,28 @@ class Net(DetectionReplayMixin, torch.nn.Module):
                 f"mem_sampling must be one of {misc_utils.MEM_SAMPLING_MODES}, "
                 f"got {self.mem_sampling!r}"
             )
+
+        # --- Global reservoir pool (ablation E0's mechanism); off by default so plain
+        # BCL-Dual behaviour is unchanged. One flat buffer over the whole stream, plus a
+        # per-slot task id (``gres_t``) and a per-slot "soft target frozen" flag
+        # (``gres_ready``) so the per-task distillation freeze still works on a global pool.
+        self.global_reservoir = bool(self.cfg.bcl_global_reservoir)
+        if self.global_reservoir:
+            seq_len = n_inputs // 2
+            self.gres_cap = int(total_memories)
+            self.gres_x = torch.FloatTensor(self.gres_cap, 2, seq_len).fill_(0)
+            self.gres_y = torch.LongTensor(self.gres_cap).fill_(-1)
+            self.gres_t = torch.LongTensor(self.gres_cap).fill_(-1)
+            self.gres_feat = torch.FloatTensor(self.gres_cap, self.nc_per_task).fill_(0)
+            self.gres_ready = torch.zeros(self.gres_cap, dtype=torch.bool)
+            if self.cfg.cuda:
+                self.gres_x = self.gres_x.cuda()
+                self.gres_y = self.gres_y.cuda()
+                self.gres_t = self.gres_t.cuda()
+                self.gres_feat = self.gres_feat.cuda()
+                self.gres_ready = self.gres_ready.cuda()
+            self.gres_filled = 0  # occupied slots (dense in [0, gres_filled))
+            self.gres_seen = 0  # total stream items seen (Vitter denominator)
         self.task_val_ptr = torch.zeros(
             n_tasks, dtype=torch.long, device=self.valx.device
         )
@@ -377,6 +405,90 @@ class Net(DetectionReplayMixin, torch.nn.Module):
             )
         self.task_mem_ptr[task_id] = 0 if endcnt == capacity else endcnt
 
+    def _gres_store(self, x_src, y_src, t):
+        """Admit a batch into the global reservoir pool (Vitter Algorithm R).
+
+        Mirrors eralg4's reservoir update (ablation E0): a single pool over the whole
+        stream, replacement probability ``cap / seen`` decaying as the stream grows. Each
+        admitted slot records its task id (``gres_t``) and is marked not-yet-frozen
+        (``gres_ready=False``); its distillation soft target is frozen when task ``t``
+        ends. Overwriting a past-task slot therefore also clears its stale soft target.
+        """
+        cap = self.gres_cap
+        for i in range(x_src.size(0)):
+            self.gres_seen += 1
+            if self.gres_filled < cap:
+                slot = self.gres_filled
+                self.gres_filled += 1
+            else:
+                j = int(np.random.randint(0, self.gres_seen + 1))  # eralg4: randint(0, age)
+                if j >= cap:
+                    continue
+                slot = j
+            self.gres_x[slot].copy_(x_src[i])
+            self.gres_y[slot] = y_src[i]
+            self.gres_t[slot] = t
+            self.gres_ready[slot] = False
+
+    def _gres_freeze(self, tt):
+        """Freeze distillation soft targets for every pool slot holding task ``tt``.
+
+        Called at ``tt``'s boundary (teacher = current model), the global-pool twin of the
+        per-task ``mem_feat`` freeze in ``observe``.
+        """
+        if self.gres_filled == 0:
+            return
+        sel = (self.gres_t[: self.gres_filled] == tt).nonzero(as_tuple=True)[0]
+        if sel.numel() == 0:
+            return
+        offset1, offset2 = self.compute_offsets(tt)
+        out = self.forward(self.gres_x[sel], tt, True)
+        cls_size = int(offset2 - offset1)
+        self.gres_feat[sel] = 0
+        self.gres_feat[sel, :cls_size] = F.softmax(
+            out[:, offset1:offset2] / self.temp, dim=1
+        ).data.clone()
+        self.gres_ready[sel] = True
+
+    def _gres_sample(self, t):
+        """Sample past-task rows from the global pool; matches ``memory_sampling``'s tuple.
+
+        Only slots from strictly earlier tasks with a frozen soft target are eligible, so
+        replay/distillation see exactly the past-task data the per-task path would.
+        """
+        if self.gres_filled == 0:
+            return None
+        device = self.gres_x.device
+        tt = self.gres_t[: self.gres_filled]
+        yy_all = self.gres_y[: self.gres_filled]
+        valid = (tt >= 0) & (tt < t) & self.gres_ready[: self.gres_filled] & (yy_all >= 0)
+        if self.noise_label is not None:
+            valid &= yy_all != self.noise_label
+        pool = torch.nonzero(valid, as_tuple=True)[0]
+        if pool.numel() == 0:
+            return None
+        sz = min(int(pool.numel()), self.sz)
+        pick = np.random.choice(int(pool.numel()), size=sz, replace=False)
+        sel = pool[torch.as_tensor(pick, device=device, dtype=torch.long)]
+        t_idx = self.gres_t[sel]
+        offsets = torch.tensor(
+            [self.compute_offsets(int(i)) for i in t_idx.tolist()],
+            device=device,
+            dtype=torch.long,
+        )
+        xx = self.gres_x[sel]
+        yy = self.gres_y[sel] - offsets[:, 0]
+        feat = self.gres_feat[sel]
+        mask = torch.zeros(sz, self.nc_per_task, device=device)
+        for j in range(sz):
+            cls_size = offsets[j][1] - offsets[j][0]
+            mask[j, :cls_size] = torch.arange(
+                offsets[j][0], offsets[j][1], device=device
+            )
+        mask = mask.long()
+        sizes = (offsets[:, 1] - offsets[:, 0]).long()
+        return xx, yy, feat, mask, t_idx.tolist(), sizes
+
     def observe(self, x, y, t):
         # noise_label = None
         # if class_counts is not None:
@@ -425,16 +537,19 @@ class Net(DetectionReplayMixin, torch.nn.Module):
         y_work = unpack_y_to_class_labels(y).long()
         if t != self.current_task:
             tt = self.current_task
-            previous_filled = int(self.task_mem_filled[tt].item())
-            if previous_filled > 0:
-                offset1, offset2 = self.compute_offsets(tt)
-                out = self.forward(self.memx[tt, :previous_filled], tt, True)
-                cls_size = int(offset2 - offset1)
-                feat = self.mem_feat[tt, :previous_filled]
-                feat.zero_()
-                feat[:, :cls_size] = F.softmax(
-                    out[:, offset1:offset2] / self.temp, dim=1
-                ).data.clone()
+            if self.global_reservoir:
+                self._gres_freeze(tt)
+            else:
+                previous_filled = int(self.task_mem_filled[tt].item())
+                if previous_filled > 0:
+                    offset1, offset2 = self.compute_offsets(tt)
+                    out = self.forward(self.memx[tt, :previous_filled], tt, True)
+                    cls_size = int(offset2 - offset1)
+                    feat = self.mem_feat[tt, :previous_filled]
+                    feat.zero_()
+                    feat[:, :cls_size] = F.softmax(
+                        out[:, offset1:offset2] / self.temp, dim=1
+                    ).data.clone()
             self.current_task = t
 
         # Validation set (ring buffer per task); store adapted input in val buffer
@@ -473,18 +588,31 @@ class Net(DetectionReplayMixin, torch.nn.Module):
         # Replay memory (ring buffer per task); store adapted input
         # Only the "new" samples go to replay; rotated-in val sample is already in val buffer
         self.net.train()
-        task_replay_capacity = int(self.task_replay_capacities[t])
-        if task_replay_capacity > 0 and y_work.size(0) > 0:
-            # Exclude the rotated-in val sample; it already lives in the val buffer.
+        if self.global_reservoir:
+            # Global reservoir pool: admit the new samples over the whole stream (there is
+            # no per-task capacity to respect). With val_fraction 0 (B3) there is no rotated
+            # val sample, so n_val_taken/n_rotated_in are 0 and all of y_work is "new".
             n_new = y_work.size(0) - n_rotated_in
             if n_new > 0:
                 replay_start = n_val_taken
-                self._store_replay(
-                    t,
+                self._gres_store(
                     x_for_storage[replay_start : replay_start + n_new],
                     y_work[:n_new],
-                    task_replay_capacity,
+                    t,
                 )
+        else:
+            task_replay_capacity = int(self.task_replay_capacities[t])
+            if task_replay_capacity > 0 and y_work.size(0) > 0:
+                # Exclude the rotated-in val sample; it already lives in the val buffer.
+                n_new = y_work.size(0) - n_rotated_in
+                if n_new > 0:
+                    replay_start = n_val_taken
+                    self._store_replay(
+                        t,
+                        x_for_storage[replay_start : replay_start + n_new],
+                        y_work[:n_new],
+                        task_replay_capacity,
+                    )
 
         self.zero_grad()
         tt = t + 1
@@ -514,7 +642,11 @@ class Net(DetectionReplayMixin, torch.nn.Module):
                 class_weighted_ce=self.class_weighted_ce,
             )
             if t > 0:
-                sampled = self.memory_sampling(t)
+                sampled = (
+                    self._gres_sample(t)
+                    if self.global_reservoir
+                    else self.memory_sampling(t)
+                )
                 if sampled is not None:
                     xx, yy, feat, mask, list_t, class_sizes = sampled
                     pred_ = self.net(xx)
