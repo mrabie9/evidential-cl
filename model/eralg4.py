@@ -11,11 +11,14 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.autograd import Variable
 
 import numpy as np
 
+import copy
+import os
 import random
 import warnings
 import math
@@ -46,6 +49,21 @@ class ErAlgConfig:
     second_order: bool = False
     meta_batches: int = 3
     eralg4_masked_loss: bool = True
+    # PROBE: sister-repo two-forward joint ER loop (see --eralg4_joint_er).
+    eralg4_joint_er: bool = False
+    # PROBE: average the ER loss over K independent stochastic forward passes of
+    # the SAME batch before one optimizer step -- the twin of C-MAML's
+    # ``meta_batches``. resnet1d carries four Dropout(p=0.2) layers that
+    # ResNet1D.forward keeps active, so a single-forward gradient aligns only
+    # ~0.69 with the noise-free gradient (K=3 reaches ~0.85) and its inflated
+    # norm trips grad_clip_norm every step. K=1 is the historical behaviour.
+    eralg4_grad_avg: int = 1
+    # Res-ER + distillation: KL on replay samples against a teacher frozen at each
+    # task boundary (LwF-style, matching er_ring's er_distill / gem_distill's loss3).
+    # memory_strength is the KL weight, temperature the softmax temperature.
+    er_distill: bool = False
+    memory_strength: float = 1.0
+    temperature: float = 5.0
 
     arch: str = "resnet1d"
     dataset: str = "tinyimagenet"
@@ -96,6 +114,13 @@ class Net(DetectionReplayMixin, nn.Module):
         self.det_lambda = float(self.cfg.det_lambda)
         self.cls_lambda = float(self.cfg.cls_lambda)
         self.memory_loss_lambda = float(self.cfg.memory_loss_lambda)
+        # Distillation (er_distill): teacher snapshot frozen at each task boundary,
+        # KL over replay rows within their per-sample task class slices.
+        self.use_distill = bool(self.cfg.er_distill)
+        self.reg = float(self.cfg.memory_strength)
+        self.temp = float(self.cfg.temperature)
+        self.kl = nn.KLDivLoss(reduction="batchmean")
+        self.teacher = None  # frozen model snapshot, set at each task boundary
         self._init_det_replay(
             self.cfg.det_memories,
             self.cfg.det_replay_batch,
@@ -316,18 +341,31 @@ class Net(DetectionReplayMixin, nn.Module):
         yi = y_work.data.cpu().numpy()
 
         if t != self.current_task:
+            # Distillation: freeze the just-finished model as a teacher, mirroring
+            # er_ring / gem_distill / BCL-Dual. Replay-sample KL below distills the
+            # student toward this snapshot within each row's task class slice.
+            if self.use_distill:
+                self.teacher = copy.deepcopy(self.net)
+                self.teacher.eval()
+                for param in self.teacher.parameters():
+                    param.requires_grad = False
             self.current_task = t
 
         metric_logits = None
         if self.cfg.learn_lr:
             loss, cls_tr_rec = self.la_ER(raw_x_train, y, t)
+        elif self.cfg.eralg4_joint_er:
+            # Sister-repo path: current live batch + replay in separate forwards,
+            # adapter co-trained in-graph. No decoupled adapter step below.
+            loss, cls_tr_rec, metric_logits = self.ER_joint(raw_x_train, y_work, t)
         else:
             loss, cls_tr_rec = self.ER(xi, yi, t)
 
         # Ensure the adapter is explicitly trained on the current differentiable
         # 3-ADC/4D batch even when replay path uses detached storage tensors.
-        if (x.dim() == 3 and x.size(1) == 3) or (
-            x.dim() == 4 and x.size(1) == 3 and x.size(2) == 2
+        if not self.cfg.eralg4_joint_er and (
+            (x.dim() == 3 and x.size(1) == 3)
+            or (x.dim() == 4 and x.size(1) == 3 and x.size(2) == 2)
         ):
             self.net.zero_grad(set_to_none=True)
             live_x_train = self._canonicalize_input(x.detach(), detach=False)
@@ -429,6 +467,23 @@ class Net(DetectionReplayMixin, nn.Module):
             prediction = self.net.forward(bx)
             loss = self._weighted_multitask_loss(prediction, by, bt, replay_count)
             cls_tr_rec.append(self._batch_accuracy(bt, prediction, by))
+            self._dbg("BASE", pass_itr, t, bx, prediction, by, bt, replay_count, loss)
+
+            # Distillation on replay rows: KL(student || frozen teacher) within each
+            # row's task class slice. Per-sample masking (student and teacher alike)
+            # confines the softmax to that row's task, so masked columns contribute ~0.
+            rc = max(0, min(int(replay_count), prediction.size(0)))
+            if self.use_distill and self.teacher is not None and rc > 0:
+                rt = bt[:rc]
+                student_masked = self._mask_logits_for_sample_tasks(prediction[:rc], rt)
+                with torch.no_grad():
+                    teacher_masked = self._mask_logits_for_sample_tasks(
+                        self.teacher.forward(bx[:rc]), rt
+                    )
+                    teacher_probs = F.softmax(teacher_masked / self.temp, dim=1)
+                loss = loss + self.reg * self.kl(
+                    F.log_softmax(student_masked / self.temp, dim=1), teacher_probs
+                )
 
             loss.backward()
             if self.cfg.grad_clip_norm:
@@ -440,6 +495,144 @@ class Net(DetectionReplayMixin, nn.Module):
 
         avg_cls_tr_rec = sum(cls_tr_rec) / len(cls_tr_rec) if cls_tr_rec else 0.0
         return loss, avg_cls_tr_rec
+
+    def _dbg(self, tag, pass_itr, t, bx, prediction, by, bt, replay_count, loss):
+        """PROBE-only per-step diagnostics (enable with ERALG4_DEBUG=1)."""
+        if os.environ.get("ERALG4_DEBUG") != "1":
+            return
+        n = getattr(self, "_dbg_steps", 0)
+        if n >= 8:
+            return
+        self._dbg_steps = n + 1
+        rc = max(0, min(int(replay_count), prediction.size(0)))
+        with torch.no_grad():
+            cur = self.take_multitask_loss(bt[rc:], prediction[rc:], by[rc:])
+            rep = (
+                self.take_multitask_loss(bt[:rc], prediction[:rc], by[:rc])
+                if rc > 0
+                else torch.zeros((), device=prediction.device)
+            )
+        print(
+            f"[DBG {tag}] step={n} pass={pass_itr} t={t} "
+            f"fwd_batch={tuple(bx.shape)} replay_n={rc} cur_n={prediction.size(0) - rc} "
+            f"cur_loss={cur.item():.4f} rep_loss={rep.item():.4f} total={loss.item():.4f} "
+            f"x_mean={bx.mean().item():.5f} x_std={bx.std().item():.5f}",
+            flush=True,
+        )
+
+    def _sample_replay(self, device):
+        """Sample a noise-excluded replay minibatch from reservoir ``M``.
+
+        Rows in ``M`` are pre-canonicalized (2, L) tensors, so no adapter grad
+        flows for replayed samples (mirrors the sister-repo ``_sample_replay``).
+        Returns ``(bx, by, bt)`` or ``None`` when no eligible samples exist.
+        """
+        if len(self.M) == 0:
+            return None
+        osize = min(self.batchSize, len(self.M))
+        replay_x, replay_y, replay_t = [], [], []
+        for k in random.choices(range(len(self.M)), k=osize):
+            xi, yi, ti = self.M[k]
+            yi_scalar = int(torch.as_tensor(yi).long().flatten()[0].item())
+            if self.noise_label is not None and yi_scalar == self.noise_label:
+                continue
+            replay_x.append(torch.as_tensor(np.array(xi)))
+            replay_y.append(yi_scalar)
+            replay_t.append(int(ti))
+        if not replay_x:
+            return None
+        bx = torch.stack(replay_x).float().to(device, non_blocking=True)
+        by = torch.tensor(replay_y, dtype=torch.long, device=device)
+        bt = torch.tensor(replay_t, dtype=torch.long, device=device)
+        return bx, by, bt
+
+    def ER_joint(self, raw_x, y, t):
+        """Sister-repo two-forward ER: current live batch + replay in separate
+        forwards, adapter and backbone co-trained in one ``opt_wt`` step.
+
+        ``raw_x`` is the detached leaf current batch; each inner step rebuilds a
+        fresh canonicalized (adapter-differentiable) graph so the adapter and
+        backbone receive gradients together. Replay rows are pre-canonicalized
+        buffer tensors (no adapter grad).
+        """
+        cls_tr_rec = []
+        metric_logits = None
+        y = y.long()
+        current_t = torch.full(
+            (raw_x.size(0),), int(t), dtype=torch.long, device=raw_x.device
+        )
+        k_avg = max(1, int(self.cfg.eralg4_grad_avg))
+        for _pass_itr in range(self.inner_steps):
+            self.net.zero_grad()
+
+            # Draw the replay rows once per optimizer step, then evaluate the loss
+            # on them k_avg times. Dropout resamples on every forward, so this
+            # averages out gradient noise exactly as C-MAML's meta_batches does;
+            # k_avg=1 is the historical single-forward path.
+            replay = self._sample_replay(raw_x.device)
+            k_losses = []
+            for _k in range(k_avg):
+                live_x = self._canonicalize_input(raw_x, detach=False)
+                current_logits = self.net.forward(live_x)
+                current_loss = self.take_multitask_loss(current_t, current_logits, y)
+
+                if replay is not None:
+                    replay_x, replay_y, replay_t = replay
+                    replay_logits = self.net.forward(replay_x)
+                    replay_loss = self.take_multitask_loss(
+                        replay_t, replay_logits, replay_y
+                    )
+                else:
+                    replay_loss = torch.zeros(
+                        (), device=current_logits.device, dtype=current_logits.dtype
+                    )
+                k_losses.append(current_loss + (self.memory_loss_lambda * replay_loss))
+
+            loss = k_losses[0] if k_avg == 1 else sum(k_losses) / k_avg
+            cls_tr_rec.append(self._batch_accuracy(current_t, current_logits, y))
+            if replay is not None:
+                self._dbg(
+                    "JOINT",
+                    _pass_itr,
+                    t,
+                    torch.cat([replay_x, live_x.detach()]),
+                    torch.cat([replay_logits.detach(), current_logits.detach()]),
+                    torch.cat([replay_y, y]),
+                    torch.cat([replay_t, current_t]),
+                    replay_x.size(0),
+                    loss,
+                )
+            else:
+                self._dbg(
+                    "JOINT",
+                    _pass_itr,
+                    t,
+                    live_x.detach(),
+                    current_logits.detach(),
+                    y,
+                    current_t,
+                    0,
+                    loss,
+                )
+            metric_logits = misc_utils.apply_task_incremental_logit_mask(
+                current_logits.detach(),
+                t,
+                self.classes_per_task,
+                self.n_outputs,
+                cil_all_seen_upto_task=t,
+                global_noise_label=self.noise_label,
+                loader=self.incremental_loader_name,
+            )
+
+            loss.backward()
+            if self.cfg.grad_clip_norm:
+                torch.nn.utils.clip_grad_norm_(
+                    self.net.parameters(), self.cfg.grad_clip_norm
+                )
+            self.opt_wt.step()
+
+        avg_cls_tr_rec = sum(cls_tr_rec) / len(cls_tr_rec) if cls_tr_rec else 0.0
+        return loss, avg_cls_tr_rec, metric_logits
 
     def inner_update(self, x, fast_weights, y, t):
         """

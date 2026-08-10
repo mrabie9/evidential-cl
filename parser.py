@@ -147,6 +147,28 @@ def get_parser():
         "TIL). See docs/cmaml_bcl_ablations.md.",
     )
     parser.set_defaults(eralg4_masked_loss=True)
+    parser.add_argument(
+        "--eralg4_joint_er",
+        action="store_true",
+        help="eralg4 (ER-reservoir): PROBE flag. Use the sister-repo two-forward "
+        "training loop (current live batch + replay in separate forwards, adapter "
+        "and backbone co-trained jointly in one opt_wt step) instead of the default "
+        "concatenated single-batch forward with a decoupled manual adapter step.",
+    )
+    parser.set_defaults(eralg4_joint_er=False)
+    parser.add_argument(
+        "--eralg4_grad_avg",
+        type=int,
+        default=1,
+        help="eralg4 (ER-reservoir): PROBE flag. Average the ER loss over K "
+        "independent stochastic forward passes of the same batch before each "
+        "optimizer step -- the twin of C-MAML's --meta_batches. resnet1d keeps "
+        "four Dropout(p=0.2) layers active on every forward, so a single-forward "
+        "gradient aligns only ~0.69 with the noise-free gradient (K=3 reaches "
+        "~0.85) and its noise-inflated norm trips --grad_clip_norm every step. "
+        "Tests whether C-MAML's TIL edge over Res-ER is just this variance "
+        "reduction. K=1 (default) is the historical behaviour.",
+    )
 
     # experiment parameters
     parser.add_argument("--cuda", default=True, action="store_true", help="Use GPU")
