@@ -4,7 +4,7 @@ loader: task_incremental_loader
 learn_lr: true
 sync_update: false
 use_old_task_memory: false
-second_order: true
+second_order: false
 
 opt_lr: 0.1 # n
 alpha_init: 0.001 # alpha
