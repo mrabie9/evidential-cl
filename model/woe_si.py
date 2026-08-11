@@ -950,6 +950,20 @@ class Net(DetectionReplayMixin, nn.Module):
         pair it with ``woe_evidence_scale='belief'``, which is bounded, or the
         constraint becomes satisfiable by inflating the readout.
 
+        WARNING -- asymmetry is only sound where the reference was recorded on the
+        *same* inputs it is scored on. That holds for ``woe_si_replay``'s decay
+        penalty, which re-evaluates each stored item against its own snapshot. It
+        does **not** hold in output mode, where the frozen teacher is scored on
+        *current-task* data: there the second arm reads "evidence against an old
+        class must not rise on new-task inputs", which forbids exactly what the
+        model should be learning, since new-task samples genuinely are not members
+        of the old classes. Measured on the 10-task TIL run, output mode with
+        ``woe_evidence_asymmetric`` at lambda=1 gives BWT -0.4383 against naive
+        fine-tuning's ~-0.37, i.e. worse retention than no penalty at all, while
+        the diagonal stays healthy at 0.6221. Use the symmetric form in output
+        mode; "match the teacher" is direction-neutral and carries no such
+        assumption.
+
         Args:
             student: ``(w_plus, w_minus)`` of the live network, shape ``(batch, K)``.
             reference: ``(w_plus, w_minus)`` of the frozen teacher or snapshot.

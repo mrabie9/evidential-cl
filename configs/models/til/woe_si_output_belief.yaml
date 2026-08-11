@@ -1,0 +1,45 @@
+model: woe_si
+loader: task_incremental_loader
+lr: 0.01
+
+# Output mode is a FUNCTIONAL penalty (evidence distillation against a frozen
+# end-of-task teacher) with no replay buffer of any kind, which is what makes it
+# the replay-free form of the evidence constraint: woe_si_replay's decay penalty
+# needs per-sample snapshots in the reservoir and cannot run without one.
+woe_reg_level: output
+woe_centering_mode: centered_uniform
+woe_mu_momentum: 0.9
+woe_conflict_weighting: false
+
+# Symmetric, deliberately. The one-sided hinge is sound in woe_si_replay, where each
+# stored item is re-scored against a snapshot taken on that same item. It is NOT
+# sound here: output mode scores a frozen teacher on *current-task* data, so the
+# arm "evidence against an old class must not rise" forbids what the model should
+# be learning -- new-task samples really are not members of the old classes.
+# Measured: woe_evidence_asymmetric at lambda=1 gives BWT -0.4383 (naive is ~-0.37)
+# with the diagonal intact at 0.6221, i.e. it actively destroys retention.
+woe_evidence_asymmetric: false
+
+# Belief scale -- the variable actually under test here. Raw weights of evidence
+# make equal drops count equally regardless of how much belief was at risk
+# (8.0 -> 7.5 costs 0.0002 of belief where 0.5 -> 0.0 costs 0.393); the belief
+# transform weights each drop by what is genuinely at stake. Compare against the
+# weight-scale symmetric plateau of 0.400-0.430 to isolate this one change.
+woe_evidence_scale: belief
+
+# tau measured, not guessed. Under this config's lr=0.01 the weights of evidence run
+# hotter than under the replay config's lr=0.003: by step 50 of task 0 the median
+# w_plus is 5.88 and the p90 is 13.86, with 7.5% of entries already past 16.6 --
+# where float32 rounds 1 - exp(-w) to exactly 1 and the gradient is exactly 0. At
+# tau = 8 the median sits at belief 0.52 and the p90 at 0.82, both on the responsive
+# part of the curve.
+woe_evidence_belief_tau: 8.0
+
+# NOT transferable. woe_si_output.yaml's 1000 is calibrated to a J^2-normalised
+# squared drift in weight space (raw penalty 0.0009-0.038 against a CE of
+# 0.42-0.88). The belief form is O(1) and takes no divisor, so it sits several
+# decades away. Swept separately; see the sweep results in the commit message.
+woe_lambda: 10.0
+
+# Inert in output mode: no path integral is accumulated, so there is no Omega to
+# anchor, winsorise, or apply proximally.
