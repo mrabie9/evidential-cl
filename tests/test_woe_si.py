@@ -25,6 +25,7 @@ if ROOT not in sys.path:
 from model.woe_si import (
     Net,
     compute_weights_of_evidence,
+    evidence_to_belief,
     information_content,
     per_class_total_evidence,
 )
@@ -684,3 +685,74 @@ def test_output_mode_still_detects_real_drift() -> None:
     model.teacher = teacher_before
 
     assert float(model._evidence_distillation_loss(x, 1).item()) > 0.0
+
+
+# ----------------------------------------------------------------------
+# evidence_to_belief
+# ----------------------------------------------------------------------
+def test_evidence_to_belief_matches_the_simple_support_mass() -> None:
+    """Weight w leaves vacuous mass exp(-w), so the focal set gets 1 - exp(-w)."""
+    w = torch.tensor([0.0, 0.1, 0.5, 2.0, 8.0, 50.0])
+    torch.testing.assert_close(evidence_to_belief(w), 1.0 - torch.exp(-w))
+
+
+def test_evidence_to_belief_is_bounded_and_monotone() -> None:
+    """The map sends [0, inf) -> [0, 1) -- this is the whole point of using it.
+
+    The bound is ``<= 1.0`` rather than ``< 1.0`` because float32 rounds
+    ``1 - exp(-w)`` up to exactly 1 past ``w ~ 16.6``; see the hard-saturation
+    test below.
+    """
+    w = torch.linspace(0.0, 500.0, 2000)
+    belief = evidence_to_belief(w)
+    assert float(belief.min()) == 0.0
+    assert float(belief.max()) <= 1.0
+    assert bool((belief.diff() >= 0).all())
+
+
+def test_evidence_to_belief_saturates_hard_in_float32() -> None:
+    """Past w ~ 16.6 the belief is exactly 1 and the gradient is exactly 0.
+
+    This is a real constraint on using the transform, not a curiosity: the
+    penalty's gradient carries a factor ``exp(-w / tau)``, which underflows the
+    float32 gap below 1. If ``w_plus`` runs above ~16.6 the term is silently
+    dead, and ``temperature`` is mandatory rather than optional.
+    """
+    dead = torch.tensor([17.0], requires_grad=True)
+    evidence_to_belief(dead).backward()
+    assert float(dead.grad) == 0.0
+
+    alive = torch.tensor([17.0], requires_grad=True)
+    evidence_to_belief(alive, temperature=17.0).backward()
+    assert float(alive.grad) > 0.0
+
+
+def test_evidence_to_belief_weights_drops_by_belief_at_risk() -> None:
+    """Equal drops in w are very unequal losses of belief.
+
+    A squared penalty in weight space scores 8.0 -> 7.5 and 0.5 -> 0.0
+    identically. On the belief scale the second is the class losing its support
+    outright and is charged three orders of magnitude more.
+    """
+    saturated = evidence_to_belief(torch.tensor(8.0)) - evidence_to_belief(
+        torch.tensor(7.5)
+    )
+    at_risk = evidence_to_belief(torch.tensor(0.5)) - evidence_to_belief(
+        torch.tensor(0.0)
+    )
+    assert float(at_risk) / float(saturated) > 100.0
+
+
+def test_evidence_to_belief_temperature_moves_the_operating_point() -> None:
+    """Dividing by tau un-saturates evidence that sits on the flat tail."""
+    w = torch.tensor([8.0])
+    assert float(evidence_to_belief(w)) > 0.999
+    assert float(evidence_to_belief(w, temperature=50.0)) < 0.2
+
+
+def test_evidence_to_belief_rejects_non_positive_temperature() -> None:
+    try:
+        evidence_to_belief(torch.tensor([1.0]), temperature=0.0)
+    except ValueError:
+        return
+    raise AssertionError("evidence_to_belief should reject a non-positive temperature")

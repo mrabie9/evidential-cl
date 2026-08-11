@@ -58,6 +58,9 @@ def _make_args(loader: str, **overrides) -> object:
     o.woe_replay_lambda = overrides.get("woe_replay_lambda", 1.0)
     o.woe_replay_mode = overrides.get("woe_replay_mode", "ce")
     o.woe_evidence_lambda = overrides.get("woe_evidence_lambda", 1.0)
+    o.woe_evidence_readout_only = overrides.get("woe_evidence_readout_only", False)
+    o.woe_evidence_scale = overrides.get("woe_evidence_scale", "weight")
+    o.woe_evidence_belief_tau = overrides.get("woe_evidence_belief_tau", 1.0)
     return o
 
 
@@ -274,9 +277,176 @@ def test_buffer_rejects_missing_evidence() -> None:
     raise AssertionError("store_evidence buffer should reject add() without evidence")
 
 
+# ----------------------------------------------------------------------
+# Belief-scale evidence decay (woe_evidence_scale = belief)
+# ----------------------------------------------------------------------
+def _inflated_decay_penalty(evidence_scale: str, inflation: float) -> float:
+    """Penalty after claiming every stored item had ``inflation`` more support.
+
+    Adding a constant to the stored ``w_plus`` fabricates a pure decay of exactly
+    that size, with the current network untouched, so the two scales are charged
+    on identical weight-space gaps.
+    """
+    model = _evidence_model(
+        woe_replay_mode="evidence", woe_evidence_scale=evidence_scale
+    )
+    x, y = _one_batch()
+    model._store_classification_replay(x, y, 0)
+    buffer = model.replay_buffer
+    for i in range(len(buffer)):
+        buffer.evidence_plus[i] = buffer.evidence_plus[i] + inflation
+    return float(model._classification_replay_loss(0).item())
+
+
+def test_belief_scale_defaults_off() -> None:
+    """Existing runs are untouched: the raw-weight hinge stays the default."""
+    model = _evidence_model(woe_replay_mode="evidence")
+    assert model.evidence_scale == "weight"
+    assert model._decay_normaliser(512) == 512.0 * 512.0
+
+
+def test_belief_scale_drops_the_j_squared_normaliser() -> None:
+    """Beliefs are O(1), so the O(J^2) divisor would shrink them 262144-fold."""
+    model = _evidence_model(woe_replay_mode="evidence", woe_evidence_scale="belief")
+    assert model._decay_normaliser(512) == 1.0
+
+
+def test_belief_scale_keeps_zero_penalty_for_an_unchanged_network() -> None:
+    """The transform is monotone, so no drift still means exactly no penalty."""
+    model = _evidence_model(woe_replay_mode="evidence", woe_evidence_scale="belief")
+    x, y = _one_batch()
+    model._store_classification_replay(x, y, 0)
+    assert float(model._classification_replay_loss(0).item()) == 0.0
+
+
+def test_belief_scale_stays_one_sided() -> None:
+    """Monotonicity preserves the sign of every gap, so the hinge is unchanged."""
+    model = _evidence_model(woe_replay_mode="evidence", woe_evidence_scale="belief")
+    x, y = _one_batch()
+    model._store_classification_replay(x, y, 0)
+    buffer = model.replay_buffer
+    for i in range(len(buffer)):
+        buffer.evidence_plus[i] = buffer.evidence_plus[i] * 0.5
+        buffer.evidence_minus[i] = buffer.evidence_minus[i] * 2.0 + 1.0
+    assert float(model._classification_replay_loss(0).item()) == 0.0
+
+    for i in range(len(buffer)):
+        buffer.evidence_plus[i] = buffer.evidence_plus[i] * 8.0 + 1.0
+    assert float(model._classification_replay_loss(0).item()) > 0.0
+
+
+def test_belief_scale_saturates_where_weight_scale_diverges() -> None:
+    """The reason for the transform: the belief hinge cannot be run away with.
+
+    A 10x larger weight-space gap costs ~100x more in weight space (it enters
+    squared and is unbounded), but essentially nothing extra in belief space,
+    where both ends are already saturated against a bound of 1.
+    """
+    weight_small = _inflated_decay_penalty("weight", 10.0)
+    weight_large = _inflated_decay_penalty("weight", 100.0)
+    assert weight_large / weight_small > 50.0
+
+    belief_small = _inflated_decay_penalty("belief", 10.0)
+    belief_large = _inflated_decay_penalty("belief", 100.0)
+    assert belief_small > 0.0
+    assert belief_large / belief_small < 1.01
+
+
+def test_belief_penalty_is_bounded_by_the_class_count() -> None:
+    """Each channel contributes at most 1 per class, so the mean is bounded."""
+    penalty = _inflated_decay_penalty("belief", 1000.0)
+    model = _evidence_model(woe_replay_mode="evidence", woe_evidence_scale="belief")
+    assert 0.0 < penalty <= 2.0 * float(model.n_outputs)
+
+
+def test_belief_tau_rescales_the_operating_point() -> None:
+    """A large tau moves saturated evidence back onto the responsive region."""
+    hot = _evidence_model(
+        woe_replay_mode="evidence",
+        woe_evidence_scale="belief",
+        woe_evidence_belief_tau=50.0,
+    )
+    x, y = _one_batch()
+    hot._store_classification_replay(x, y, 0)
+    buffer = hot.replay_buffer
+    for i in range(len(buffer)):
+        buffer.evidence_plus[i] = buffer.evidence_plus[i] + 10.0
+    hot_penalty = float(hot._classification_replay_loss(0).item())
+    # At tau=1 the same gap is fully saturated and charges close to the cap;
+    # at tau=50 it sits low on the curve and charges much less.
+    assert 0.0 < hot_penalty < _inflated_decay_penalty("belief", 10.0)
+
+
+def test_invalid_evidence_scale_is_rejected() -> None:
+    try:
+        _evidence_model(woe_replay_mode="evidence", woe_evidence_scale="bel")
+    except ValueError:
+        return
+    raise AssertionError("woe_evidence_scale should reject unknown values")
+
+
+def test_non_positive_belief_tau_is_rejected() -> None:
+    try:
+        _evidence_model(
+            woe_replay_mode="evidence",
+            woe_evidence_scale="belief",
+            woe_evidence_belief_tau=0.0,
+        )
+    except ValueError:
+        return
+    raise AssertionError("woe_evidence_belief_tau should reject non-positive values")
+
+
 def test_invalid_replay_mode_rejected() -> None:
     try:
         _evidence_model(woe_replay_mode="nonsense")
     except ValueError:
         return
     raise AssertionError("woe_replay_mode should validate against _REPLAY_MODES")
+
+
+# ----------------------------------------------------------------------
+# Readout-only evidence distillation
+# ----------------------------------------------------------------------
+def _decay_grads(model: Net):
+    """Backward the evidence-decay penalty; return (backbone_grad, readout_grad)."""
+    x, y = _one_batch()
+    model._store_classification_replay(x, y, 0)
+    # Force real decay so the hinge is active and the penalty is non-zero.
+    buffer = model.replay_buffer
+    for i in range(len(buffer)):
+        buffer.evidence_plus[i] = buffer.evidence_plus[i] * 8.0 + 1.0
+    loss = model._classification_replay_loss(0)
+    assert float(loss.item()) > 0.0
+    model.zero_grad(set_to_none=True)
+    loss.backward()
+    backbone = sum(
+        float(p.grad.abs().sum().item())
+        for n, p in model.net.named_parameters()
+        if p.grad is not None and not n.replace("model.", "").startswith("fc")
+    )
+    readout = sum(
+        float(p.grad.abs().sum().item())
+        for n, p in model.net.named_parameters()
+        if p.grad is not None and n.replace("model.", "").startswith("fc")
+    )
+    return backbone, readout
+
+
+def test_readout_only_sends_no_gradient_to_the_backbone() -> None:
+    model = _evidence_model(woe_replay_mode="evidence", woe_evidence_readout_only=True)
+    backbone, readout = _decay_grads(model)
+    assert readout > 0.0, "the readout must still be constrained"
+    assert backbone == 0.0, "no gradient may reach the backbone"
+
+
+def test_default_evidence_mode_does_reach_the_backbone() -> None:
+    """Without the flag the penalty propagates through the whole network."""
+    model = _evidence_model(woe_replay_mode="evidence")
+    backbone, readout = _decay_grads(model)
+    assert readout > 0.0
+    assert backbone > 0.0
+
+
+def test_readout_only_defaults_off() -> None:
+    assert not _evidence_model(woe_replay_mode="evidence").evidence_readout_only

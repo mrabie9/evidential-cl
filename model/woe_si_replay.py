@@ -33,12 +33,32 @@ evidence having *decayed*::
     L = mean_b sum_k [ relu(w+_stored - w+_now)^2 + relu(w-_now - w-_stored)^2 ]
 
 Only deterioration is charged; the model is free to become *more* certain about a
-rehearsed item, so the term never competes for capacity it does not need. This is a
-functional constraint like ``woe_reg_level='output'``, but anchored to per-sample
-evidence recorded when the sample was seen rather than to a frozen end-of-task
-teacher network -- and, unlike output mode, the snapshot and the recomputation
-centre with the *same* per-task feature mean, so an unchanged network scores exactly
-zero penalty.
+rehearsed item, so the term never competes for capacity it does not need.
+
+``woe_evidence_scale`` chooses what the hinge is measured on. The default
+``'weight'`` uses the raw ``(w_plus, w_minus)`` above. ``'belief'`` first maps each
+channel through ``1 - exp(-w / tau)``, the mass that channel commits to its focal
+set. Weights of evidence are unbounded above, so a *one-sided* penalty on them is
+satisfiable by inflating the readout -- ``w`` is linear in it, so one global rescale
+satisfies every "must not decrease" constraint at once, and current-task CE actively
+pushes that way because it also sharpens the softmax. The symmetric ``output`` mode
+pinned the scale; dropping the upper arm opened the hole. Beliefs saturate, so the
+loophole stops paying. See :func:`model.woe_si.evidence_to_belief`.
+
+Either way this is a functional constraint like ``woe_reg_level='output'``, but
+anchored to per-sample evidence recorded when the sample was seen rather than to a
+frozen end-of-task teacher network -- and, unlike output mode, the snapshot and the
+recomputation centre with the *same* per-task feature mean, so an unchanged network
+scores exactly zero penalty.
+
+``woe_evidence_readout_only`` detaches the backbone features before the penalty is
+formed, so rehearsed items constrain only the linear readout and never propagate a
+gradient into the backbone. Paired with ``woe_replay_mode='evidence'`` this makes
+the buffer purely a distillation signal: the backbone is driven entirely by the
+current task while the readout is held to the evidence it previously assigned. It
+also confines the mechanism to the one place the Dempster-Shafer construction is
+exact -- for the backbone, ``d I / d theta`` is ``(d I / d phi)(d phi / d theta)``,
+where only the first factor carries DS content.
 
 The evidence snapshot is stored *alongside* the input, not instead of it: penalising
 decay requires re-evaluating the current model on the stored item, which needs the
@@ -48,7 +68,8 @@ thousand, so it is a few percent of buffer memory.
 Config: ``configs/models/til/woe_si_replay.yaml``. Extra knobs:
 ``woe_replay_memories`` (buffer capacity), ``woe_replay_batch_size`` (replay draw
 per step), ``woe_replay_lambda`` (replay CE weight), ``woe_replay_mode``
-(``ce``/``evidence``/``both``) and ``woe_evidence_lambda`` (evidence-decay weight).
+(``ce``/``evidence``/``both``), ``woe_evidence_lambda`` (evidence-decay weight),
+``woe_evidence_scale`` (``weight``/``belief``) and ``woe_evidence_belief_tau``.
 """
 
 from __future__ import annotations
@@ -59,7 +80,11 @@ from typing import List, Optional, Tuple
 import torch
 
 from model.detection_replay import unpack_y_to_class_labels
-from model.woe_si import Net as WoeSiNet, per_class_total_evidence
+from model.woe_si import (
+    Net as WoeSiNet,
+    evidence_to_belief,
+    per_class_total_evidence,
+)
 from utils import misc_utils
 from utils.class_weighted_loss import classification_cross_entropy
 
@@ -69,6 +94,12 @@ from utils.class_weighted_loss import classification_cross_entropy
 #                 falling below what it was when they were stored.
 #   "both"     -- the sum of the two.
 _REPLAY_MODES = ("ce", "evidence", "both")
+
+# Scale the evidence-decay penalty is measured on:
+#   "weight" -- raw weights of evidence (w_plus, w_minus), unbounded above.
+#   "belief" -- 1 - exp(-w / tau), the mass each channel commits, bounded in
+#               [0, 1). See `model.woe_si.evidence_to_belief`.
+_EVIDENCE_SCALES = ("weight", "belief")
 
 
 class ReservoirReplayBuffer:
@@ -212,6 +243,21 @@ class Net(WoeSiNet):
                 f"got {self.replay_mode!r}"
             )
         self.evidence_lambda = float(getattr(args, "woe_evidence_lambda", 1.0))
+        self.evidence_readout_only = bool(
+            getattr(args, "woe_evidence_readout_only", False)
+        )
+        self.evidence_scale = str(getattr(args, "woe_evidence_scale", "weight"))
+        if self.evidence_scale not in _EVIDENCE_SCALES:
+            raise ValueError(
+                f"woe_evidence_scale must be one of {_EVIDENCE_SCALES}, "
+                f"got {self.evidence_scale!r}"
+            )
+        self.evidence_belief_tau = float(getattr(args, "woe_evidence_belief_tau", 1.0))
+        if self.evidence_belief_tau <= 0.0:
+            raise ValueError(
+                "woe_evidence_belief_tau must be positive, got "
+                f"{self.evidence_belief_tau}"
+            )
         self.uses_evidence_replay = self.replay_mode in ("evidence", "both")
         self.uses_ce_replay = self.replay_mode in ("ce", "both")
         self.replay_buffer = ReservoirReplayBuffer(
@@ -294,10 +340,14 @@ class Net(WoeSiNet):
                              + relu(w-_now - w-_stored)^2 ]
 
         Improvement is free, so the term never fights the current task for
-        capacity it does not need. ``J^2``-normalised to sit on the same scale as
-        the other DS losses in this family. The squared hinge is C^1 -- its
-        derivative ``2*relu(.)`` is continuous at the kink -- so nothing here is
+        capacity it does not need. The squared hinge is C^1 -- its derivative
+        ``2*relu(.)`` is continuous at the kink -- so nothing here is
         discontinuous for the optimiser.
+
+        Under ``woe_evidence_scale='belief'`` both sides are first mapped through
+        ``1 - exp(-w / tau)`` (see :meth:`_to_penalty_scale`); the normalisation
+        changes with the scale (see :meth:`_decay_normaliser`), so
+        ``woe_evidence_lambda`` does not transfer between the two.
 
         Args:
             replay_x: Rehearsed inputs ``(batch, ...)`` already on device.
@@ -309,6 +359,13 @@ class Net(WoeSiNet):
             Scalar penalty; zero when no item can be scored.
         """
         features = self.net.forward_features(replay_x, bn_training=False)
+        if self.evidence_readout_only:
+            # Detach so the penalty is a function of the readout alone: rehearsed
+            # items constrain `fc` and never reach the backbone, which is then
+            # driven purely by the current task. `bn_training=False` already keeps
+            # the replay forward from touching BatchNorm running statistics, so
+            # with this detach the backbone is untouched by replay entirely.
+            features = features.detach()
         total = torch.zeros((), device=features.device)
         scored = 0
         for task_id in torch.unique(replay_t).tolist():
@@ -324,16 +381,72 @@ class Net(WoeSiNet):
                 active,
                 self._task_feature_mean(int(task_id)),
             )
-            now_plus, now_minus = per_class_total_evidence(weights)
-            decay = torch.relu(stored_plus[rows][:, active] - now_plus).pow(
-                2
-            ) + torch.relu(now_minus - stored_minus[rows][:, active]).pow(2)
+            now_plus, now_minus = self._to_penalty_scale(
+                *per_class_total_evidence(weights)
+            )
+            was_plus, was_minus = self._to_penalty_scale(
+                stored_plus[rows][:, active], stored_minus[rows][:, active]
+            )
+            decay = torch.relu(was_plus - now_plus).pow(2) + torch.relu(
+                now_minus - was_minus
+            ).pow(2)
             total = total + decay.sum(dim=1).sum()
             scored += int(rows.sum().item())
         if scored == 0:
             return torch.zeros(1, device=features.device)
-        feature_count = features.shape[1]
-        return total / (scored * float(feature_count * feature_count))
+        return total / (scored * self._decay_normaliser(features.shape[1]))
+
+    # ------------------------------------------------------------------
+    def _to_penalty_scale(
+        self, w_plus: torch.Tensor, w_minus: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Map a ``(w_plus, w_minus)`` pair onto the configured penalty scale.
+
+        Identity under ``woe_evidence_scale='weight'``. Under ``'belief'`` both
+        channels go through :func:`model.woe_si.evidence_to_belief`, which is
+        monotone -- so the stored snapshot can stay in weight space and be
+        converted here, and existing buffers remain valid.
+
+        The two channels are transformed *separately* rather than combined into
+        ``Bel({theta_k})``. That is deliberate: the penalty makes two independent
+        one-sided statements (support must not fall, counter-evidence must not
+        rise), and combining the channels would let a drop in support be repaired
+        by suppressing counter-evidence instead.
+
+        Args:
+            w_plus: Positive total evidence ``(batch, K)``.
+            w_minus: Negative total evidence ``(batch, K)``.
+
+        Returns:
+            The pair mapped onto the penalty scale, shapes unchanged.
+        """
+        if self.evidence_scale != "belief":
+            return w_plus, w_minus
+        tau = self.evidence_belief_tau
+        return evidence_to_belief(w_plus, tau), evidence_to_belief(w_minus, tau)
+
+    # ------------------------------------------------------------------
+    def _decay_normaliser(self, feature_count: int) -> float:
+        """Scale divisor for the decay penalty, which differs per scale.
+
+        ``w_plus`` is a sum of up to ``J`` non-negative terms, so a squared
+        difference in weight space is ``O(J^2)``; the ``J^2`` divisor puts it on
+        the same footing as the other DS losses in this family. Beliefs are
+        ``O(1)`` by construction, so applying the same divisor would shrink the
+        penalty by ``J^2`` -- 262144 for the ResNet18 readout.
+
+        Consequence: ``woe_evidence_lambda`` does **not** transfer between the
+        two scales and must be swept separately for each.
+
+        Args:
+            feature_count: Readout input width ``J``.
+
+        Returns:
+            Divisor applied after averaging over scored items.
+        """
+        if self.evidence_scale == "belief":
+            return 1.0
+        return float(feature_count * feature_count)
 
     # ------------------------------------------------------------------
     def _task_feature_mean(self, task_id: int) -> torch.Tensor:

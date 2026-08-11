@@ -169,6 +169,62 @@ def per_class_total_evidence(
     return w_plus, w_minus
 
 
+def evidence_to_belief(
+    total_evidence: torch.Tensor, temperature: float = 1.0
+) -> torch.Tensor:
+    """Map a total weight of evidence onto the belief mass it commits.
+
+    A weight of evidence is the *logarithmic* parameterisation of a simple
+    support function: weight ``w`` leaves vacuous mass ``exp(-w)``, so the mass
+    committed to the focal set is ``1 - exp(-w)``. Dempster's rule combines
+    simple support functions sharing a focal set by *adding* weights, which is
+    why ``w_plus`` is a plain sum over features -- this transform belongs after
+    that sum, never inside it.
+
+    The map sends ``[0, inf) -> [0, 1)``, so it is bounded where ``w`` is not.
+    That is the point: a one-sided "must not decrease" penalty on ``w`` can be
+    satisfied by inflating the readout (``w`` is linear in it, so one global
+    rescale satisfies every such constraint at once), whereas the same penalty on
+    the belief scale sees a gradient carrying a factor ``exp(-w)`` and stops
+    paying for inflation. It also makes equal drops count equally in
+    decision-relevant terms: 8.0 -> 7.5 moves belief by 0.0002, 0.5 -> 0.0 moves
+    it by 0.393, where a squared penalty in ``w`` scores the two identically.
+
+    ``temperature`` rescales the input to ``1 - exp(-w / tau)``. Weights of
+    evidence are sums over ``J`` features and can sit far out on the flat tail of
+    the curve, where every drop looks equally negligible; setting ``tau`` near the
+    typical ``w`` returns the operating point to the responsive region.
+
+    ``tau`` is not cosmetic. The saturation is *hard* in float32: past
+    ``w / tau ~ 16.6`` the result rounds to exactly 1.0 and the gradient (which
+    carries a factor ``exp(-w / tau)``) is exactly zero, so a penalty built on
+    this transform is silently inert for any evidence above that. Measure the
+    typical ``w_plus`` before choosing ``tau``.
+
+    Note this is the mass the *channel in isolation* commits to its focal set.
+    It is ``Bel({theta_k})`` of the full class-``k`` mass function only before
+    combining with the opposing channel, which discounts it by the conflict
+    ``kappa`` (see :func:`_conflict_factor`).
+
+    Args:
+        total_evidence: Non-negative total evidence of any shape, typically
+            ``w_plus`` or ``w_minus`` from :func:`per_class_total_evidence`.
+        temperature: Positive scale divided into the evidence before the
+            exponential. ``1.0`` is the plain Dempster-Shafer transform.
+
+    Returns:
+        Belief in ``[0, 1)``, same shape as ``total_evidence``.
+
+    Usage:
+        >>> w_plus, w_minus = per_class_total_evidence(w)
+        >>> belief_plus = evidence_to_belief(w_plus)
+    """
+    if temperature <= 0.0:
+        raise ValueError(f"temperature must be positive, got {temperature}")
+    # -expm1(-x) is 1 - exp(-x) without the catastrophic cancellation at small x.
+    return -torch.expm1(-total_evidence / temperature)
+
+
 def information_content(
     weights_of_evidence: torch.Tensor,
     conflict_weighting: bool = False,
@@ -216,9 +272,7 @@ def _conflict_factor(w_plus: torch.Tensor, w_minus: torch.Tensor) -> torch.Tenso
     Returns:
         Conflict factor with shape ``(batch, K)``, all ``>= 1``.
     """
-    belief_plus = 1.0 - torch.exp(-w_plus)
-    belief_minus = 1.0 - torch.exp(-w_minus)
-    kappa = belief_plus * belief_minus
+    kappa = evidence_to_belief(w_plus) * evidence_to_belief(w_minus)
     return 1.0 + kappa
 
 

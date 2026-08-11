@@ -756,6 +756,44 @@ def get_parser():
             "woe_replay_lambda; needs its own sweep."
         ),
     )
+    parser.add_argument(
+        "--woe_evidence_readout_only",
+        action="store_true",
+        help=(
+            "woe_si_replay: detach backbone features in the evidence-decay "
+            "penalty, so rehearsed items constrain only the linear readout and "
+            "send no gradient into the backbone. With woe_replay_mode='evidence' "
+            "the buffer becomes a pure distillation signal and the backbone is "
+            "trained solely on the current task."
+        ),
+    )
+    parser.add_argument(
+        "--woe_evidence_scale",
+        type=str,
+        default="weight",
+        choices=["weight", "belief"],
+        help=(
+            "woe_si_replay: scale the evidence-decay hinge is measured on. "
+            "'weight' (default) uses the raw weights of evidence, which are "
+            "unbounded above -- a one-sided penalty on them can be satisfied by "
+            "inflating the readout. 'belief' uses 1 - exp(-w/tau), the mass each "
+            "channel commits, which saturates at 1 so inflation stops paying. The "
+            "two scales differ by a factor of J^2 in normalisation, so "
+            "woe_evidence_lambda does not transfer between them."
+        ),
+    )
+    parser.add_argument(
+        "--woe_evidence_belief_tau",
+        type=float,
+        default=1.0,
+        help=(
+            "woe_si_replay: temperature in the belief map 1 - exp(-w/tau) (used "
+            "when woe_evidence_scale='belief'). w_plus is a sum over J features "
+            "and may sit on the flat tail of the curve where every drop looks "
+            "negligible; set tau near the typical w_plus to move the operating "
+            "point back onto the responsive region. 1.0 is the plain DS transform."
+        ),
+    )
 
     # WoE-SI + reservoir experience replay (model: woe_si_replay).
     parser.add_argument(
