@@ -302,13 +302,13 @@ def test_belief_scale_defaults_off() -> None:
     """Existing runs are untouched: the raw-weight hinge stays the default."""
     model = _evidence_model(woe_replay_mode="evidence")
     assert model.evidence_scale == "weight"
-    assert model._decay_normaliser(512) == 512.0 * 512.0
+    assert model._evidence_normaliser(512) == 512.0 * 512.0
 
 
 def test_belief_scale_drops_the_j_squared_normaliser() -> None:
     """Beliefs are O(1), so the O(J^2) divisor would shrink them 262144-fold."""
     model = _evidence_model(woe_replay_mode="evidence", woe_evidence_scale="belief")
-    assert model._decay_normaliser(512) == 1.0
+    assert model._evidence_normaliser(512) == 1.0
 
 
 def test_belief_scale_keeps_zero_penalty_for_an_unchanged_network() -> None:

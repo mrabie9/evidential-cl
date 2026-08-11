@@ -773,7 +773,9 @@ def get_parser():
         default="weight",
         choices=["weight", "belief"],
         help=(
-            "woe_si_replay: scale the evidence-decay hinge is measured on. "
+            "Scale the functional evidence penalties are measured on -- both "
+            "woe_si's woe_reg_level='output' distillation and woe_si_replay's "
+            "evidence-decay hinge. "
             "'weight' (default) uses the raw weights of evidence, which are "
             "unbounded above -- a one-sided penalty on them can be satisfied by "
             "inflating the readout. 'belief' uses 1 - exp(-w/tau), the mass each "
@@ -783,11 +785,25 @@ def get_parser():
         ),
     )
     parser.add_argument(
+        "--woe_evidence_asymmetric",
+        action="store_true",
+        help=(
+            "woe_si (woe_reg_level='output'): charge only *deterioration* of the "
+            "teacher's evidence -- support for an old class falling, or evidence "
+            "against it rising -- leaving improvement free, instead of the "
+            "symmetric squared drift. Removes the upper arm that pinned the "
+            "evidence scale, so pair it with woe_evidence_scale='belief', which "
+            "is bounded; otherwise the constraint is satisfiable by inflating the "
+            "readout. woe_si_replay's decay penalty is always one-sided and "
+            "ignores this flag."
+        ),
+    )
+    parser.add_argument(
         "--woe_evidence_belief_tau",
         type=float,
         default=1.0,
         help=(
-            "woe_si_replay: temperature in the belief map 1 - exp(-w/tau) (used "
+            "Temperature in the belief map 1 - exp(-w/tau) (used "
             "when woe_evidence_scale='belief'). w_plus is a sum over J features "
             "and may sit on the flat tail of the curve where every drop looks "
             "negligible; set tau near the typical w_plus to move the operating "

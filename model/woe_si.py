@@ -92,6 +92,11 @@ _REG_LEVELS = ("parameter", "channel", "output")
 #                 ``Net._apply_proximal_anchor`` for the derivation and why it is
 #                 unconditionally stable where the loss form is not.
 _ANCHOR_MODES = ("loss", "proximal")
+# Scale the functional (evidence) penalties are measured on:
+#   "weight" -- raw weights of evidence (w_plus, w_minus), unbounded above.
+#   "belief" -- 1 - exp(-w / tau), the mass each channel commits, bounded in
+#               [0, 1). See ``evidence_to_belief``.
+_EVIDENCE_SCALES = ("weight", "belief")
 
 
 def compute_weights_of_evidence(
@@ -409,6 +414,19 @@ class Net(DetectionReplayMixin, nn.Module):
         self.mu_momentum = float(self.cfg.woe_mu_momentum)
         self.importance_stride = max(1, int(self.cfg.woe_importance_stride))
         self.conflict_weighting = bool(self.cfg.woe_conflict_weighting)
+        self.evidence_scale = str(getattr(args, "woe_evidence_scale", "weight"))
+        if self.evidence_scale not in _EVIDENCE_SCALES:
+            raise ValueError(
+                f"woe_evidence_scale must be one of {_EVIDENCE_SCALES}, "
+                f"got {self.evidence_scale!r}"
+            )
+        self.evidence_belief_tau = float(getattr(args, "woe_evidence_belief_tau", 1.0))
+        if self.evidence_belief_tau <= 0.0:
+            raise ValueError(
+                "woe_evidence_belief_tau must be positive, got "
+                f"{self.evidence_belief_tau}"
+            )
+        self.evidence_asymmetric = bool(getattr(args, "woe_evidence_asymmetric", False))
         self.clipgrad = self.cfg.clipgrad
         self.cls_lambda = float(self.cfg.cls_lambda)
         self._init_det_replay(
@@ -908,9 +926,97 @@ class Net(DetectionReplayMixin, nn.Module):
             )
             w_plus_t, w_minus_t = per_class_total_evidence(teacher_w)
 
-        feature_count = features.shape[1]
-        drift = (w_plus_s - w_plus_t).pow(2) + (w_minus_s - w_minus_t).pow(2)
-        return drift.sum(dim=1).mean() / float(feature_count * feature_count)
+        student = self._to_penalty_scale(w_plus_s, w_minus_s)
+        teacher = self._to_penalty_scale(w_plus_t, w_minus_t)
+        drift = self._drift_terms(student, teacher)
+        return drift.sum(dim=1).mean() / self._evidence_normaliser(features.shape[1])
+
+    # ------------------------------------------------------------------
+    def _drift_terms(
+        self,
+        student: Tuple[torch.Tensor, torch.Tensor],
+        reference: Tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        """Per-class penalty between a student and a reference evidence pair.
+
+        Symmetric by default -- any movement away from the reference is charged.
+        Under ``woe_evidence_asymmetric`` only *deterioration* is charged: support
+        for the class falling, or evidence against it rising. Improvement is then
+        free, so the term never competes for capacity the old tasks do not need.
+
+        The squared hinge is C^1 (its derivative ``2*relu(.)`` is continuous at the
+        kink), so the asymmetric form is no harder to optimise than the symmetric
+        one. Note it also removes the upper arm that pinned the evidence scale --
+        pair it with ``woe_evidence_scale='belief'``, which is bounded, or the
+        constraint becomes satisfiable by inflating the readout.
+
+        Args:
+            student: ``(w_plus, w_minus)`` of the live network, shape ``(batch, K)``.
+            reference: ``(w_plus, w_minus)`` of the frozen teacher or snapshot.
+
+        Returns:
+            Per-class penalty with shape ``(batch, K)``.
+        """
+        student_plus, student_minus = student
+        reference_plus, reference_minus = reference
+        if self.evidence_asymmetric:
+            return torch.relu(reference_plus - student_plus).pow(2) + torch.relu(
+                student_minus - reference_minus
+            ).pow(2)
+        return (student_plus - reference_plus).pow(2) + (
+            student_minus - reference_minus
+        ).pow(2)
+
+    # ------------------------------------------------------------------
+    def _to_penalty_scale(
+        self, w_plus: torch.Tensor, w_minus: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Map a ``(w_plus, w_minus)`` pair onto the configured penalty scale.
+
+        Identity under ``woe_evidence_scale='weight'``. Under ``'belief'`` both
+        channels go through :func:`evidence_to_belief`, which is monotone -- so a
+        stored snapshot can stay in weight space and be converted here.
+
+        The two channels are transformed *separately* rather than combined into
+        ``Bel({theta_k})``. That is deliberate: the asymmetric penalty makes two
+        independent one-sided statements (support must not fall, counter-evidence
+        must not rise), and combining the channels would let a drop in support be
+        repaired by suppressing counter-evidence instead.
+
+        Args:
+            w_plus: Positive total evidence ``(batch, K)``.
+            w_minus: Negative total evidence ``(batch, K)``.
+
+        Returns:
+            The pair mapped onto the penalty scale, shapes unchanged.
+        """
+        if self.evidence_scale != "belief":
+            return w_plus, w_minus
+        tau = self.evidence_belief_tau
+        return evidence_to_belief(w_plus, tau), evidence_to_belief(w_minus, tau)
+
+    # ------------------------------------------------------------------
+    def _evidence_normaliser(self, feature_count: int) -> float:
+        """Scale divisor for the functional penalties, which differs per scale.
+
+        A squared difference of weights was assumed to be ``O(J^2)``, since
+        ``w_plus`` sums up to ``J`` non-negative terms. Measured on the 10-task TIL
+        run it is not: ``w_plus`` reaches a median of 3.5 and a max of 11.7, not
+        ~512, so the ``J^2`` divisor over-normalises by roughly 4000x and forces a
+        correspondingly large ``lambda``. It is kept for the weight scale so
+        existing tuned values stay valid. Beliefs are ``O(1)`` and take no divisor.
+
+        Consequence: ``lambda`` does **not** transfer between the two scales.
+
+        Args:
+            feature_count: Readout input width ``J``.
+
+        Returns:
+            Divisor applied after averaging over the batch.
+        """
+        if self.evidence_scale == "belief":
+            return 1.0
+        return float(feature_count * feature_count)
 
     # ------------------------------------------------------------------
     def _update_feature_mean(self, batch_features: torch.Tensor) -> None:

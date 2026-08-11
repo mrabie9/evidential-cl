@@ -80,11 +80,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from model.detection_replay import unpack_y_to_class_labels
-from model.woe_si import (
-    Net as WoeSiNet,
-    evidence_to_belief,
-    per_class_total_evidence,
-)
+from model.woe_si import Net as WoeSiNet, per_class_total_evidence
 from utils import misc_utils
 from utils.class_weighted_loss import classification_cross_entropy
 
@@ -94,12 +90,6 @@ from utils.class_weighted_loss import classification_cross_entropy
 #                 falling below what it was when they were stored.
 #   "both"     -- the sum of the two.
 _REPLAY_MODES = ("ce", "evidence", "both")
-
-# Scale the evidence-decay penalty is measured on:
-#   "weight" -- raw weights of evidence (w_plus, w_minus), unbounded above.
-#   "belief" -- 1 - exp(-w / tau), the mass each channel commits, bounded in
-#               [0, 1). See `model.woe_si.evidence_to_belief`.
-_EVIDENCE_SCALES = ("weight", "belief")
 
 
 class ReservoirReplayBuffer:
@@ -246,18 +236,8 @@ class Net(WoeSiNet):
         self.evidence_readout_only = bool(
             getattr(args, "woe_evidence_readout_only", False)
         )
-        self.evidence_scale = str(getattr(args, "woe_evidence_scale", "weight"))
-        if self.evidence_scale not in _EVIDENCE_SCALES:
-            raise ValueError(
-                f"woe_evidence_scale must be one of {_EVIDENCE_SCALES}, "
-                f"got {self.evidence_scale!r}"
-            )
-        self.evidence_belief_tau = float(getattr(args, "woe_evidence_belief_tau", 1.0))
-        if self.evidence_belief_tau <= 0.0:
-            raise ValueError(
-                "woe_evidence_belief_tau must be positive, got "
-                f"{self.evidence_belief_tau}"
-            )
+        # woe_evidence_scale / woe_evidence_belief_tau are read and validated by
+        # model.woe_si.Net.__init__, which the super() call above already ran.
         self.uses_evidence_replay = self.replay_mode in ("evidence", "both")
         self.uses_ce_replay = self.replay_mode in ("ce", "both")
         self.replay_buffer = ReservoirReplayBuffer(
@@ -345,8 +325,8 @@ class Net(WoeSiNet):
         discontinuous for the optimiser.
 
         Under ``woe_evidence_scale='belief'`` both sides are first mapped through
-        ``1 - exp(-w / tau)`` (see :meth:`_to_penalty_scale`); the normalisation
-        changes with the scale (see :meth:`_decay_normaliser`), so
+        ``1 - exp(-w / tau)`` (see :meth:`model.woe_si.Net._to_penalty_scale`); the normalisation
+        changes with the scale (see :meth:`model.woe_si.Net._evidence_normaliser`), so
         ``woe_evidence_lambda`` does not transfer between the two.
 
         Args:
@@ -394,59 +374,7 @@ class Net(WoeSiNet):
             scored += int(rows.sum().item())
         if scored == 0:
             return torch.zeros(1, device=features.device)
-        return total / (scored * self._decay_normaliser(features.shape[1]))
-
-    # ------------------------------------------------------------------
-    def _to_penalty_scale(
-        self, w_plus: torch.Tensor, w_minus: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Map a ``(w_plus, w_minus)`` pair onto the configured penalty scale.
-
-        Identity under ``woe_evidence_scale='weight'``. Under ``'belief'`` both
-        channels go through :func:`model.woe_si.evidence_to_belief`, which is
-        monotone -- so the stored snapshot can stay in weight space and be
-        converted here, and existing buffers remain valid.
-
-        The two channels are transformed *separately* rather than combined into
-        ``Bel({theta_k})``. That is deliberate: the penalty makes two independent
-        one-sided statements (support must not fall, counter-evidence must not
-        rise), and combining the channels would let a drop in support be repaired
-        by suppressing counter-evidence instead.
-
-        Args:
-            w_plus: Positive total evidence ``(batch, K)``.
-            w_minus: Negative total evidence ``(batch, K)``.
-
-        Returns:
-            The pair mapped onto the penalty scale, shapes unchanged.
-        """
-        if self.evidence_scale != "belief":
-            return w_plus, w_minus
-        tau = self.evidence_belief_tau
-        return evidence_to_belief(w_plus, tau), evidence_to_belief(w_minus, tau)
-
-    # ------------------------------------------------------------------
-    def _decay_normaliser(self, feature_count: int) -> float:
-        """Scale divisor for the decay penalty, which differs per scale.
-
-        ``w_plus`` is a sum of up to ``J`` non-negative terms, so a squared
-        difference in weight space is ``O(J^2)``; the ``J^2`` divisor puts it on
-        the same footing as the other DS losses in this family. Beliefs are
-        ``O(1)`` by construction, so applying the same divisor would shrink the
-        penalty by ``J^2`` -- 262144 for the ResNet18 readout.
-
-        Consequence: ``woe_evidence_lambda`` does **not** transfer between the
-        two scales and must be swept separately for each.
-
-        Args:
-            feature_count: Readout input width ``J``.
-
-        Returns:
-            Divisor applied after averaging over scored items.
-        """
-        if self.evidence_scale == "belief":
-            return 1.0
-        return float(feature_count * feature_count)
+        return total / (scored * self._evidence_normaliser(features.shape[1]))
 
     # ------------------------------------------------------------------
     def _task_feature_mean(self, task_id: int) -> torch.Tensor:

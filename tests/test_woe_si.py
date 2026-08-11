@@ -62,6 +62,9 @@ def _make_args(loader: str, **overrides) -> object:
     o.woe_importance_stride = overrides.get("woe_importance_stride", 1)
     o.woe_conflict_weighting = overrides.get("woe_conflict_weighting", False)
     o.woe_reg_level = overrides.get("woe_reg_level", "parameter")
+    o.woe_evidence_scale = overrides.get("woe_evidence_scale", "weight")
+    o.woe_evidence_belief_tau = overrides.get("woe_evidence_belief_tau", 1.0)
+    o.woe_evidence_asymmetric = overrides.get("woe_evidence_asymmetric", False)
     o.woe_omega_winsorise = overrides.get("woe_omega_winsorise", 0.0)
     o.woe_anchor_mode = overrides.get("woe_anchor_mode", "loss")
     return o
@@ -756,3 +759,84 @@ def test_evidence_to_belief_rejects_non_positive_temperature() -> None:
     except ValueError:
         return
     raise AssertionError("evidence_to_belief should reject a non-positive temperature")
+
+
+# ----------------------------------------------------------------------
+# Belief scale and asymmetry in output mode (no replay buffer)
+# ----------------------------------------------------------------------
+def _output_model(**overrides) -> Net:
+    return Net(
+        1,
+        6,
+        2,
+        _make_args("task_incremental_loader", woe_reg_level="output", **overrides),
+    )
+
+
+def _teachered(model: Net):
+    """Train one batch, freeze a teacher, then perturb the readout."""
+    import copy
+
+    torch.manual_seed(8)
+    x = torch.randn(8, 2, 1024)
+    y = torch.randint(0, 3, (8,))
+    model.observe(x, y, 0)
+    model._snapshot_teacher()
+    teacher = copy.deepcopy(model.teacher)
+    return x, teacher
+
+
+def test_output_mode_defaults_to_symmetric_weight_scale() -> None:
+    """Existing output-mode runs are untouched by the new knobs."""
+    model = _output_model()
+    assert model.evidence_scale == "weight"
+    assert not model.evidence_asymmetric
+    assert model._evidence_normaliser(512) == 512.0 * 512.0
+
+
+def test_output_mode_belief_scale_drops_the_normaliser() -> None:
+    model = _output_model(woe_evidence_scale="belief")
+    assert model._evidence_normaliser(512) == 1.0
+
+
+def test_output_mode_asymmetric_ignores_pure_improvement() -> None:
+    """Raising support above the teacher's is free; dropping below is charged."""
+    model = _output_model(woe_evidence_asymmetric=True, woe_evidence_scale="belief")
+    x, teacher = _teachered(model)
+
+    # Scale the readout up: w_plus rises for every class, but so does w_minus, so
+    # exercise the hinge directly on the drift terms instead.
+    reference = (torch.tensor([[2.0, 2.0]]), torch.tensor([[1.0, 1.0]]))
+    better = (torch.tensor([[3.0, 3.0]]), torch.tensor([[0.5, 0.5]]))
+    worse = (torch.tensor([[1.0, 1.0]]), torch.tensor([[2.0, 2.0]]))
+    assert float(model._drift_terms(better, reference).sum()) == 0.0
+    assert float(model._drift_terms(worse, reference).sum()) > 0.0
+
+    model.teacher = teacher
+    assert torch.isfinite(model._evidence_distillation_loss(x, 1)).all()
+
+
+def test_output_mode_symmetric_charges_improvement_too() -> None:
+    """The default form penalises movement in either direction."""
+    model = _output_model()
+    reference = (torch.tensor([[2.0, 2.0]]), torch.tensor([[1.0, 1.0]]))
+    better = (torch.tensor([[3.0, 3.0]]), torch.tensor([[0.5, 0.5]]))
+    assert float(model._drift_terms(better, reference).sum()) > 0.0
+
+
+def test_output_mode_belief_still_zero_for_an_unchanged_network() -> None:
+    """Monotone transform plus shared centring keeps the self-distillation zero."""
+    import copy
+
+    model = _output_model(woe_evidence_scale="belief", woe_evidence_asymmetric=True)
+    x, _ = _teachered(model)
+    model.teacher = copy.deepcopy(model.net)
+    assert float(model._evidence_distillation_loss(x, 1).item()) == 0.0
+
+
+def test_output_mode_rejects_bad_scale() -> None:
+    try:
+        _output_model(woe_evidence_scale="bel")
+    except ValueError:
+        return
+    raise AssertionError("woe_evidence_scale should reject unknown values")
