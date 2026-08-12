@@ -65,6 +65,8 @@ def _make_args(loader: str, **overrides) -> object:
     o.woe_evidence_scale = overrides.get("woe_evidence_scale", "weight")
     o.woe_evidence_belief_tau = overrides.get("woe_evidence_belief_tau", 1.0)
     o.woe_evidence_asymmetric = overrides.get("woe_evidence_asymmetric", False)
+    o.woe_lwf_lambda = overrides.get("woe_lwf_lambda", 0.0)
+    o.woe_lwf_temperature = overrides.get("woe_lwf_temperature", 5.0)
     o.woe_omega_winsorise = overrides.get("woe_omega_winsorise", 0.0)
     o.woe_anchor_mode = overrides.get("woe_anchor_mode", "loss")
     return o
@@ -840,3 +842,112 @@ def test_output_mode_rejects_bad_scale() -> None:
     except ValueError:
         return
     raise AssertionError("woe_evidence_scale should reject unknown values")
+
+
+# ----------------------------------------------------------------------
+# LwF logit distillation (woe_lwf_lambda)
+# ----------------------------------------------------------------------
+def test_lwf_term_is_off_by_default() -> None:
+    model = Net(1, 6, 2, _make_args("task_incremental_loader"))
+    assert model.lwf_lambda == 0.0
+    x = torch.randn(4, 2, 1024)
+    assert (
+        float(model._lwf_distillation_loss(model.net.forward_heads(x)[1], x, 1)) == 0.0
+    )
+
+
+def test_lwf_zero_before_a_teacher_exists() -> None:
+    model = Net(1, 6, 2, _make_args("task_incremental_loader", woe_lwf_lambda=1.0))
+    x = torch.randn(4, 2, 1024)
+    logits = model.net.forward_heads(x)[1]
+    assert model.teacher is None
+    assert float(model._lwf_distillation_loss(logits, x, 1).item()) == 0.0
+
+
+def test_lwf_zero_against_an_identical_teacher() -> None:
+    """KL(p || p) = 0, so a self-distilling network is charged nothing.
+
+    Both sides are scored with ``bn_training=True`` (batch statistics), matching
+    ``model.lwf``. That also activates the backbone's 4 dropout modules, so the
+    teacher forward is *stochastic* -- two forwards of the same weights on the
+    same input differ by 0.48 in logit space. The seed is reset before each
+    forward so the dropout masks coincide; without that, identical weights still
+    register 0.0151 of KL.
+    """
+    torch.manual_seed(3)
+    model = Net(1, 6, 2, _make_args("task_incremental_loader", woe_lwf_lambda=1.0))
+    x = torch.randn(6, 2, 1024)
+    model.observe(x, torch.randint(0, 3, (6,)), 0)
+    model._snapshot_teacher()
+    torch.manual_seed(123)
+    logits = model.net.forward_heads(x, bn_training=True)[1]
+    torch.manual_seed(123)
+    assert abs(float(model._lwf_distillation_loss(logits, x, 1).item())) < 1e-5
+
+
+def test_lwf_does_not_mutate_the_frozen_teacher() -> None:
+    """The teacher must stay frozen across steps, statistics included.
+
+    The teacher is scored with batch statistics (matching ``model.lwf``), which
+    would normally also *update* its BatchNorm running buffers on every call, so
+    the "frozen" reference would drift toward the current task.
+    ``_snapshot_teacher`` zeroes the teacher's BN momentum to prevent exactly
+    that, without changing the statistics used for normalisation.
+
+    ``num_batches_tracked`` is excluded: it still increments, but it is only read
+    when ``momentum is None``, so it cannot affect the teacher's output.
+    """
+    torch.manual_seed(6)
+    model = Net(1, 6, 2, _make_args("task_incremental_loader", woe_lwf_lambda=1.0))
+    x = torch.randn(6, 2, 1024)
+    model.observe(x, torch.randint(0, 3, (6,)), 0)
+    model._snapshot_teacher()
+    before = {
+        k: v.clone()
+        for k, v in model.teacher.state_dict().items()
+        if not k.endswith("num_batches_tracked")
+    }
+    for _ in range(3):
+        model.observe(x, torch.randint(3, 6, (6,)), 1)
+    after = model.teacher.state_dict()
+    changed = [
+        k for k in before if not torch.equal(before[k].float(), after[k].float())
+    ]
+    assert changed == [], f"teacher drifted on {len(changed)} buffers: {changed[:3]}"
+
+
+def test_lwf_positive_once_the_student_moves() -> None:
+    torch.manual_seed(4)
+    model = Net(1, 6, 2, _make_args("task_incremental_loader", woe_lwf_lambda=1.0))
+    x = torch.randn(6, 2, 1024)
+    model.observe(x, torch.randint(0, 3, (6,)), 0)
+    model._snapshot_teacher()
+    with torch.no_grad():
+        model.net.model.fc.weight.mul_(3.0)
+    logits = model.net.forward_heads(x)[1]
+    assert float(model._lwf_distillation_loss(logits, x, 1).item()) > 0.0
+
+
+def test_lwf_snapshots_a_teacher_under_the_parameter_anchor() -> None:
+    """Stacking needs the teacher even when reg_level is not 'output'."""
+    torch.manual_seed(5)
+    model = Net(
+        1,
+        6,
+        2,
+        _make_args(
+            "task_incremental_loader", woe_lwf_lambda=1.0, woe_reg_level="parameter"
+        ),
+    )
+    x = torch.randn(6, 2, 1024)
+    model.observe(x, torch.randint(0, 3, (6,)), 0)
+    model._consolidate_current_task()
+    assert model.teacher is not None
+
+
+def test_lwf_rejects_non_positive_temperature() -> None:
+    try:
+        Net(1, 6, 2, _make_args("task_incremental_loader", woe_lwf_temperature=0.0))
+    except ValueError:
+        return
+    raise AssertionError("woe_lwf_temperature should reject non-positive values")

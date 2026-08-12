@@ -427,6 +427,13 @@ class Net(DetectionReplayMixin, nn.Module):
                 f"{self.evidence_belief_tau}"
             )
         self.evidence_asymmetric = bool(getattr(args, "woe_evidence_asymmetric", False))
+        self.lwf_lambda = float(getattr(args, "woe_lwf_lambda", 0.0))
+        self.lwf_temperature = float(getattr(args, "woe_lwf_temperature", 5.0))
+        if self.lwf_temperature <= 0.0:
+            raise ValueError(
+                f"woe_lwf_temperature must be positive, got {self.lwf_temperature}"
+            )
+        self.lwf_kl = nn.KLDivLoss(reduction="batchmean")
         self.clipgrad = self.cfg.clipgrad
         self.cls_lambda = float(self.cfg.cls_lambda)
         self._init_det_replay(
@@ -529,6 +536,10 @@ class Net(DetectionReplayMixin, nn.Module):
             else:
                 reg = self._surrogate_loss()
             loss = self.cls_lambda * loss_ce + self.woe_lambda * reg
+            if self.lwf_lambda != 0.0:
+                loss = loss + self.lwf_lambda * self._lwf_distillation_loss(
+                    cls_logits, x, t
+                )
             # Rehearsal hook: no-op in base WoE-SI, a reservoir-replay CE term in
             # the woe_si_replay subclass. Sampled before the current batch is
             # written to the buffer so a sample never rehearses on itself.
@@ -748,7 +759,9 @@ class Net(DetectionReplayMixin, nn.Module):
         self._winsorise_omega()
         # Output mode distils a frozen end-of-task snapshot; capture it (and the
         # feature mean it must centre with) *before* the per-task stats are reset.
-        if self.reg_level == "output":
+        # The LwF logit-distillation term needs the same teacher, and is available
+        # alongside any reg_level, so either consumer triggers the snapshot.
+        if self.reg_level == "output" or self.lwf_lambda != 0.0:
             self._snapshot_teacher()
         # Reset running feature stats for the next task.
         self.woe_feature_mean.zero_()
@@ -756,6 +769,66 @@ class Net(DetectionReplayMixin, nn.Module):
         self._step_in_task = 0
         self._window_h.clear()
         self._window_p_start.clear()
+
+    # ------------------------------------------------------------------
+    def _lwf_distillation_loss(
+        self, student_logits: torch.Tensor, x: torch.Tensor, t: int
+    ) -> torch.Tensor:
+        """Learning-without-Forgetting logit distillation on previous classes.
+
+        Temperature-scaled KL between the student's and a frozen teacher's softmax
+        over the columns of completed tasks, scaled by ``T^2`` so its gradient
+        magnitude is comparable to the cross-entropy it accompanies. This mirrors
+        ``model.lwf.Net._distillation_loss`` exactly, so a WoE-SI run with
+        ``woe_lambda=0`` and ``woe_lwf_lambda>0`` is an LwF control sharing this
+        module's optimiser, masking and BatchNorm handling.
+
+        Orthogonal to the ``I_2`` anchor by construction: the anchor constrains
+        *parameters* via the DS path integral, this constrains the *function* at
+        the readout. Both can be active at once, which is what makes a 2x2
+        stacking test possible in one code path.
+
+        Args:
+            student_logits: Unmasked class logits of the live network.
+            x: The current batch, re-run through the frozen teacher.
+            t: Current task index. Returns 0 on the first task.
+
+        Returns:
+            Scalar distillation loss; exactly 0 before a teacher exists.
+        """
+        if self.teacher is None:
+            return torch.zeros(1, device=student_logits.device)
+        previous = self._previous_class_indices(t, student_logits.device)
+        if previous.numel() == 0:
+            return torch.zeros(1, device=student_logits.device)
+
+        student_previous = student_logits.index_select(1, previous)
+        with torch.no_grad():
+            # bn_training=True scores the teacher on the *current batch's*
+            # statistics rather than the running statistics it froze with. That
+            # matches `model.lwf` (which calls `self.teacher(x)`, and ResNet1D's
+            # forward runs `self.model.train(bn_training)`), and it is the right
+            # choice here rather than an accident: consecutive tasks are different
+            # radar datasets, so a teacher normalised with the previous task's
+            # statistics is evaluated under distribution shift and its targets are
+            # correspondingly degraded. Measured on task 1, freezing the
+            # statistics instead drops the distillation loss from 1.059 to 0.475
+            # and costs 0.068 of final macro recall (0.4766 -> 0.4087).
+            #
+            # `_snapshot_teacher` zeroes the teacher's BatchNorm momentum, so this
+            # forward uses batch statistics *without* mutating the frozen running
+            # buffers -- unlike `model.lwf`, where each distillation pass updates
+            # them. Those buffers are never read in this mode, so the numerics
+            # match `model.lwf` exactly; the teacher simply stays genuinely frozen.
+            teacher_logits = self.teacher.forward_heads(x, bn_training=True)[1]
+            teacher_probs = torch.softmax(
+                teacher_logits.index_select(1, previous) / self.lwf_temperature,
+                dim=1,
+            )
+        student_log_probs = torch.log_softmax(
+            student_previous / self.lwf_temperature, dim=1
+        )
+        return self.lwf_kl(student_log_probs, teacher_probs) * (self.lwf_temperature**2)
 
     # ------------------------------------------------------------------
     def _snapshot_teacher(self) -> None:
@@ -770,6 +843,16 @@ class Net(DetectionReplayMixin, nn.Module):
         self.teacher.eval()
         for param in self.teacher.parameters():
             param.requires_grad = False
+        # Zero the BatchNorm momentum so a `bn_training=True` teacher forward
+        # normalises with batch statistics but leaves the running buffers exactly
+        # where they were frozen: the update is
+        # `(1 - momentum) * running + momentum * batch`. Without this, every
+        # distillation pass would drift the "frozen" reference toward the current
+        # task. `.eval()` alone cannot achieve it -- ResNet1D.forward calls
+        # `self.model.train(bn_training)` and overrides module mode.
+        for module in self.teacher.modules():
+            if isinstance(module, nn.modules.batchnorm._BatchNorm):
+                module.momentum = 0.0
         self.teacher_feature_mean = self.woe_feature_mean.detach().clone()
 
     # ------------------------------------------------------------------

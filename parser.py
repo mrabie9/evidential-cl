@@ -785,6 +785,28 @@ def get_parser():
         ),
     )
     parser.add_argument(
+        "--woe_lwf_lambda",
+        type=float,
+        default=0.0,
+        help=(
+            "woe_si: weight on a Learning-without-Forgetting logit-distillation "
+            "term (temperature-scaled KL against a frozen end-of-task teacher on "
+            "previously-seen classes). 0 (default) disables it. Orthogonal to the "
+            "I_2 parameter anchor -- the anchor constrains parameters, this "
+            "constrains the function -- so both can be on at once. Setting this "
+            "with woe_lambda=0 gives an LwF control inside this module."
+        ),
+    )
+    parser.add_argument(
+        "--woe_lwf_temperature",
+        type=float,
+        default=5.0,
+        help=(
+            "woe_si: softmax temperature for --woe_lwf_lambda. Matches "
+            "model.lwf's default of 5.0."
+        ),
+    )
+    parser.add_argument(
         "--woe_evidence_asymmetric",
         action="store_true",
         help=(

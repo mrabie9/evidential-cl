@@ -1,0 +1,27 @@
+model: woe_si
+loader: task_incremental_loader
+lr: 0.001
+
+# Parameter-space anchor, proximal form -- the best replay-free mechanism found
+# (0.4847 at woe_lambda = 1e6 on the full 10-task TIL sequence). Set woe_lambda
+# to 0 on the command line for the LwF-only arm of the 2x2.
+woe_reg_level: parameter
+woe_anchor_mode: proximal
+woe_lambda: 1000000.0
+woe_xi: 0.001
+woe_centering_mode: centered_uniform
+woe_mu_momentum: 0.9
+woe_importance_stride: 1
+woe_conflict_weighting: false
+
+# Learning-without-Forgetting logit distillation: temperature-scaled KL against a
+# frozen end-of-task teacher over previously-seen classes. Orthogonal to the
+# anchor by construction -- the anchor constrains *parameters* via the DS path
+# integral, this constrains the *function* at the readout -- so the two can be on
+# simultaneously and the 2x2 runs through one code path.
+#
+# 1.0 / 5.0 are model.lwf's own defaults (distill_lambda / temperature), so the
+# woe_lambda=0 arm is a faithful LwF control sharing this module's optimiser,
+# task masking and BatchNorm handling.
+woe_lwf_lambda: 1.0
+woe_lwf_temperature: 5.0
