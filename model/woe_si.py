@@ -97,6 +97,20 @@ _ANCHOR_MODES = ("loss", "proximal")
 #   "belief" -- 1 - exp(-w / tau), the mass each channel commits, bounded in
 #               [0, 1). See ``evidence_to_belief``.
 _EVIDENCE_SCALES = ("weight", "belief")
+# Scalar whose path integral defines per-parameter importance. Ablation axis:
+# does the Dempster-Shafer construction earn its place, or would any monotone
+# "the network became more committed" scalar select the same parameters?
+#   "i2"   -- Denoeux I_2(m), the DS information content (the method).
+#   "z2"   -- squared norm of the active logits. Cheapest possible stand-in;
+#             measured cos(dI_2/dtheta, dz2/dtheta) = 0.850 +/- 0.075 over all
+#             10 tasks, so it should select nearly the same parameters.
+#   "phi2" -- squared norm of the penultimate features. Knows nothing about the
+#             readout or the classes at all.
+#   "ce"   -- the task loss, i.e. plain Synaptic Intelligence (Zenke et al.).
+#             The canonical baseline. Tracked as *negative* CE so "the scalar
+#             went up" still means "the model improved", matching SI's sign
+#             convention and keeping the relu in consolidation meaningful.
+_IMPORTANCE_SCALARS = ("i2", "z2", "phi2", "ce")
 
 
 def compute_weights_of_evidence(
@@ -427,6 +441,12 @@ class Net(DetectionReplayMixin, nn.Module):
                 f"{self.evidence_belief_tau}"
             )
         self.evidence_asymmetric = bool(getattr(args, "woe_evidence_asymmetric", False))
+        self.importance_scalar = str(getattr(args, "woe_importance_scalar", "i2"))
+        if self.importance_scalar not in _IMPORTANCE_SCALARS:
+            raise ValueError(
+                f"woe_importance_scalar must be one of {_IMPORTANCE_SCALARS}, "
+                f"got {self.importance_scalar!r}"
+            )
         self.evidence_distill_lambda = float(
             getattr(args, "woe_evidence_distill_lambda", 0.0)
         )
@@ -505,7 +525,7 @@ class Net(DetectionReplayMixin, nn.Module):
             # never pollutes the CE gradient. Sampled once per importance window.
             window_start = self._step_in_task % self.importance_stride == 0
             if use_path_integral and window_start:
-                self._capture_importance_gradient(x, t)
+                self._capture_importance_gradient(x, y, t)
 
             # ----- 2) Standard CE update (drives the parameters) -----------
             self.opt.zero_grad()
@@ -637,6 +657,60 @@ class Net(DetectionReplayMixin, nn.Module):
         )
 
     # ------------------------------------------------------------------
+    def _importance_scalar(
+        self, x: torch.Tensor, y: torch.Tensor, t: int
+    ) -> torch.Tensor:
+        """Differentiable scalar whose path integral defines importance.
+
+        ``"i2"`` is WoE-SI proper. The others exist to ablate whether the
+        Dempster-Shafer construction is doing any work, or whether any scalar
+        that rises as the network commits would select the same parameters.
+        Each is normalised to an ``O(1)`` scale like ``I_2`` is, but they are not
+        on a *common* scale, so ``woe_lambda`` must be swept per scalar.
+
+        Args:
+            x: Current batch.
+            y: Current labels; used only by ``"ce"``.
+            t: Current task index.
+
+        Returns:
+            Scalar tensor, larger meaning "more committed / better fit".
+        """
+        if self.importance_scalar == "i2":
+            return self._compute_information_content(x, t, update_feature_mean=True)
+
+        features = self.net.forward_features(x, bn_training=False)
+        self._update_feature_mean(features.detach())
+        feature_count = features.shape[1]
+
+        if self.importance_scalar == "phi2":
+            return features.pow(2).sum(dim=1).mean() / float(feature_count)
+
+        logits = self.net.forward_classifier(features, bn_training=False)
+        if self.importance_scalar == "z2":
+            active = self._active_class_indices(t, features.device)
+            selected = logits.index_select(1, active)
+            return selected.pow(2).sum(dim=1).mean() / float(max(1, active.numel()))
+
+        # "ce": plain Synaptic Intelligence. Negated so that an increase still
+        # means the model improved, keeping the relu in consolidation (which
+        # protects parameters that *built* something) pointing the right way.
+        masked = misc_utils.apply_task_incremental_logit_mask(
+            logits,
+            t,
+            self.classes_per_task,
+            self.n_outputs,
+            cil_all_seen_upto_task=t,
+            global_noise_label=self.noise_label,
+            loader=self.incremental_loader_name,
+        )
+        return -classification_cross_entropy(
+            masked,
+            unpack_y_to_class_labels(y).long(),
+            class_weighted_ce=self.class_weighted_ce,
+        )
+
+    # ------------------------------------------------------------------
     def _compute_information_content(
         self, x: torch.Tensor, t: int, update_feature_mean: bool
     ) -> torch.Tensor:
@@ -705,14 +779,18 @@ class Net(DetectionReplayMixin, nn.Module):
         )
 
     # ------------------------------------------------------------------
-    def _capture_importance_gradient(self, x: torch.Tensor, t: int) -> None:
-        """Backward ``I_2(m)`` into a scratch buffer (no CE-gradient pollution).
+    def _capture_importance_gradient(
+        self, x: torch.Tensor, y: torch.Tensor, t: int
+    ) -> None:
+        """Backward the importance scalar into a scratch buffer.
 
-        Stores ``h_i = dI_2/dtheta_i`` and a snapshot of ``theta_i`` at the start
-        of the importance window. ``torch.autograd.grad`` is used so parameter
-        ``.grad`` fields (owned by the CE optimiser step) are left untouched.
+        Stores ``h_i = d(scalar)/dtheta_i`` and a snapshot of ``theta_i`` at the
+        start of the importance window. ``torch.autograd.grad`` is used so
+        parameter ``.grad`` fields (owned by the CE optimiser step) are left
+        untouched. Which scalar is tracked is set by ``woe_importance_scalar``;
+        ``"i2"`` is the DS information content that defines the method.
         """
-        info_content = self._compute_information_content(x, t, update_feature_mean=True)
+        info_content = self._importance_scalar(x, y, t)
         params = [self._tracked_params[name] for name in self._tracked_names]
         grads = torch.autograd.grad(
             info_content, params, retain_graph=False, allow_unused=True

@@ -785,6 +785,20 @@ def get_parser():
         ),
     )
     parser.add_argument(
+        "--woe_importance_scalar",
+        type=str,
+        default="i2",
+        choices=["i2", "z2", "phi2", "ce"],
+        help=(
+            "woe_si: which scalar the SI path integral tracks. 'i2' (default) "
+            "is the Dempster-Shafer information content, i.e. WoE-SI proper. "
+            "The rest are ablations: 'z2' squared active-logit norm, 'phi2' "
+            "squared feature norm, 'ce' the task loss (= plain Synaptic "
+            "Intelligence). They sit on different scales, so woe_lambda must "
+            "be swept per scalar."
+        ),
+    )
+    parser.add_argument(
         "--woe_evidence_distill_lambda",
         type=float,
         default=0.0,

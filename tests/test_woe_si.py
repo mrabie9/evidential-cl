@@ -65,6 +65,7 @@ def _make_args(loader: str, **overrides) -> object:
     o.woe_evidence_scale = overrides.get("woe_evidence_scale", "weight")
     o.woe_evidence_belief_tau = overrides.get("woe_evidence_belief_tau", 1.0)
     o.woe_evidence_asymmetric = overrides.get("woe_evidence_asymmetric", False)
+    o.woe_importance_scalar = overrides.get("woe_importance_scalar", "i2")
     o.woe_lwf_lambda = overrides.get("woe_lwf_lambda", 0.0)
     o.woe_evidence_distill_lambda = overrides.get("woe_evidence_distill_lambda", 0.0)
     o.woe_lwf_temperature = overrides.get("woe_lwf_temperature", 5.0)
@@ -1019,3 +1020,81 @@ def test_evidence_distill_adds_to_the_loss_on_later_tasks() -> None:
     loss, _rec, _logits = model.observe(x, torch.randint(3, 6, (6,)), 1)
     assert torch.isfinite(torch.tensor(loss))
     assert float(model._evidence_distillation_loss(x, 1).item()) > 0.0
+
+
+# ----------------------------------------------------------------------
+# Importance-scalar ablation (woe_importance_scalar)
+# ----------------------------------------------------------------------
+def test_importance_scalar_defaults_to_i2() -> None:
+    model = Net(1, 6, 2, _make_args("task_incremental_loader"))
+    assert model.importance_scalar == "i2"
+
+
+def test_importance_scalar_rejects_unknown() -> None:
+    try:
+        Net(1, 6, 2, _make_args("task_incremental_loader", woe_importance_scalar="i3"))
+    except ValueError:
+        return
+    raise AssertionError("woe_importance_scalar should reject unknown values")
+
+
+def test_every_importance_scalar_accumulates_finite_omega() -> None:
+    """Each ablation drives a usable, finite, non-degenerate path integral."""
+    for scalar in ("i2", "z2", "phi2", "ce"):
+        torch.manual_seed(11)
+        model = Net(
+            1,
+            6,
+            2,
+            _make_args("task_incremental_loader", woe_importance_scalar=scalar),
+        )
+        x = torch.randn(6, 2, 1024)
+        y = torch.randint(0, 3, (6,))
+        for _ in range(3):
+            model.observe(x, y, 0)
+        model._consolidate_current_task()
+        omega = _cumulative_omega(model)
+        assert math.isfinite(omega), f"{scalar}: non-finite Omega"
+        assert omega > 0.0, f"{scalar}: Omega collapsed to zero"
+
+
+def test_importance_scalars_produce_different_omega_scales() -> None:
+    """The ablation must actually change the importance signal, not alias to i2.
+
+    Compares total cumulative Omega, not a single parameter: the first tracked
+    parameter (``input_adapter.weight``, 6 entries) accumulates exactly zero
+    under every scalar, so it discriminates nothing.
+
+    The totals also differ by five orders of magnitude (i2 3.3e-4, phi2 1.1,
+    z2 4.9, ce 51 on this toy setup), which is why ``woe_lambda`` cannot be
+    shared across scalars -- the anchor strength is ``lambda * Omega``.
+    """
+    omegas = {}
+    for scalar in ("i2", "phi2"):
+        torch.manual_seed(12)
+        model = Net(
+            1,
+            6,
+            2,
+            _make_args("task_incremental_loader", woe_importance_scalar=scalar),
+        )
+        x = torch.randn(6, 2, 1024)
+        y = torch.randint(0, 3, (6,))
+        for _ in range(3):
+            model.observe(x, y, 0)
+        model._consolidate_current_task()
+        omegas[scalar] = _cumulative_omega(model)
+    assert omegas["i2"] != omegas["phi2"]
+    assert omegas["phi2"] > 100.0 * omegas["i2"]
+
+
+def test_ce_scalar_is_negated_so_improvement_is_positive() -> None:
+    """SI's sign convention: the tracked scalar rises as the model improves."""
+    torch.manual_seed(13)
+    model = Net(
+        1, 6, 2, _make_args("task_incremental_loader", woe_importance_scalar="ce")
+    )
+    x = torch.randn(6, 2, 1024)
+    y = torch.randint(0, 3, (6,))
+    scalar = model._importance_scalar(x, y, 0)
+    assert float(scalar.item()) < 0.0  # -CE, and CE > 0 on an untrained net
