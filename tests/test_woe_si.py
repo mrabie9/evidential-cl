@@ -66,6 +66,7 @@ def _make_args(loader: str, **overrides) -> object:
     o.woe_evidence_belief_tau = overrides.get("woe_evidence_belief_tau", 1.0)
     o.woe_evidence_asymmetric = overrides.get("woe_evidence_asymmetric", False)
     o.woe_lwf_lambda = overrides.get("woe_lwf_lambda", 0.0)
+    o.woe_evidence_distill_lambda = overrides.get("woe_evidence_distill_lambda", 0.0)
     o.woe_lwf_temperature = overrides.get("woe_lwf_temperature", 5.0)
     o.woe_omega_winsorise = overrides.get("woe_omega_winsorise", 0.0)
     o.woe_anchor_mode = overrides.get("woe_anchor_mode", "loss")
@@ -951,3 +952,70 @@ def test_lwf_rejects_non_positive_temperature() -> None:
     except ValueError:
         return
     raise AssertionError("woe_lwf_temperature should reject non-positive values")
+
+
+# ----------------------------------------------------------------------
+# Evidence distillation alongside the anchor (woe_evidence_distill_lambda)
+# ----------------------------------------------------------------------
+def test_evidence_distill_off_by_default() -> None:
+    model = Net(1, 6, 2, _make_args("task_incremental_loader"))
+    assert model.evidence_distill_lambda == 0.0
+
+
+def test_evidence_distill_rejects_output_reg_level() -> None:
+    """output mode already applies this term via woe_lambda; refuse to double it."""
+    try:
+        Net(
+            1,
+            6,
+            2,
+            _make_args(
+                "task_incremental_loader",
+                woe_reg_level="output",
+                woe_evidence_distill_lambda=1.0,
+            ),
+        )
+    except ValueError:
+        return
+    raise AssertionError("combining output mode with the distill lambda should raise")
+
+
+def test_evidence_distill_snapshots_teacher_under_the_anchor() -> None:
+    """Running alongside the parameter anchor still needs a frozen teacher."""
+    torch.manual_seed(7)
+    model = Net(
+        1,
+        6,
+        2,
+        _make_args(
+            "task_incremental_loader",
+            woe_reg_level="parameter",
+            woe_anchor_mode="proximal",
+            woe_evidence_distill_lambda=3.0,
+        ),
+    )
+    x = torch.randn(6, 2, 1024)
+    model.observe(x, torch.randint(0, 3, (6,)), 0)
+    model._consolidate_current_task()
+    assert model.teacher is not None
+
+
+def test_evidence_distill_adds_to_the_loss_on_later_tasks() -> None:
+    """The term is inert on task 0 and active once a teacher exists."""
+    torch.manual_seed(8)
+    args = _make_args(
+        "task_incremental_loader",
+        woe_reg_level="parameter",
+        woe_anchor_mode="proximal",
+        woe_lambda=0.0,
+        woe_evidence_distill_lambda=3.0,
+    )
+    model = Net(1, 6, 2, args)
+    x = torch.randn(6, 2, 1024)
+    model.observe(x, torch.randint(0, 3, (6,)), 0)
+    assert float(model._evidence_distillation_loss(x, 0).item()) == 0.0
+    model._consolidate_current_task()
+    model.current_task = 0
+    loss, _rec, _logits = model.observe(x, torch.randint(3, 6, (6,)), 1)
+    assert torch.isfinite(torch.tensor(loss))
+    assert float(model._evidence_distillation_loss(x, 1).item()) > 0.0

@@ -785,6 +785,20 @@ def get_parser():
         ),
     )
     parser.add_argument(
+        "--woe_evidence_distill_lambda",
+        type=float,
+        default=0.0,
+        help=(
+            "woe_si: weight on the DS evidence-distillation term running "
+            "*alongside* a parameter anchor, instead of replacing it. This is "
+            "the evidential counterpart of --woe_lwf_lambda: same frozen "
+            "teacher, but the target is the per-class (w_plus, w_minus) rather "
+            "than the logits. Incompatible with woe_reg_level='output', which "
+            "already applies this term weighted by woe_lambda. Its scale is "
+            "the J^2-normalised one, where the swept value was ~3."
+        ),
+    )
+    parser.add_argument(
         "--woe_lwf_lambda",
         type=float,
         default=0.0,

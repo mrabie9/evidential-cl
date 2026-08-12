@@ -427,6 +427,15 @@ class Net(DetectionReplayMixin, nn.Module):
                 f"{self.evidence_belief_tau}"
             )
         self.evidence_asymmetric = bool(getattr(args, "woe_evidence_asymmetric", False))
+        self.evidence_distill_lambda = float(
+            getattr(args, "woe_evidence_distill_lambda", 0.0)
+        )
+        if self.evidence_distill_lambda != 0.0 and self.cfg.woe_reg_level == "output":
+            raise ValueError(
+                "woe_evidence_distill_lambda adds the evidence-distillation term "
+                "alongside a parameter anchor; woe_reg_level='output' already "
+                "applies that term weighted by woe_lambda. Use one or the other."
+            )
         self.lwf_lambda = float(getattr(args, "woe_lwf_lambda", 0.0))
         self.lwf_temperature = float(getattr(args, "woe_lwf_temperature", 5.0))
         if self.lwf_temperature <= 0.0:
@@ -536,6 +545,14 @@ class Net(DetectionReplayMixin, nn.Module):
             else:
                 reg = self._surrogate_loss()
             loss = self.cls_lambda * loss_ce + self.woe_lambda * reg
+            if self.evidence_distill_lambda != 0.0:
+                # DS evidence distillation running *alongside* the parameter
+                # anchor rather than replacing it, mirroring how the LwF term
+                # attaches. reg_level='output' already applies this term as `reg`,
+                # so the two paths are mutually exclusive (validated in __init__).
+                loss = loss + self.evidence_distill_lambda * (
+                    self._evidence_distillation_loss(x, t)
+                )
             if self.lwf_lambda != 0.0:
                 loss = loss + self.lwf_lambda * self._lwf_distillation_loss(
                     cls_logits, x, t
@@ -761,7 +778,11 @@ class Net(DetectionReplayMixin, nn.Module):
         # feature mean it must centre with) *before* the per-task stats are reset.
         # The LwF logit-distillation term needs the same teacher, and is available
         # alongside any reg_level, so either consumer triggers the snapshot.
-        if self.reg_level == "output" or self.lwf_lambda != 0.0:
+        if (
+            self.reg_level == "output"
+            or self.lwf_lambda != 0.0
+            or self.evidence_distill_lambda != 0.0
+        ):
             self._snapshot_teacher()
         # Reset running feature stats for the next task.
         self.woe_feature_mean.zero_()
