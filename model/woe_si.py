@@ -111,6 +111,21 @@ _EVIDENCE_SCALES = ("weight", "belief")
 #             went up" still means "the model improved", matching SI's sign
 #             convention and keeping the relu in consolidation meaningful.
 _IMPORTANCE_SCALARS = ("i2", "z2", "phi2", "ce")
+# How the signed path integral omega^t is projected onto the non-negative Omega
+# the quadratic anchor needs. Some projection is mandatory, not stylistic: a
+# negative Omega makes the loss-form penalty unbounded below (an anti-anchor that
+# drives theta away from theta* without limit), and in the proximal form sends
+# b = 2*lr*lambda*Omega negative -- extrapolating away from theta* for
+# b in (-1, 0), with a pole at b = -1 and a reflection below it.
+#   "relu" -- keep positive contributions only (the original behaviour).
+#   "abs"  -- keep the magnitude, so a strongly *negative* path integral is
+#             treated as important rather than as irrelevant.
+# The sign of omega describes the parameter's journey; the anchor pins its
+# destination theta*, which is the end-of-task value the network already fits the
+# task at. Measured on task 0, "relu" zeroes 46.7% of parameters and discards
+# 24.2% of the total |omega| mass -- and 28.3% of the top 1% most influential
+# parameters by |omega|, which are then left entirely free.
+_OMEGA_TRANSFORMS = ("relu", "abs")
 
 
 def compute_weights_of_evidence(
@@ -441,6 +456,12 @@ class Net(DetectionReplayMixin, nn.Module):
                 f"{self.evidence_belief_tau}"
             )
         self.evidence_asymmetric = bool(getattr(args, "woe_evidence_asymmetric", False))
+        self.omega_transform = str(getattr(args, "woe_omega_transform", "relu"))
+        if self.omega_transform not in _OMEGA_TRANSFORMS:
+            raise ValueError(
+                f"woe_omega_transform must be one of {_OMEGA_TRANSFORMS}, "
+                f"got {self.omega_transform!r}"
+            )
         self.importance_scalar = str(getattr(args, "woe_importance_scalar", "i2"))
         if self.importance_scalar not in _IMPORTANCE_SCALARS:
             raise ValueError(
@@ -839,7 +860,10 @@ class Net(DetectionReplayMixin, nn.Module):
             omega = getattr(self, f"{key}_woe_omega")
             w_buf = getattr(self, f"{key}_woe_w")
             delta_total = param.detach() - prev
-            omega.add_(torch.relu(w_buf) / (delta_total.pow(2) + self.xi))
+            projected = (
+                w_buf.abs() if self.omega_transform == "abs" else torch.relu(w_buf)
+            )
+            omega.add_(projected / (delta_total.pow(2) + self.xi))
             if self.reg_level == "channel" and omega.dim() >= 2:
                 # Collapse to per-output-channel (dim 0 is the filter/class axis),
                 # mirroring model.eucr_consolidation.to_channel. Idempotent across

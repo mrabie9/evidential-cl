@@ -1137,6 +1137,22 @@ def get_parser():
         ),
     )
     parser.add_argument(
+        "--woe_omega_transform",
+        type=str,
+        default="relu",
+        choices=["relu", "abs"],
+        help=(
+            "woe_si: how the signed path integral is projected onto the "
+            "non-negative Omega the quadratic anchor requires. Some projection "
+            "is mandatory -- negative Omega makes the loss-form penalty "
+            "unbounded below and puts a pole in the proximal update. 'relu' "
+            "(default) keeps positive contributions only, so a strongly "
+            "negative path integral is treated as irrelevant; 'abs' keeps the "
+            "magnitude, treating it as important. Changes total Omega, so "
+            "woe_lambda must be re-swept."
+        ),
+    )
+    parser.add_argument(
         "--woe_importance_scalar",
         type=str,
         default="i2",
