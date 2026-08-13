@@ -54,6 +54,22 @@ def _default_config_chain(model_name: str, preset_default: str | None) -> List[s
     tuning_defaults = REPO_ROOT / "configs/tuning_defaults.yaml"
     if tuning_defaults.exists():
         chain.append(str(tuning_defaults))
+
+    # A preset that explicitly names its config wins over the model-name lookup.
+    # Several presets share one model but target different variants of it (e.g.
+    # woe_si in output mode, woe_si_replay in evidence mode); without this the
+    # lookup silently loads configs/models/til/<model_name>.yaml and the sweep
+    # tunes the wrong variant -- a parameter that the loaded config never enables
+    # then has no effect, and every trial scores identically.
+    # "config_all.yaml" is the dataclass placeholder, not a deliberate choice.
+    if preset_default and preset_default != "config_all.yaml":
+        preset_path = Path(preset_default)
+        if not preset_path.is_absolute():
+            preset_path = REPO_ROOT / preset_path
+        if preset_path.exists():
+            chain.append(str(preset_path))
+            return chain
+
     model_cfg_candidates = (
         REPO_ROOT / "configs/models" / f"{model_name}.yaml",
         REPO_ROOT / "configs/models/til" / f"{model_name}.yaml",
