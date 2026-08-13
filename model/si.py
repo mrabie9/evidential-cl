@@ -24,6 +24,14 @@ from model.detection_replay import (
 from utils.training_metrics import macro_recall
 from utils import misc_utils
 from utils.class_weighted_loss import classification_cross_entropy
+from utils.proximal_anchor import (
+    anchor_curvature,
+    apply_proximal_anchor,
+    log_importance_summary,
+    optimizer_learning_rate,
+    proximal_anchor_coefficient,
+    resolve_anchor_mode,
+)
 
 
 @dataclass
@@ -86,6 +94,8 @@ class Net(DetectionReplayMixin, nn.Module):
 
         self.si_c = float(self.cfg.si_c)
         self.epsilon = float(self.cfg.si_epsilon)
+        self.anchor_mode = resolve_anchor_mode(args)
+        self.use_proximal_anchor = self.anchor_mode == "proximal"
         self.clipgrad = self.cfg.clipgrad
         self.det_lambda = float(self.cfg.det_lambda)
         self.cls_lambda = float(self.cfg.cls_lambda)
@@ -175,16 +185,28 @@ class Net(DetectionReplayMixin, nn.Module):
             #     mem_loss = self.det_loss(mem_det_logits, mem_y.float())
             #     det_loss = 0.5 * (det_loss + mem_loss)
 
+            if self.use_proximal_anchor:
+                # The anchor is applied in closed form after the optimiser step
+                # instead, so it contributes nothing to this backward pass -- and
+                # therefore nothing to the global gradient-norm clip budget.
+                surrogate = torch.zeros(1, device=self._device())
+            else:
+                surrogate = self._surrogate_loss()
             loss = (
                 self.cls_lambda * loss_ce
                 # + self.det_lambda * det_loss
-                + self.si_c * self._surrogate_loss()
+                + self.si_c * surrogate
             )
 
             loss.backward()
             if self.clipgrad is not None:
                 torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.clipgrad)
             self.opt.step()
+            if self.use_proximal_anchor:
+                self._apply_proximal_anchor()
+            # Run after the anchor so the path integral integrates the parameter
+            # displacement the network actually kept, matching the loss form
+            # where the anchor's pull is likewise already inside the step.
             self._update_path_integral()
             metric_logits = logits_for_loss.detach()
 
@@ -259,6 +281,11 @@ class Net(DetectionReplayMixin, nn.Module):
             prev.copy_(param.detach())
             W_buf.zero_()
             getattr(self, f"{key}_si_p_old").copy_(param.detach())
+        log_importance_summary(
+            "si",
+            self.current_task,
+            (getattr(self, f"{key}_si_omega") for key in self._param_to_key.values()),
+        )
 
     # ------------------------------------------------------------------
     def _surrogate_loss(self) -> torch.Tensor:
@@ -274,6 +301,33 @@ class Net(DetectionReplayMixin, nn.Module):
             prev = getattr(self, f"{key}_si_prev")
             loss = loss + (omega * (param - prev).pow(2)).sum()
         return loss
+
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def _apply_proximal_anchor(self) -> None:
+        """Apply the SI quadratic anchor as a closed-form post-step update.
+
+        SI writes its penalty as ``si_c * sum_i Omega_i (theta_i - prev_i)^2``,
+        so the anchor curvature is ``k = 2 * si_c``. See
+        ``utils.proximal_anchor`` for the derivation and for why SI's
+        unrectified ``Omega`` (``W / (delta^2 + epsilon)`` is not sign
+        constrained) is clamped at zero here.
+
+        A no-op on the first task, where ``Omega`` is still all zeros.
+        """
+        coefficient = proximal_anchor_coefficient(
+            optimizer_learning_rate(self.opt), anchor_curvature("si", self.si_c)
+        )
+        for name, param in self.net.named_parameters():
+            key = self._param_to_key.get(name)
+            if key is None:
+                continue
+            apply_proximal_anchor(
+                param,
+                getattr(self, f"{key}_si_omega"),
+                getattr(self, f"{key}_si_prev"),
+                coefficient,
+            )
 
     # ------------------------------------------------------------------
     def _compute_offsets(self, task: int) -> Tuple[int, int]:

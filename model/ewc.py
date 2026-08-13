@@ -26,6 +26,14 @@ from model.detection_replay import (
 from utils.training_metrics import macro_recall
 from utils import misc_utils
 from utils.class_weighted_loss import classification_cross_entropy
+from utils.proximal_anchor import (
+    anchor_curvature,
+    apply_proximal_anchor,
+    log_importance_summary,
+    optimizer_learning_rate,
+    proximal_anchor_coefficient,
+    resolve_anchor_mode,
+)
 
 
 @dataclass
@@ -86,6 +94,8 @@ class Net(DetectionReplayMixin, nn.Module):
         self.incremental_loader_name = getattr(args, "loader", None)
 
         self.lamb = float(self.cfg.lamb)
+        self.anchor_mode = resolve_anchor_mode(args)
+        self.use_proximal_anchor = self.anchor_mode == "proximal"
         self.clipgrad = float(self.cfg.clipgrad) if self.cfg.clipgrad > 0 else None
         self.det_lambda = float(self.cfg.det_lambda)
         self.cls_lambda = float(self.cfg.cls_lambda)
@@ -199,10 +209,17 @@ class Net(DetectionReplayMixin, nn.Module):
             #     mem_det_logits, _ = self._forward_heads(mem_x)
             #     mem_loss = self.det_loss(mem_det_logits, mem_y.float())
             #     det_loss = 0.5 * (det_loss + mem_loss)
+            if self.use_proximal_anchor:
+                # The anchor is applied in closed form after the optimiser step
+                # instead, so it contributes nothing to this backward pass -- and
+                # therefore nothing to the global gradient-norm clip budget.
+                penalty = torch.zeros(1, device=self._device())
+            else:
+                penalty = self._ewc_penalty()
             loss = (
                 self.cls_lambda * loss_ce
                 # + self.det_lambda * det_loss
-                + 0.5 * self.lamb * self._ewc_penalty()
+                + 0.5 * self.lamb * penalty
             )
             loss.backward()
 
@@ -210,6 +227,8 @@ class Net(DetectionReplayMixin, nn.Module):
                 torch.nn.utils.clip_grad_norm_(self.parameters(), self.clipgrad)
 
             self.opt.step()
+            if self.use_proximal_anchor:
+                self._apply_proximal_anchor()
             metric_logits = logits_for_loss.detach()
 
         return float(loss.item()), cls_tr_rec, metric_logits
@@ -284,6 +303,7 @@ class Net(DetectionReplayMixin, nn.Module):
                 self.fisher[name] = fisher_est
             self.param_star[name] = param.detach().clone()
 
+        log_importance_summary("ewc", self.current_task, self.fisher.values())
         self._tasks_consolidated += 1
         self._reset_fisher_accum()
 
@@ -299,6 +319,30 @@ class Net(DetectionReplayMixin, nn.Module):
                 self.fisher[name] * (param - self.param_star[name]).pow(2)
             ).sum()
         return penalty
+
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def _apply_proximal_anchor(self) -> None:
+        """Apply the EWC quadratic anchor as a closed-form post-step update.
+
+        EWC writes its penalty as ``0.5 * lamb * sum_i F_i (theta_i -
+        theta_i^*)^2``, so the anchor curvature is ``k = lamb`` -- half SI's
+        factor, because the ``0.5`` is already explicit here. See
+        ``utils.proximal_anchor`` for the derivation.
+
+        A no-op before the first consolidation, when ``self.fisher`` is empty.
+        """
+        if not self.fisher:
+            return
+        coefficient = proximal_anchor_coefficient(
+            optimizer_learning_rate(self.opt), anchor_curvature("ewc", self.lamb)
+        )
+        for name, param in self.net.named_parameters():
+            fisher = self.fisher.get(name)
+            star = self.param_star.get(name)
+            if fisher is None or star is None:
+                continue
+            apply_proximal_anchor(param, fisher, star, coefficient)
 
     # ------------------------------------------------------------------
     def _reset_fisher_accum(self) -> None:

@@ -25,6 +25,14 @@ from model.detection_replay import (
 from utils.training_metrics import macro_recall
 from utils import misc_utils
 from utils.class_weighted_loss import classification_cross_entropy
+from utils.proximal_anchor import (
+    anchor_curvature,
+    apply_proximal_anchor,
+    log_importance_summary,
+    optimizer_learning_rate,
+    proximal_anchor_coefficient,
+    resolve_anchor_mode,
+)
 
 
 @dataclass
@@ -98,6 +106,8 @@ class Net(DetectionReplayMixin, nn.Module):
         self.lamb = float(self.cfg.lamb)
         self.alpha = float(self.cfg.alpha)
         self.eps = float(self.cfg.eps)
+        self.anchor_mode = resolve_anchor_mode(args)
+        self.use_proximal_anchor = self.anchor_mode == "proximal"
         self.clipgrad = self.cfg.clipgrad
         self.det_lambda = float(self.cfg.det_lambda)
         self.cls_lambda = float(self.cfg.cls_lambda)
@@ -195,16 +205,28 @@ class Net(DetectionReplayMixin, nn.Module):
             #     mem_loss = self.det_loss(mem_det_logits, mem_y.float())
             #     det_loss = 0.5 * (det_loss + mem_loss)
 
+            if self.use_proximal_anchor:
+                # The anchor is applied in closed form after the optimiser step
+                # instead, so it contributes nothing to this backward pass -- and
+                # therefore nothing to the global gradient-norm clip budget.
+                regulariser = torch.zeros(1, device=self._device())
+            else:
+                regulariser = self._regulariser()
             loss = (
                 self.cls_lambda * loss_ce
                 # + self.det_lambda * det_loss
-                + self.lamb * self._regulariser()
+                + self.lamb * regulariser
             )
             loss.backward()
 
             if self.clipgrad is not None:
                 torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.clipgrad)
             self.opt.step()
+            if self.use_proximal_anchor:
+                self._apply_proximal_anchor()
+            # Run after the anchor so the running statistics see the parameter
+            # displacement the network actually kept, matching the loss form
+            # where the anchor's pull is likewise already inside the step.
             self._update_running_statistics()
             metric_logits = logits_for_loss.detach()
 
@@ -309,7 +331,46 @@ class Net(DetectionReplayMixin, nn.Module):
             self.s_running[name] = s_clone.clone()
             self.param_star[name] = param.detach().clone()
             self.p_old[name] = param.detach().clone()
+        log_importance_summary(
+            "rwalk",
+            self.current_task,
+            (self.fisher[name] + self.s[name] for name in self.fisher),
+        )
         self.tasks_trained += 1
+
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def _apply_proximal_anchor(self) -> None:
+        """Apply the RWalk quadratic anchor as a closed-form post-step update.
+
+        RWalk writes its penalty as ``lamb * sum_i (F_i + s_i) (theta_i -
+        theta_i^*)^2``, so the anchor curvature is ``k = 2 * lamb``. See
+        ``utils.proximal_anchor`` for the derivation.
+
+        RWalk's importance ``F + s`` is the one in this repository that most
+        often goes negative: ``s`` accumulates ``-grad * delta`` divided by a
+        Fisher-weighted distance, which is negative on every step where the loss
+        rose. ``apply_proximal_anchor`` clamps it at zero, so such parameters are
+        simply left unprotected instead of being actively pushed away from their
+        anchor as the loss form does.
+
+        A no-op before the first consolidation, when ``tasks_trained`` is 0.
+        """
+        if self.tasks_trained == 0:
+            return
+        coefficient = proximal_anchor_coefficient(
+            optimizer_learning_rate(self.opt), anchor_curvature("rwalk", self.lamb)
+        )
+        for name, param in self.net.named_parameters():
+            if not param.requires_grad or name.startswith("det_head"):
+                continue
+            self._ensure_state_device(name, param)
+            fisher = self.fisher.get(name)
+            s_term = self.s.get(name)
+            star = self.param_star.get(name)
+            if fisher is None or s_term is None or star is None:
+                continue
+            apply_proximal_anchor(param, fisher + s_term, star, coefficient)
 
     # ------------------------------------------------------------------
     def _ensure_state_device(self, name: str, param: torch.nn.Parameter) -> None:

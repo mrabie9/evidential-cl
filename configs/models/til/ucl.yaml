@@ -1,12 +1,10 @@
-# Model-specific overrides for ucl.
 model: ucl_bresnet
 loader: task_incremental_loader
-
-lr: 0.01
+lr: 0.003
 lr_rho: 0.005
-beta: 0.02
+beta: 0.0002
 alpha: 10
 ratio: 0.1
-
-eval_samples: 1 # Only used for epistemic uncertainty estimation
+eval_samples: 1
 split: true
+anchor_mode: loss

@@ -30,6 +30,11 @@ from utils.iq_features import append_iq_augmented_features
 from utils.training_metrics import macro_recall
 from utils import misc_utils
 from utils.class_weighted_loss import classification_cross_entropy
+from utils.proximal_anchor import (
+    apply_proximal_anchor,
+    optimizer_learning_rate,
+    resolve_anchor_mode,
+)
 
 
 def _calculate_fan_in_and_fan_out(tensor: torch.Tensor) -> Tuple[int, int]:
@@ -524,6 +529,13 @@ class Net(nn.Module):
             weight_decay=0.0,
         )
 
+        self.anchor_mode = resolve_anchor_mode(args)
+        # Only the mu penalty is a diagonal quadratic anchor, so only it moves to
+        # the proximal path; the sigma KL and the L1 term stay in the loss. See
+        # `_apply_proximal_mu_anchor`.
+        self.use_proximal_anchor = self.anchor_mode == "proximal"
+        self._regularised_parameter_count = 0
+
         self.current_task: Optional[int] = None
         self.model_old: Optional[BayesianClassifier] = None
         self.saved = False
@@ -953,6 +965,8 @@ class Net(nn.Module):
             if self.cfg.clipgrad > 0:
                 torch.nn.utils.clip_grad_norm_(self.parameters(), self.cfg.clipgrad)
             self.optimizer.step()
+            if self.use_proximal_anchor:
+                self._apply_proximal_mu_anchor(int(y_cls_filtered.size(0)))
 
         # if y_det is not None:
         #     self.detector.train()
@@ -1180,6 +1194,9 @@ class Net(nn.Module):
             regularized_parameter_count += param_count
 
         normaliser = max(1, regularized_parameter_count)
+        # Cached for `_apply_proximal_mu_anchor`, which needs the same divisor to
+        # reproduce this term's curvature exactly.
+        self._regularised_parameter_count = normaliser
         sigma_weight_reg = sigma_weight_reg / normaliser
         sigma_weight_normal_reg = sigma_weight_normal_reg / normaliser
         mu_weight_reg = mu_weight_reg / normaliser
@@ -1188,12 +1205,114 @@ class Net(nn.Module):
         l1_mu_bias_reg = l1_mu_bias_reg / normaliser
 
         loss = base_loss
-        loss = loss + self.cfg.alpha * (mu_weight_reg + mu_bias_reg) / (2 * batch_size)
+        if not self.use_proximal_anchor:
+            # In proximal mode this quadratic is applied in closed form after the
+            # optimiser step instead; the L1 and sigma terms below are not
+            # quadratic anchors and stay in the loss either way.
+            loss = loss + self.cfg.alpha * (mu_weight_reg + mu_bias_reg) / (
+                2 * batch_size
+            )
         loss = loss + self.saved * (l1_mu_weight_reg + l1_mu_bias_reg) / batch_size
         loss = loss + self.cfg.beta * (sigma_weight_reg + sigma_weight_normal_reg) / (
             2 * batch_size
         )
         return loss
+
+    def _iter_regularised_layer_pairs(
+        self,
+    ) -> Iterable[Tuple[BayesianLayer, BayesianLayer]]:
+        """Yield ``(old_layer, new_layer)`` for every regularised Bayesian layer.
+
+        The regularised set is the whole feature extractor plus the heads of
+        tasks already completed -- exactly the pairs ``_apply_regularisation``
+        walks. Factored out so the proximal mu anchor cannot drift out of sync
+        with the loss term it replaces.
+
+        Yields:
+            Pairs of frozen-snapshot and live Bayesian layers. Empty until the
+            first snapshot exists.
+
+        Usage:
+            >>> for old_layer, new_layer in self._iter_regularised_layer_pairs():
+            ...     ...
+        """
+        if self.model_old is None:
+            return
+        yield from zip(
+            self._iter_bayesian_modules(self.model_old.feature_net),
+            self._iter_bayesian_modules(self.model.feature_net),
+        )
+        current_task_index = (
+            int(self.current_task) if self.current_task is not None else 0
+        )
+        for head_index in range(min(current_task_index, len(self.model.heads))):
+            yield self.model_old.heads[head_index], self.model.heads[head_index]
+
+    @torch.no_grad()
+    def _apply_proximal_mu_anchor(self, batch_size: int) -> None:
+        """Apply UCL's mu anchor as a closed-form post-step update.
+
+        UCL's regulariser is three terms, only one of which is a diagonal
+        quadratic anchor::
+
+            alpha * sum_i (S_i * (mu_i - mu_i^*))^2 / (2 * B * N)
+
+        with ``S_i = std_init / sigma_i^*`` the "strength" of the frozen
+        posterior. Matching the canonical form
+        ``(k/2) * sum_i Omega_i (theta_i - theta_i^*)^2`` gives importance
+        ``Omega_i = S_i^2`` and curvature ``k = alpha / (B * N)``, where ``B`` is
+        the minibatch size and ``N`` the regularised-parameter count. Both vary
+        per step, so unlike EWC/SI/RWalk the curvature cannot be precomputed and
+        ``utils.proximal_anchor.anchor_curvature`` does not carry an entry for
+        UCL.
+
+        This is the term with the worst conditioning in the method: ``S_i``
+        is an *inverse* posterior standard deviation, so a layer that a previous
+        task made confident about (small ``sigma^*``) contributes curvature that
+        grows without bound. That is precisely the regime where explicit descent
+        on the anchor is unstable and the closed form is not.
+
+        The L1 term (``|mu - mu^*|`` weighted by the frozen signal-to-noise
+        ratio) and the sigma KL terms stay in the loss: neither is a quadratic
+        anchor, and the L1 gradient is bounded by construction, so neither has
+        the stability problem this addresses.
+
+        Args:
+            batch_size: Size of the minibatch the step was taken on -- the same
+                ``B`` that scaled the loss term being replaced.
+        """
+        if not self.saved or self.model_old is None:
+            return
+        normaliser = max(1, int(self._regularised_parameter_count))
+        curvature = float(self.cfg.alpha) / (float(batch_size) * float(normaliser))
+        # Group 0 holds the mu parameters (see the optimiser construction in
+        # __init__); the rho group has its own learning rate and is not anchored.
+        coefficient = optimizer_learning_rate(self.optimizer, group_index=0) * curvature
+        if coefficient == 0.0:
+            return
+        eps = 1e-8
+        for old_layer, new_layer in self._iter_regularised_layer_pairs():
+            saver_weight_sigma = old_layer.weight_sigma.clamp_min(eps)
+            fan_in, _ = _calculate_fan_in_and_fan_out(new_layer.weight_mu)
+            std_init = math.sqrt((2.0 / fan_in) * self.cfg.ratio)
+            weight_strength = std_init / saver_weight_sigma
+            apply_proximal_anchor(
+                new_layer.weight_mu,
+                weight_strength.pow(2),
+                old_layer.weight_mu,
+                coefficient,
+            )
+
+            trainer_bias = getattr(new_layer, "bias", None)
+            saver_bias = getattr(old_layer, "bias", None)
+            if trainer_bias is None or saver_bias is None:
+                continue
+            bias_strength = weight_strength.view(weight_strength.size(0), -1).mean(
+                dim=1
+            )
+            apply_proximal_anchor(
+                trainer_bias, bias_strength.pow(2), saver_bias, coefficient
+            )
 
     def _iter_bayesian_modules(self, module: nn.Module) -> Iterable[BayesianLayer]:
         for sub in module.modules():
