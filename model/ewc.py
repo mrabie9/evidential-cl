@@ -45,14 +45,13 @@ class EwcConfig:
     @staticmethod
     def from_args(args: object) -> "EwcConfig":
         cfg = EwcConfig()
-        # Override defaults with any args attributes that match
+        # Override defaults with any args attributes that match. `None` means
+        # "not set on args" (the parser registers `lamb` with a None default),
+        # so the dataclass default stands.
         for field in cfg.__dataclass_fields__:
-            if hasattr(args, field):
-                setattr(cfg, field, getattr(args, field))
-        if hasattr(args, "clipgrad") and not hasattr(args, "clipgrad_norm"):
-            cfg.clipgrad = getattr(args, "clipgrad")
-        if hasattr(args, "lamb"):
-            cfg.lamb = getattr(args, "lamb")
+            value = getattr(args, field, None)
+            if value is not None:
+                setattr(cfg, field, value)
         return cfg
 
 

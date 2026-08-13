@@ -51,8 +51,13 @@ class RWalkConfig:
             return cfg
 
         for field in cfg.__dataclass_fields__:
-            if hasattr(args, field):
-                setattr(cfg, field, getattr(args, field))
+            # `None` means "not set on args" (the parser registers `lamb`,
+            # `alpha` and `eps` with None defaults), so the dataclass default
+            # stands -- which is what keeps RWalk's `alpha` from picking up
+            # UCL's, the two methods sharing the flag name.
+            value = getattr(args, field, None)
+            if value is not None:
+                setattr(cfg, field, value)
         return cfg
 
 

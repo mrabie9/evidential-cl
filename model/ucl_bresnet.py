@@ -360,8 +360,13 @@ class UCLConfig:
     def from_args(args: object) -> "UCLConfig":
         cfg = UCLConfig()
         for field in cfg.__dataclass_fields__:
-            if hasattr(args, field):
-                setattr(cfg, field, getattr(args, field))
+            # `None` means "not set on args" (the parser registers `alpha`,
+            # `beta`, `ratio` and `lr_rho` with None defaults), so the dataclass
+            # default stands -- which is what keeps UCL's `alpha` from picking up
+            # RWalk's, the two methods sharing the flag name.
+            value = getattr(args, field, None)
+            if value is not None:
+                setattr(cfg, field, value)
         return cfg
 
 

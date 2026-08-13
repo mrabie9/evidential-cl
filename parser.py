@@ -572,6 +572,103 @@ def get_parser():
 
     # Parameters for HAT
 
+    # Regularisation-based CL methods (EWC, SI, RWalk, UCL).
+    #
+    # These were previously read only from each learner's dataclass defaults:
+    # `parser._apply_config_overrides` skips any YAML key that is not a
+    # registered argument, so `si_c`, `lamb`, `alpha`, `beta`, `ratio` and
+    # `lr_rho` in configs/models/til/*.yaml were silently discarded. They default
+    # to None here so that an unset value still falls through to the learner's
+    # own default (each `*Config.from_args` skips None), which keeps the two
+    # methods that share the name `alpha` -- RWalk's Fisher EMA momentum and
+    # UCL's mu-penalty strength -- from inheriting each other's default.
+    parser.add_argument(
+        "--anchor_mode",
+        type=str,
+        default="loss",
+        choices=["loss", "proximal"],
+        help=(
+            "How EWC / SI / RWalk / UCL apply their quadratic anchor. 'loss' "
+            "(default) adds it to the training loss and lets the optimiser "
+            "descend it. 'proximal' applies its closed-form minimiser after the "
+            "optimiser step, keeping it out of the backward pass and the "
+            "gradient-norm clip budget; unconditionally stable at any importance "
+            "scale. The two modes need separate penalty-strength sweeps."
+        ),
+    )
+    parser.add_argument(
+        "--si_c",
+        type=float,
+        default=None,
+        help="SI penalty strength c (weight on the path-integral anchor).",
+    )
+    parser.add_argument(
+        "--si_epsilon",
+        type=float,
+        default=None,
+        help="SI damping term in the per-task importance normaliser.",
+    )
+    parser.add_argument(
+        "--lamb",
+        type=float,
+        default=None,
+        help="EWC / RWalk anchor-penalty strength lambda.",
+    )
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=None,
+        help="RWalk Fisher EMA momentum; UCL mu-regularisation strength.",
+    )
+    parser.add_argument(
+        "--eps",
+        type=float,
+        default=None,
+        help="RWalk damping term in the parameter-importance score s.",
+    )
+    parser.add_argument(
+        "--beta",
+        type=float,
+        default=None,
+        help="UCL sigma-regularisation strength.",
+    )
+    parser.add_argument(
+        "--ratio",
+        type=float,
+        default=None,
+        help="UCL initial posterior sigma as a ratio of the He init scale.",
+    )
+    parser.add_argument(
+        "--lr_rho",
+        type=float,
+        default=None,
+        help="UCL learning rate for the posterior rho (sigma) parameters.",
+    )
+    parser.add_argument(
+        "--gamma",
+        type=float,
+        default=None,
+        help="HAT mask-sparsity penalty weight; MER meta-update rate.",
+    )
+    parser.add_argument(
+        "--smax",
+        type=float,
+        default=None,
+        help="HAT maximum gate temperature s_max in the annealing schedule.",
+    )
+    parser.add_argument(
+        "--distill_lambda",
+        type=float,
+        default=None,
+        help="LwF weight on the logit-distillation term.",
+    )
+    parser.add_argument(
+        "--eval_samples",
+        type=int,
+        default=None,
+        help="UCL Monte-Carlo samples drawn per evaluation forward pass.",
+    )
+
     # EUCR (Evidential Uncertainty Channel Regularisation) parameters
     parser.add_argument(
         "--reg_lambda",

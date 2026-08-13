@@ -66,8 +66,12 @@ class BclDualConfig:
                 else:
                     cfg.adapt_inner_steps = max(1, inner_raw)
                 continue
-            if hasattr(args, field_name):
-                setattr(cfg, field_name, getattr(args, field_name))
+            value = getattr(args, field_name, None)
+            # `None` means the argument was registered but never set (the
+            # parser gives shared names like `beta` a None default so each
+            # model keeps its own), so the dataclass default stands.
+            if value is not None:
+                setattr(cfg, field_name, value)
         return cfg
 
 

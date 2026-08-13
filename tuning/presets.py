@@ -53,6 +53,7 @@ COMMON_TYPE_HINTS: Dict[str, type] = {
     "woe_conflict_weighting": bool,
     "woe_reg_level": str,
     "woe_anchor_mode": str,
+    "anchor_mode": str,
     "woe_omega_winsorise": float,
     "woe_replay_memories": int,
     "woe_replay_batch_size": int,

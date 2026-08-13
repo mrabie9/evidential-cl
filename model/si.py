@@ -46,8 +46,11 @@ class SiConfig:
     def from_args(args: object) -> "SiConfig":
         cfg = SiConfig()
         for field in cfg.__dataclass_fields__:
-            if hasattr(args, field):
-                setattr(cfg, field, getattr(args, field))
+            # `None` means "not set on args" (the parser registers si_c and
+            # si_epsilon with a None default), so the dataclass default stands.
+            value = getattr(args, field, None)
+            if value is not None:
+                setattr(cfg, field, value)
         return cfg
 
 
