@@ -2,9 +2,27 @@
 import os
 import argparse
 from pathlib import Path
-from typing import Iterable, List, Sequence
+from typing import Dict, Iterable, List, Sequence, Set, Tuple
 
 import yaml
+
+# YAML keys that are applied under a different argparse dest. Historical spellings
+# of the inner-loop step count, kept so old configs keep working.
+CONFIG_KEY_ALIASES: Dict[str, str] = {
+    "glances": "inner_steps",
+    "update_steps": "inner_steps",
+}
+
+# YAML keys that are deliberately inert: they document the resulting behaviour
+# for a reader but must NOT be wired to an argument, because something else
+# decides the value. Anything here needs a comment saying what that something is.
+INTENTIONALLY_UNUSED_CONFIG_KEYS: Set[str] = {
+    # model.ucl_bresnet._infer_ucl_split_from_loader derives `split` from the
+    # loader name (CIL -> concatenated heads, TIL -> per-task heads) and
+    # overwrites whatever the config says. Registering it would let a config
+    # appear to set something it cannot.
+    "split",
+}
 
 
 def get_parser():
@@ -1008,20 +1026,54 @@ def _expanded_config_paths(config_sources: Sequence[str] | None) -> List[Path]:
 def _apply_config_overrides(
     args: argparse.Namespace, config_paths: Iterable[Path]
 ) -> argparse.Namespace:
-    """Apply YAML overrides from the provided config files to the namespace."""
+    """Apply YAML overrides from the provided config files to the namespace.
 
+    A YAML key reaches a learner only if some ``add_argument`` in
+    :func:`get_parser` declares that dest: the namespace is built by
+    ``parser.parse_args([])`` and so contains exactly the registered dests and
+    nothing else. Any other key is therefore not applicable, and this raises
+    rather than skipping it. Silently dropping such keys is how
+    ``configs/models/til/si.yaml``'s ``si_c: 0.4`` came to have no effect on any
+    run for as long as it existed, while the file read as if it did.
+
+    Args:
+        args: Namespace of parser defaults to overwrite in place.
+        config_paths: YAML files, applied in order; later files win.
+
+    Returns:
+        The same namespace, with every applicable key applied.
+
+    Raises:
+        ValueError: If any file contains a key that no argument declares and
+            that is not listed in :data:`INTENTIONALLY_UNUSED_CONFIG_KEYS`.
+
+    Usage:
+        >>> _apply_config_overrides(args, [Path("configs/base.yaml")])
+    """
+    unrecognised: List[Tuple[str, str]] = []
     for path in config_paths:
         with path.open("r", encoding="utf-8") as handle:
             data = yaml.safe_load(handle) or {}
         for key, value in data.items():
-            if key == "glances":
-                setattr(args, "inner_steps", value)
-                continue
-            if key == "update_steps":
-                setattr(args, "inner_steps", value)
+            if key in CONFIG_KEY_ALIASES:
+                setattr(args, CONFIG_KEY_ALIASES[key], value)
                 continue
             if hasattr(args, key):
                 setattr(args, key, value)
+                continue
+            if key in INTENTIONALLY_UNUSED_CONFIG_KEYS:
+                continue
+            unrecognised.append((str(path), key))
+    if unrecognised:
+        listing = "\n".join(f"    {path}: {key}" for path, key in unrecognised)
+        raise ValueError(
+            "Config key(s) that no argparse argument declares, so they would "
+            "have no effect on the run:\n"
+            f"{listing}\n"
+            "Register the argument in parser.get_parser(), remove the key, or "
+            "add it to parser.INTENTIONALLY_UNUSED_CONFIG_KEYS with a comment "
+            "explaining why it is inert."
+        )
     return args
 
 
