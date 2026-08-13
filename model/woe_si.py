@@ -84,6 +84,33 @@ _CENTERING_MODES = ("centered_uniform", "raw_uniform", "full_lc")
 #   "output"    -- no path integral at all: distil the DS output evidence
 #                  (w_plus / w_minus) of a frozen end-of-task teacher (LwF-style).
 _REG_LEVELS = ("parameter", "channel", "output")
+# How the quadratic anchor is applied to the parameters:
+#   "loss"     -- add lambda * sum_i Omega_i (theta_i - theta_i*)^2 to the training
+#                 loss and let the optimiser descend it (the original behaviour).
+#   "proximal" -- keep the anchor out of the backward pass entirely and apply its
+#                 closed-form minimiser as a post-step update. See
+#                 ``Net._apply_proximal_anchor`` for the derivation and why it is
+#                 unconditionally stable where the loss form is not.
+_ANCHOR_MODES = ("loss", "proximal")
+# Scale the functional (evidence) penalties are measured on:
+#   "weight" -- raw weights of evidence (w_plus, w_minus), unbounded above.
+#   "belief" -- 1 - exp(-w / tau), the mass each channel commits, bounded in
+#               [0, 1). See ``evidence_to_belief``.
+_EVIDENCE_SCALES = ("weight", "belief")
+# Scalar whose path integral defines per-parameter importance. Ablation axis:
+# does the Dempster-Shafer construction earn its place, or would any monotone
+# "the network became more committed" scalar select the same parameters?
+#   "i2"   -- Denoeux I_2(m), the DS information content (the method).
+#   "z2"   -- squared norm of the active logits. Cheapest possible stand-in;
+#             measured cos(dI_2/dtheta, dz2/dtheta) = 0.850 +/- 0.075 over all
+#             10 tasks, so it should select nearly the same parameters.
+#   "phi2" -- squared norm of the penultimate features. Knows nothing about the
+#             readout or the classes at all.
+#   "ce"   -- the task loss, i.e. plain Synaptic Intelligence (Zenke et al.).
+#             The canonical baseline. Tracked as *negative* CE so "the scalar
+#             went up" still means "the model improved", matching SI's sign
+#             convention and keeping the relu in consolidation meaningful.
+_IMPORTANCE_SCALARS = ("i2", "z2", "phi2", "ce")
 
 
 def compute_weights_of_evidence(
@@ -161,6 +188,62 @@ def per_class_total_evidence(
     return w_plus, w_minus
 
 
+def evidence_to_belief(
+    total_evidence: torch.Tensor, temperature: float = 1.0
+) -> torch.Tensor:
+    """Map a total weight of evidence onto the belief mass it commits.
+
+    A weight of evidence is the *logarithmic* parameterisation of a simple
+    support function: weight ``w`` leaves vacuous mass ``exp(-w)``, so the mass
+    committed to the focal set is ``1 - exp(-w)``. Dempster's rule combines
+    simple support functions sharing a focal set by *adding* weights, which is
+    why ``w_plus`` is a plain sum over features -- this transform belongs after
+    that sum, never inside it.
+
+    The map sends ``[0, inf) -> [0, 1)``, so it is bounded where ``w`` is not.
+    That is the point: a one-sided "must not decrease" penalty on ``w`` can be
+    satisfied by inflating the readout (``w`` is linear in it, so one global
+    rescale satisfies every such constraint at once), whereas the same penalty on
+    the belief scale sees a gradient carrying a factor ``exp(-w)`` and stops
+    paying for inflation. It also makes equal drops count equally in
+    decision-relevant terms: 8.0 -> 7.5 moves belief by 0.0002, 0.5 -> 0.0 moves
+    it by 0.393, where a squared penalty in ``w`` scores the two identically.
+
+    ``temperature`` rescales the input to ``1 - exp(-w / tau)``. Weights of
+    evidence are sums over ``J`` features and can sit far out on the flat tail of
+    the curve, where every drop looks equally negligible; setting ``tau`` near the
+    typical ``w`` returns the operating point to the responsive region.
+
+    ``tau`` is not cosmetic. The saturation is *hard* in float32: past
+    ``w / tau ~ 16.6`` the result rounds to exactly 1.0 and the gradient (which
+    carries a factor ``exp(-w / tau)``) is exactly zero, so a penalty built on
+    this transform is silently inert for any evidence above that. Measure the
+    typical ``w_plus`` before choosing ``tau``.
+
+    Note this is the mass the *channel in isolation* commits to its focal set.
+    It is ``Bel({theta_k})`` of the full class-``k`` mass function only before
+    combining with the opposing channel, which discounts it by the conflict
+    ``kappa`` (see :func:`_conflict_factor`).
+
+    Args:
+        total_evidence: Non-negative total evidence of any shape, typically
+            ``w_plus`` or ``w_minus`` from :func:`per_class_total_evidence`.
+        temperature: Positive scale divided into the evidence before the
+            exponential. ``1.0`` is the plain Dempster-Shafer transform.
+
+    Returns:
+        Belief in ``[0, 1)``, same shape as ``total_evidence``.
+
+    Usage:
+        >>> w_plus, w_minus = per_class_total_evidence(w)
+        >>> belief_plus = evidence_to_belief(w_plus)
+    """
+    if temperature <= 0.0:
+        raise ValueError(f"temperature must be positive, got {temperature}")
+    # -expm1(-x) is 1 - exp(-x) without the catastrophic cancellation at small x.
+    return -torch.expm1(-total_evidence / temperature)
+
+
 def information_content(
     weights_of_evidence: torch.Tensor,
     conflict_weighting: bool = False,
@@ -208,9 +291,7 @@ def _conflict_factor(w_plus: torch.Tensor, w_minus: torch.Tensor) -> torch.Tenso
     Returns:
         Conflict factor with shape ``(batch, K)``, all ``>= 1``.
     """
-    belief_plus = 1.0 - torch.exp(-w_plus)
-    belief_minus = 1.0 - torch.exp(-w_minus)
-    kappa = belief_plus * belief_minus
+    kappa = evidence_to_belief(w_plus) * evidence_to_belief(w_minus)
     return 1.0 + kappa
 
 
@@ -235,6 +316,13 @@ class WoeSiConfig:
       ``_REG_LEVELS``. ``"output"`` is a functional (evidence-distillation)
       penalty and is *not* on the SI path-integral scale, so it needs its own
       ``woe_lambda``.
+    * ``woe_omega_winsorise`` -- quantile in ``(0, 1)`` at which the cumulative
+      ``Omega`` is capped after each consolidation; ``0`` (default) disables it.
+      The path integral is extremely heavy-tailed in practice, so a handful of
+      parameters can otherwise carry curvature the optimiser cannot integrate.
+    * ``woe_anchor_mode`` -- ``"loss"`` (default) or ``"proximal"``; see
+      ``_ANCHOR_MODES``. Ignored when ``woe_reg_level`` is ``"output"``, which is
+      a functional penalty with no per-parameter anchor to apply.
     """
 
     inner_steps: int = 1
@@ -247,6 +335,8 @@ class WoeSiConfig:
     woe_importance_stride: int = 1
     woe_conflict_weighting: bool = False
     woe_reg_level: str = "parameter"
+    woe_omega_winsorise: float = 0.0
+    woe_anchor_mode: str = "loss"
 
     optimizer: str = "sgd"
     clipgrad: Optional[float] = 100.0
@@ -314,6 +404,23 @@ class Net(DetectionReplayMixin, nn.Module):
                 f"woe_reg_level must be one of {_REG_LEVELS}, "
                 f"got {self.cfg.woe_reg_level!r}"
             )
+        if self.cfg.woe_anchor_mode not in _ANCHOR_MODES:
+            raise ValueError(
+                f"woe_anchor_mode must be one of {_ANCHOR_MODES}, "
+                f"got {self.cfg.woe_anchor_mode!r}"
+            )
+        self.omega_winsorise = float(self.cfg.woe_omega_winsorise)
+        if not 0.0 <= self.omega_winsorise < 1.0:
+            raise ValueError(
+                "woe_omega_winsorise must lie in [0, 1) (0 disables capping), "
+                f"got {self.omega_winsorise!r}"
+            )
+        self.anchor_mode = str(self.cfg.woe_anchor_mode)
+        # "output" is a functional penalty with no per-parameter anchor, so the
+        # proximal path never applies there.
+        self.use_proximal_anchor = (
+            self.anchor_mode == "proximal" and self.cfg.woe_reg_level != "output"
+        )
         self.reg_level = str(self.cfg.woe_reg_level)
         self.woe_lambda = float(self.cfg.woe_lambda)
         self.xi = float(self.cfg.woe_xi)
@@ -321,6 +428,41 @@ class Net(DetectionReplayMixin, nn.Module):
         self.mu_momentum = float(self.cfg.woe_mu_momentum)
         self.importance_stride = max(1, int(self.cfg.woe_importance_stride))
         self.conflict_weighting = bool(self.cfg.woe_conflict_weighting)
+        self.evidence_scale = str(getattr(args, "woe_evidence_scale", "weight"))
+        if self.evidence_scale not in _EVIDENCE_SCALES:
+            raise ValueError(
+                f"woe_evidence_scale must be one of {_EVIDENCE_SCALES}, "
+                f"got {self.evidence_scale!r}"
+            )
+        self.evidence_belief_tau = float(getattr(args, "woe_evidence_belief_tau", 1.0))
+        if self.evidence_belief_tau <= 0.0:
+            raise ValueError(
+                "woe_evidence_belief_tau must be positive, got "
+                f"{self.evidence_belief_tau}"
+            )
+        self.evidence_asymmetric = bool(getattr(args, "woe_evidence_asymmetric", False))
+        self.importance_scalar = str(getattr(args, "woe_importance_scalar", "i2"))
+        if self.importance_scalar not in _IMPORTANCE_SCALARS:
+            raise ValueError(
+                f"woe_importance_scalar must be one of {_IMPORTANCE_SCALARS}, "
+                f"got {self.importance_scalar!r}"
+            )
+        self.evidence_distill_lambda = float(
+            getattr(args, "woe_evidence_distill_lambda", 0.0)
+        )
+        if self.evidence_distill_lambda != 0.0 and self.cfg.woe_reg_level == "output":
+            raise ValueError(
+                "woe_evidence_distill_lambda adds the evidence-distillation term "
+                "alongside a parameter anchor; woe_reg_level='output' already "
+                "applies that term weighted by woe_lambda. Use one or the other."
+            )
+        self.lwf_lambda = float(getattr(args, "woe_lwf_lambda", 0.0))
+        self.lwf_temperature = float(getattr(args, "woe_lwf_temperature", 5.0))
+        if self.lwf_temperature <= 0.0:
+            raise ValueError(
+                f"woe_lwf_temperature must be positive, got {self.lwf_temperature}"
+            )
+        self.lwf_kl = nn.KLDivLoss(reduction="batchmean")
         self.clipgrad = self.cfg.clipgrad
         self.cls_lambda = float(self.cfg.cls_lambda)
         self._init_det_replay(
@@ -383,7 +525,7 @@ class Net(DetectionReplayMixin, nn.Module):
             # never pollutes the CE gradient. Sampled once per importance window.
             window_start = self._step_in_task % self.importance_stride == 0
             if use_path_integral and window_start:
-                self._capture_importance_gradient(x, t)
+                self._capture_importance_gradient(x, y, t)
 
             # ----- 2) Standard CE update (drives the parameters) -----------
             self.opt.zero_grad()
@@ -415,14 +557,37 @@ class Net(DetectionReplayMixin, nn.Module):
 
             if self.reg_level == "output":
                 reg = self._evidence_distillation_loss(x, t)
+            elif self.use_proximal_anchor:
+                # The anchor is applied in closed form after the optimiser step
+                # instead, so it contributes nothing to this backward pass -- and
+                # therefore nothing to the global gradient-norm clip budget.
+                reg = torch.zeros(1, device=self._device())
             else:
                 reg = self._surrogate_loss()
             loss = self.cls_lambda * loss_ce + self.woe_lambda * reg
+            if self.evidence_distill_lambda != 0.0:
+                # DS evidence distillation running *alongside* the parameter
+                # anchor rather than replacing it, mirroring how the LwF term
+                # attaches. reg_level='output' already applies this term as `reg`,
+                # so the two paths are mutually exclusive (validated in __init__).
+                loss = loss + self.evidence_distill_lambda * (
+                    self._evidence_distillation_loss(x, t)
+                )
+            if self.lwf_lambda != 0.0:
+                loss = loss + self.lwf_lambda * self._lwf_distillation_loss(
+                    cls_logits, x, t
+                )
+            # Rehearsal hook: no-op in base WoE-SI, a reservoir-replay CE term in
+            # the woe_si_replay subclass. Sampled before the current batch is
+            # written to the buffer so a sample never rehearses on itself.
+            loss = loss + self._classification_replay_loss(t)
 
             loss.backward()
             if self.clipgrad is not None:
                 torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.clipgrad)
             self.opt.step()
+            if self.use_proximal_anchor:
+                self._apply_proximal_anchor()
 
             # ----- 3) Accumulate the I_2 path integral over the window -----
             window_end = (
@@ -435,6 +600,9 @@ class Net(DetectionReplayMixin, nn.Module):
             self._step_in_task += 1
             metric_logits = logits_for_loss.detach()
 
+        # Store the current batch after the update so the reservoir reflects the
+        # stream. No-op in base WoE-SI (see the rehearsal hooks below).
+        self._store_classification_replay(x, y, t)
         return float(loss.item()), cls_tr_rec, metric_logits
 
     # ------------------------------------------------------------------
@@ -486,6 +654,60 @@ class Net(DetectionReplayMixin, nn.Module):
         self.register_buffer("woe_feature_mean", torch.zeros(self.feature_dim))
         self.register_buffer(
             "woe_feature_mean_initialised", torch.zeros(1, dtype=torch.bool)
+        )
+
+    # ------------------------------------------------------------------
+    def _importance_scalar(
+        self, x: torch.Tensor, y: torch.Tensor, t: int
+    ) -> torch.Tensor:
+        """Differentiable scalar whose path integral defines importance.
+
+        ``"i2"`` is WoE-SI proper. The others exist to ablate whether the
+        Dempster-Shafer construction is doing any work, or whether any scalar
+        that rises as the network commits would select the same parameters.
+        Each is normalised to an ``O(1)`` scale like ``I_2`` is, but they are not
+        on a *common* scale, so ``woe_lambda`` must be swept per scalar.
+
+        Args:
+            x: Current batch.
+            y: Current labels; used only by ``"ce"``.
+            t: Current task index.
+
+        Returns:
+            Scalar tensor, larger meaning "more committed / better fit".
+        """
+        if self.importance_scalar == "i2":
+            return self._compute_information_content(x, t, update_feature_mean=True)
+
+        features = self.net.forward_features(x, bn_training=False)
+        self._update_feature_mean(features.detach())
+        feature_count = features.shape[1]
+
+        if self.importance_scalar == "phi2":
+            return features.pow(2).sum(dim=1).mean() / float(feature_count)
+
+        logits = self.net.forward_classifier(features, bn_training=False)
+        if self.importance_scalar == "z2":
+            active = self._active_class_indices(t, features.device)
+            selected = logits.index_select(1, active)
+            return selected.pow(2).sum(dim=1).mean() / float(max(1, active.numel()))
+
+        # "ce": plain Synaptic Intelligence. Negated so that an increase still
+        # means the model improved, keeping the relu in consolidation (which
+        # protects parameters that *built* something) pointing the right way.
+        masked = misc_utils.apply_task_incremental_logit_mask(
+            logits,
+            t,
+            self.classes_per_task,
+            self.n_outputs,
+            cil_all_seen_upto_task=t,
+            global_noise_label=self.noise_label,
+            loader=self.incremental_loader_name,
+        )
+        return -classification_cross_entropy(
+            masked,
+            unpack_y_to_class_labels(y).long(),
+            class_weighted_ce=self.class_weighted_ce,
         )
 
     # ------------------------------------------------------------------
@@ -557,14 +779,18 @@ class Net(DetectionReplayMixin, nn.Module):
         )
 
     # ------------------------------------------------------------------
-    def _capture_importance_gradient(self, x: torch.Tensor, t: int) -> None:
-        """Backward ``I_2(m)`` into a scratch buffer (no CE-gradient pollution).
+    def _capture_importance_gradient(
+        self, x: torch.Tensor, y: torch.Tensor, t: int
+    ) -> None:
+        """Backward the importance scalar into a scratch buffer.
 
-        Stores ``h_i = dI_2/dtheta_i`` and a snapshot of ``theta_i`` at the start
-        of the importance window. ``torch.autograd.grad`` is used so parameter
-        ``.grad`` fields (owned by the CE optimiser step) are left untouched.
+        Stores ``h_i = d(scalar)/dtheta_i`` and a snapshot of ``theta_i`` at the
+        start of the importance window. ``torch.autograd.grad`` is used so
+        parameter ``.grad`` fields (owned by the CE optimiser step) are left
+        untouched. Which scalar is tracked is set by ``woe_importance_scalar``;
+        ``"i2"`` is the DS information content that defines the method.
         """
-        info_content = self._compute_information_content(x, t, update_feature_mean=True)
+        info_content = self._importance_scalar(x, y, t)
         params = [self._tracked_params[name] for name in self._tracked_names]
         grads = torch.autograd.grad(
             info_content, params, retain_graph=False, allow_unused=True
@@ -623,9 +849,18 @@ class Net(DetectionReplayMixin, nn.Module):
                 omega.copy_(per_channel.expand_as(omega))
             prev.copy_(param.detach())
             w_buf.zero_()
+        # Cap the tail once every buffer for this task has been folded in, so the
+        # quantile is taken over the final cumulative Omega.
+        self._winsorise_omega()
         # Output mode distils a frozen end-of-task snapshot; capture it (and the
         # feature mean it must centre with) *before* the per-task stats are reset.
-        if self.reg_level == "output":
+        # The LwF logit-distillation term needs the same teacher, and is available
+        # alongside any reg_level, so either consumer triggers the snapshot.
+        if (
+            self.reg_level == "output"
+            or self.lwf_lambda != 0.0
+            or self.evidence_distill_lambda != 0.0
+        ):
             self._snapshot_teacher()
         # Reset running feature stats for the next task.
         self.woe_feature_mean.zero_()
@@ -633,6 +868,66 @@ class Net(DetectionReplayMixin, nn.Module):
         self._step_in_task = 0
         self._window_h.clear()
         self._window_p_start.clear()
+
+    # ------------------------------------------------------------------
+    def _lwf_distillation_loss(
+        self, student_logits: torch.Tensor, x: torch.Tensor, t: int
+    ) -> torch.Tensor:
+        """Learning-without-Forgetting logit distillation on previous classes.
+
+        Temperature-scaled KL between the student's and a frozen teacher's softmax
+        over the columns of completed tasks, scaled by ``T^2`` so its gradient
+        magnitude is comparable to the cross-entropy it accompanies. This mirrors
+        ``model.lwf.Net._distillation_loss`` exactly, so a WoE-SI run with
+        ``woe_lambda=0`` and ``woe_lwf_lambda>0`` is an LwF control sharing this
+        module's optimiser, masking and BatchNorm handling.
+
+        Orthogonal to the ``I_2`` anchor by construction: the anchor constrains
+        *parameters* via the DS path integral, this constrains the *function* at
+        the readout. Both can be active at once, which is what makes a 2x2
+        stacking test possible in one code path.
+
+        Args:
+            student_logits: Unmasked class logits of the live network.
+            x: The current batch, re-run through the frozen teacher.
+            t: Current task index. Returns 0 on the first task.
+
+        Returns:
+            Scalar distillation loss; exactly 0 before a teacher exists.
+        """
+        if self.teacher is None:
+            return torch.zeros(1, device=student_logits.device)
+        previous = self._previous_class_indices(t, student_logits.device)
+        if previous.numel() == 0:
+            return torch.zeros(1, device=student_logits.device)
+
+        student_previous = student_logits.index_select(1, previous)
+        with torch.no_grad():
+            # bn_training=True scores the teacher on the *current batch's*
+            # statistics rather than the running statistics it froze with. That
+            # matches `model.lwf` (which calls `self.teacher(x)`, and ResNet1D's
+            # forward runs `self.model.train(bn_training)`), and it is the right
+            # choice here rather than an accident: consecutive tasks are different
+            # radar datasets, so a teacher normalised with the previous task's
+            # statistics is evaluated under distribution shift and its targets are
+            # correspondingly degraded. Measured on task 1, freezing the
+            # statistics instead drops the distillation loss from 1.059 to 0.475
+            # and costs 0.068 of final macro recall (0.4766 -> 0.4087).
+            #
+            # `_snapshot_teacher` zeroes the teacher's BatchNorm momentum, so this
+            # forward uses batch statistics *without* mutating the frozen running
+            # buffers -- unlike `model.lwf`, where each distillation pass updates
+            # them. Those buffers are never read in this mode, so the numerics
+            # match `model.lwf` exactly; the teacher simply stays genuinely frozen.
+            teacher_logits = self.teacher.forward_heads(x, bn_training=True)[1]
+            teacher_probs = torch.softmax(
+                teacher_logits.index_select(1, previous) / self.lwf_temperature,
+                dim=1,
+            )
+        student_log_probs = torch.log_softmax(
+            student_previous / self.lwf_temperature, dim=1
+        )
+        return self.lwf_kl(student_log_probs, teacher_probs) * (self.lwf_temperature**2)
 
     # ------------------------------------------------------------------
     def _snapshot_teacher(self) -> None:
@@ -647,6 +942,16 @@ class Net(DetectionReplayMixin, nn.Module):
         self.teacher.eval()
         for param in self.teacher.parameters():
             param.requires_grad = False
+        # Zero the BatchNorm momentum so a `bn_training=True` teacher forward
+        # normalises with batch statistics but leaves the running buffers exactly
+        # where they were frozen: the update is
+        # `(1 - momentum) * running + momentum * batch`. Without this, every
+        # distillation pass would drift the "frozen" reference toward the current
+        # task. `.eval()` alone cannot achieve it -- ResNet1D.forward calls
+        # `self.model.train(bn_training)` and overrides module mode.
+        for module in self.teacher.modules():
+            if isinstance(module, nn.modules.batchnorm._BatchNorm):
+                module.momentum = 0.0
         self.teacher_feature_mean = self.woe_feature_mean.detach().clone()
 
     # ------------------------------------------------------------------
@@ -669,6 +974,76 @@ class Net(DetectionReplayMixin, nn.Module):
         return loss
 
     # ------------------------------------------------------------------
+    @torch.no_grad()
+    def _apply_proximal_anchor(self) -> None:
+        """Apply the quadratic anchor as a closed-form post-step update.
+
+        The loss form takes an explicit gradient step on ``lambda*Omega*(theta -
+        theta*)^2``, whose curvature is ``k = 2*lambda*Omega``. Explicit descent on
+        a quadratic is stable only while ``lr*k < 2``; the path integral is heavy
+        tailed enough that a few parameters land far outside that window, diverge,
+        and -- because ``clip_grad_norm_`` rescales every gradient by one global
+        scalar -- drag the whole network's effective learning rate down with them.
+
+        The proximal (backward-Euler) form evaluates the anchor gradient at the
+        *new* point, ``theta_new = theta+ - lr*2*lambda*Omega*(theta_new -
+        theta*)``, which solves in closed form to a convex combination::
+
+            b = 2 * lr * lambda * Omega
+            theta_new = (theta+ + b * theta*) / (1 + b)
+                      = (1 - a) * theta+ + a * theta*,   a = b/(1+b) in [0, 1)
+
+        Because ``a`` saturates at 1 for any ``Omega``, the update can never
+        overshoot the anchor: ``Omega -> 0`` leaves the parameter free and
+        ``Omega -> inf`` pins it exactly to ``theta*``. It is also a no-op on the
+        first task, where ``Omega`` is still all zeros.
+        """
+        learning_rate = float(self.opt.param_groups[0]["lr"])
+        scale = 2.0 * learning_rate * self.woe_lambda
+        if scale == 0.0:
+            return
+        for name in self._tracked_names:
+            param = self._tracked_params[name]
+            key = self._param_to_key[name]
+            omega = getattr(self, f"{key}_woe_omega")
+            prev = getattr(self, f"{key}_woe_prev")
+            b = omega * scale
+            param.copy_((param + b * prev) / (1.0 + b))
+
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def _winsorise_omega(self) -> None:
+        """Cap cumulative ``Omega`` at a global quantile across all buffers.
+
+        The per-parameter path integral is heavy tailed -- in practice a handful
+        of weights accumulate importance orders of magnitude above the 99th
+        percentile, which is what pushes the loss-form anchor outside its
+        stability window. Capping at ``woe_omega_winsorise`` bounds the curvature
+        while leaving the relative ordering of every other parameter untouched.
+
+        The quantile is taken over the concatenation of all tracked buffers, not
+        per tensor, because the tail is concentrated in one layer -- a per-tensor
+        cap would simply rescale that layer's own outliers against each other.
+        ``kthvalue`` is used rather than ``torch.quantile`` so the computation is
+        exact regardless of parameter count (``quantile`` caps out around 2**24).
+        """
+        if self.omega_winsorise <= 0.0:
+            return
+        buffers = [
+            getattr(self, f"{self._param_to_key[name]}_woe_omega")
+            for name in self._tracked_names
+        ]
+        if not buffers:
+            return
+        flat = torch.cat([buf.reshape(-1) for buf in buffers])
+        index = max(
+            1, min(flat.numel(), int(round(self.omega_winsorise * flat.numel())))
+        )
+        cap = torch.kthvalue(flat.float(), index).values
+        for buf in buffers:
+            buf.clamp_(max=cap.to(buf.dtype))
+
+    # ------------------------------------------------------------------
     def _evidence_distillation_loss(self, x: torch.Tensor, t: int) -> torch.Tensor:
         """Output-level penalty: drift of the DS evidence vs. a frozen teacher.
 
@@ -679,11 +1054,24 @@ class Net(DetectionReplayMixin, nn.Module):
 
             L = mean_b  sum_{k in old}  (w+_s - w+_t)^2 + (w-_s - w-_t)^2
 
+        Student and teacher are centred with the **same** feature mean -- the
+        teacher's snapshot. Centring is a choice of reference point for the
+        Least-Commitment decomposition (``w_jk = beta_kj (phi_j - mu_j) +
+        beta_0k/J``), so scoring the two networks against different ``mu`` leaves a
+        reference shift inside the measured "drift": an *unchanged* network then
+        scores a non-zero penalty. Measured on the 10-task TIL run, distilling a
+        network against an exact copy of itself accounted for 22-70% of the total
+        penalty before this was fixed. Using the teacher's ``mu`` for both also
+        keeps the target fixed for the duration of the task, where the live EMA
+        would drift under the student even though the teacher is frozen.
+
         ``J^2``-normalised to match the ``I_2`` importance signal's scale (see
         ``_compute_information_content``). Returns exactly ``0`` before the first
         teacher exists, mirroring the SI penalty being 0 on the first task. The
         running feature mean is EMA-updated here so output mode (which skips the
-        importance path) still tracks ``mu`` for centring.
+        importance path) still tracks ``mu`` -- not to centre this comparison, but
+        so the *next* ``_snapshot_teacher`` inherits the statistics of the task it
+        was frozen on.
         """
         features = self.net.forward_features(x, bn_training=False)
         self._update_feature_mean(features.detach())
@@ -700,8 +1088,12 @@ class Net(DetectionReplayMixin, nn.Module):
                 distill_x = torch.cat([x, replay[0].to(x.device)], dim=0)
                 features = self.net.forward_features(distill_x, bn_training=False)
 
+        # Both networks are centred with the teacher's mu: a shared reference is
+        # what makes the difference measure evidence drift rather than a shift in
+        # centring statistics. See the docstring.
+        centring_mean = self.teacher_feature_mean
         student_w = self._weights_of_evidence(
-            features, self.net.model.fc, active, self.woe_feature_mean
+            features, self.net.model.fc, active, centring_mean
         )
         w_plus_s, w_minus_s = per_class_total_evidence(student_w)
         with torch.no_grad():
@@ -712,13 +1104,115 @@ class Net(DetectionReplayMixin, nn.Module):
                 teacher_features,
                 self.teacher.model.fc,
                 active,
-                self.teacher_feature_mean,
+                centring_mean,
             )
             w_plus_t, w_minus_t = per_class_total_evidence(teacher_w)
 
-        feature_count = features.shape[1]
-        drift = (w_plus_s - w_plus_t).pow(2) + (w_minus_s - w_minus_t).pow(2)
-        return drift.sum(dim=1).mean() / float(feature_count * feature_count)
+        student = self._to_penalty_scale(w_plus_s, w_minus_s)
+        teacher = self._to_penalty_scale(w_plus_t, w_minus_t)
+        drift = self._drift_terms(student, teacher)
+        return drift.sum(dim=1).mean() / self._evidence_normaliser(features.shape[1])
+
+    # ------------------------------------------------------------------
+    def _drift_terms(
+        self,
+        student: Tuple[torch.Tensor, torch.Tensor],
+        reference: Tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        """Per-class penalty between a student and a reference evidence pair.
+
+        Symmetric by default -- any movement away from the reference is charged.
+        Under ``woe_evidence_asymmetric`` only *deterioration* is charged: support
+        for the class falling, or evidence against it rising. Improvement is then
+        free, so the term never competes for capacity the old tasks do not need.
+
+        The squared hinge is C^1 (its derivative ``2*relu(.)`` is continuous at the
+        kink), so the asymmetric form is no harder to optimise than the symmetric
+        one. Note it also removes the upper arm that pinned the evidence scale --
+        pair it with ``woe_evidence_scale='belief'``, which is bounded, or the
+        constraint becomes satisfiable by inflating the readout.
+
+        WARNING -- asymmetry is only sound where the reference was recorded on the
+        *same* inputs it is scored on. That holds for ``woe_si_replay``'s decay
+        penalty, which re-evaluates each stored item against its own snapshot. It
+        does **not** hold in output mode, where the frozen teacher is scored on
+        *current-task* data: there the second arm reads "evidence against an old
+        class must not rise on new-task inputs", which forbids exactly what the
+        model should be learning, since new-task samples genuinely are not members
+        of the old classes. Measured on the 10-task TIL run, output mode with
+        ``woe_evidence_asymmetric`` at lambda=1 gives BWT -0.4383 against naive
+        fine-tuning's ~-0.37, i.e. worse retention than no penalty at all, while
+        the diagonal stays healthy at 0.6221. Use the symmetric form in output
+        mode; "match the teacher" is direction-neutral and carries no such
+        assumption.
+
+        Args:
+            student: ``(w_plus, w_minus)`` of the live network, shape ``(batch, K)``.
+            reference: ``(w_plus, w_minus)`` of the frozen teacher or snapshot.
+
+        Returns:
+            Per-class penalty with shape ``(batch, K)``.
+        """
+        student_plus, student_minus = student
+        reference_plus, reference_minus = reference
+        if self.evidence_asymmetric:
+            return torch.relu(reference_plus - student_plus).pow(2) + torch.relu(
+                student_minus - reference_minus
+            ).pow(2)
+        return (student_plus - reference_plus).pow(2) + (
+            student_minus - reference_minus
+        ).pow(2)
+
+    # ------------------------------------------------------------------
+    def _to_penalty_scale(
+        self, w_plus: torch.Tensor, w_minus: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Map a ``(w_plus, w_minus)`` pair onto the configured penalty scale.
+
+        Identity under ``woe_evidence_scale='weight'``. Under ``'belief'`` both
+        channels go through :func:`evidence_to_belief`, which is monotone -- so a
+        stored snapshot can stay in weight space and be converted here.
+
+        The two channels are transformed *separately* rather than combined into
+        ``Bel({theta_k})``. That is deliberate: the asymmetric penalty makes two
+        independent one-sided statements (support must not fall, counter-evidence
+        must not rise), and combining the channels would let a drop in support be
+        repaired by suppressing counter-evidence instead.
+
+        Args:
+            w_plus: Positive total evidence ``(batch, K)``.
+            w_minus: Negative total evidence ``(batch, K)``.
+
+        Returns:
+            The pair mapped onto the penalty scale, shapes unchanged.
+        """
+        if self.evidence_scale != "belief":
+            return w_plus, w_minus
+        tau = self.evidence_belief_tau
+        return evidence_to_belief(w_plus, tau), evidence_to_belief(w_minus, tau)
+
+    # ------------------------------------------------------------------
+    def _evidence_normaliser(self, feature_count: int) -> float:
+        """Scale divisor for the functional penalties, which differs per scale.
+
+        A squared difference of weights was assumed to be ``O(J^2)``, since
+        ``w_plus`` sums up to ``J`` non-negative terms. Measured on the 10-task TIL
+        run it is not: ``w_plus`` reaches a median of 3.5 and a max of 11.7, not
+        ~512, so the ``J^2`` divisor over-normalises by roughly 4000x and forces a
+        correspondingly large ``lambda``. It is kept for the weight scale so
+        existing tuned values stay valid. Beliefs are ``O(1)`` and take no divisor.
+
+        Consequence: ``lambda`` does **not** transfer between the two scales.
+
+        Args:
+            feature_count: Readout input width ``J``.
+
+        Returns:
+            Divisor applied after averaging over the batch.
+        """
+        if self.evidence_scale == "belief":
+            return 1.0
+        return float(feature_count * feature_count)
 
     # ------------------------------------------------------------------
     def _update_feature_mean(self, batch_features: torch.Tensor) -> None:
@@ -805,6 +1299,42 @@ class Net(DetectionReplayMixin, nn.Module):
     def _compute_offsets(self, task: int) -> Tuple[int, int]:
         offset1, offset2 = misc_utils.compute_offsets(task, self.classes_per_task)
         return offset1, min(self.n_outputs, offset2)
+
+    # ------------------------------------------------------------------
+    def _classification_replay_loss(self, t: int) -> torch.Tensor:
+        """Extra classification loss from a rehearsal buffer (hook).
+
+        Base WoE-SI is a pure regularisation method and keeps no rehearsal
+        buffer, so this returns exactly ``0``. The ``woe_si_replay`` subclass
+        overrides it to add an experience-replay cross-entropy term over a
+        reservoir sample of previously-seen batches.
+
+        Args:
+            t: Current task index (unused in the base no-op).
+
+        Returns:
+            A scalar loss contribution; zero in the base learner.
+        """
+        del t
+        return torch.zeros(1, device=self._device())
+
+    # ------------------------------------------------------------------
+    def _store_classification_replay(
+        self, x: torch.Tensor, y: torch.Tensor, t: int
+    ) -> None:
+        """Write the current batch into a rehearsal buffer (hook).
+
+        No-op in base WoE-SI; overridden by ``woe_si_replay`` to feed its
+        reservoir buffer. Kept separate from the detector-replay buffer that
+        ``DetectionReplayMixin`` maintains for the detection head.
+
+        Args:
+            x: Current input batch.
+            y: Current (possibly packed) labels.
+            t: Current task index.
+        """
+        del x, y, t
+        return None
 
     # ------------------------------------------------------------------
     def _device(self) -> torch.device:

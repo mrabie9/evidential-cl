@@ -1,0 +1,49 @@
+model: woe_si_replay
+loader: task_incremental_loader
+lr: 0.003
+
+# The parameter anchor is off so the sweep isolates what the *evidence* term adds
+# on top of ordinary experience replay. A 2x2 over the full task sequence found the
+# anchor contributes nothing once replay is present, so leaving it on would only
+# confound this measurement.
+woe_lambda: 0.0
+woe_reg_level: parameter
+woe_centering_mode: centered_uniform
+woe_mu_momentum: 0.9
+woe_conflict_weighting: false
+
+# Reservoir experience replay.
+woe_replay_memories: 5120
+woe_replay_batch_size: 128
+woe_replay_lambda: 1.0
+
+# "both" = rehearsal cross-entropy plus the one-sided evidence-decay penalty, so
+# woe_evidence_lambda = 0 recovers plain ER exactly and sits inside the sweep as
+# its own control arm.
+woe_replay_mode: both
+woe_evidence_readout_only: true
+
+# Belief scale: the hinge is charged on 1 - exp(-w / tau), the mass each evidence
+# channel commits, rather than on the raw weight of evidence. Weights are unbounded
+# above, so a one-sided "must not decrease" penalty on them is satisfiable by
+# inflating the readout -- w is linear in it, so one global rescale clears every
+# such constraint at once, and current-task CE pushes that way anyway because it
+# sharpens the softmax. Beliefs saturate at 1, so that route stops paying.
+woe_evidence_scale: belief
+
+# tau is set from measurement, not taste. Probed over task 0 of the 10-task TIL
+# run, w_plus climbs 0.05 -> 0.52 -> 0.73 -> 3.50 (median) across the first 50
+# steps, reaching p90 7.85 / max 11.7 and still rising. At tau = 1 the median is
+# already at belief 0.970 and the p90 at 0.9996, i.e. on the flat tail; past
+# w = 16.6 float32 rounds the belief to exactly 1 and the gradient is exactly 0,
+# so the penalty would go silently inert mid-task. tau = 8 maps that measured
+# range onto belief 0.35-0.77, which is the responsive part of the curve.
+woe_evidence_belief_tau: 8.0
+
+# NOT transferable from woe_si_replay_evidence.yaml. That config divides the
+# penalty by J^2 = 262144 because a squared difference of weights was assumed to
+# be O(J^2); the measured w_plus is 3-12, not ~512, so the raw term there lands at
+# 1e-4 and needs lambda ~ 1e4 to register. Belief-scale terms are O(1) and take no
+# divisor, so the same penalty strength sits several decades lower. Sweep at least
+# [1, 10, 100, 1000] before reading anything into the result.
+woe_evidence_lambda: 100.0

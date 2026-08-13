@@ -51,6 +51,15 @@ COMMON_TYPE_HINTS: Dict[str, type] = {
     "woe_mu_momentum": float,
     "woe_importance_stride": int,
     "woe_conflict_weighting": bool,
+    "woe_reg_level": str,
+    "woe_anchor_mode": str,
+    "anchor_mode": str,
+    "woe_omega_winsorise": float,
+    "woe_replay_memories": int,
+    "woe_replay_batch_size": int,
+    "woe_replay_lambda": float,
+    "woe_replay_mode": str,
+    "woe_evidence_lambda": float,
     "clipgrad_norm": float,
     "optimizer": str,
     "smax": float,
@@ -203,7 +212,7 @@ TUNING_PRESETS: Dict[str, TuningPreset] = {
                     "factors": (0.5, 1.0, 2.0),
                     "min": 0.1,
                     "fallback": 1.0,
-                    "values": [1, 10, 100, 1000, 10000],
+                    "values": [0.1, 0.5, 1, 10],  # , 100, 1000, 10000],
                 },
                 "beta": {
                     "kind": "float",
@@ -347,7 +356,7 @@ TUNING_PRESETS: Dict[str, TuningPreset] = {
                     "factors": (0.5, 1.0, 2.0),
                     "min": 0.1,
                     "fallback": 1.0,
-                    "values": [0.1, 0.5, 1, 5, 10, 50, 100, 500],
+                    "values": [0.1, 0.5, 1, 5, 10],  # , 50, 100, 500],
                 },
             }
         ),
@@ -879,6 +888,152 @@ TUNING_PRESETS: Dict[str, TuningPreset] = {
                     "min": 1e-5,
                     "fallback": 1e-3,
                     "values": [1e-4, 1e-3, 1e-2],
+                },
+            }
+        ),
+    ),
+    "woe_si_output": TuningPreset(
+        model_name="woe_si",
+        description=(
+            "Run grid or random search over Weight-of-Evidence SI hyperparameters "
+            "with woe_reg_level='output' (DS evidence distillation)."
+        ),
+        default_config="configs/models/til/woe_si_output.yaml",
+        default_output_root="logs/tuning/woe_si_output",
+        type_hints=COMMON_TYPE_HINTS,
+        grid_factory=make_grid_factory(
+            {
+                "lr": {
+                    "kind": "float",
+                    "factors": (0.5, 1.0, 2.0),
+                    "min": 1e-5,
+                    "fallback": 3e-3,
+                    "values": [0.01, 0.003, 0.001, 0.0003, 0.0001],
+                },
+                "woe_lambda": {
+                    # Output mode is a functional penalty, NOT the SI path
+                    # integral, so it needs its own range -- the [1e2, 1e5] grid in
+                    # the "woe_si" preset is meaningless here. Measured on the
+                    # 10-task TIL run (see the probe in the tuning docstring): the
+                    # raw distillation term is 0.0009-0.038 while CE is 0.42-0.88,
+                    # so CE/reg spans 23-464 and lambda ~ 100 balances it. This
+                    # grid spans negligible (1) through balanced (~100) to
+                    # dominant (3000, the value inherited from the parameter grid
+                    # that produced a final macro-F1 of 0.107).
+                    "kind": "float",
+                    "factors": (0.5, 1.0, 2.0),
+                    "min": 0.1,
+                    "fallback": 100.0,
+                    "values": [1.0, 3.0, 10.0, 30.0, 100.0, 300.0, 1000.0, 3000.0],
+                },
+                # woe_xi is deliberately absent: output mode sets
+                # use_path_integral=False, so Omega is never accumulated and xi
+                # cannot affect the loss.
+            }
+        ),
+    ),
+    "woe_si_replay_evidence": TuningPreset(
+        model_name="woe_si_replay",
+        description=(
+            "Run grid or random search over the evidence-decay replay penalty "
+            "(woe_replay_mode='both'), sweeping woe_evidence_lambda."
+        ),
+        default_config="configs/models/til/woe_si_replay_evidence.yaml",
+        default_output_root="logs/tuning/woe_si_replay_evidence",
+        type_hints=COMMON_TYPE_HINTS,
+        grid_factory=make_grid_factory(
+            {
+                "lr": {
+                    "kind": "float",
+                    "factors": (0.5, 1.0, 2.0),
+                    "min": 1e-5,
+                    "fallback": 3e-3,
+                    "values": [0.01, 0.003, 0.001, 0.0003, 0.0001],
+                },
+                "woe_evidence_lambda": {
+                    # The one-sided, J^2-normalised decay term is much smaller than
+                    # the cross-entropy: measured on the 10-task TIL run it is
+                    # 0.00019-0.00062 against a CE of 0.60-1.01, so CE/decay spans
+                    # 1638-4508 (geometric centre ~2800) and lambda ~ 3000 balances
+                    # the two. Distinct from woe_replay_lambda and from every
+                    # woe_lambda grid; do not transfer values between them.
+                    #
+                    # 0.0 is deliberately on the grid: with woe_replay_mode='both'
+                    # it recovers plain experience replay exactly, so the sweep
+                    # contains its own null arm and can show whether the evidence
+                    # term helps at all rather than only which positive value is
+                    # least bad.
+                    "kind": "float",
+                    "factors": (0.5, 1.0, 2.0),
+                    "min": 0.0,
+                    "fallback": 3000.0,
+                    "values": [
+                        0.0,
+                        10.0,
+                        30.0,
+                        100.0,
+                        300.0,
+                        1000.0,
+                        3000.0,
+                        10000.0,
+                        30000.0,
+                    ],
+                },
+            }
+        ),
+    ),
+    "woe_si_replay": TuningPreset(
+        model_name="woe_si_replay",
+        description=(
+            "Run grid or random search over Weight-of-Evidence SI + reservoir "
+            "replay hyperparameters."
+        ),
+        default_config="configs/models/til/woe_si_replay.yaml",
+        default_output_root="logs/tuning/woe_si_replay",
+        type_hints=COMMON_TYPE_HINTS,
+        grid_factory=make_grid_factory(
+            {
+                # Shared WoE-SI regularisation knobs (see the "woe_si" preset).
+                "lr": {
+                    "kind": "float",
+                    "factors": (0.5, 1.0, 2.0),
+                    "min": 1e-5,
+                    "fallback": 1e-3,
+                    "values": [
+                        0.03,
+                        0.01,
+                        0.003,
+                        0.001,
+                        0.0003,
+                        0.0001,
+                        0.00003,
+                        0.00001,
+                    ],
+                },
+                "woe_lambda": {
+                    "kind": "float",
+                    "factors": (0.5, 1.0, 2.0),
+                    "min": 1.0,
+                    "fallback": 1000.0,
+                    "values": [
+                        100.0,
+                        300.0,
+                        1000.0,
+                        3000.0,
+                        10000.0,
+                        30000.0,
+                        100000.0,
+                    ],
+                },
+                # Replay-specific knobs. woe_replay_lambda weights the rehearsal
+                # cross-entropy against the DS regularisation; woe_replay_memories
+                # is the reservoir buffer capacity.
+                "woe_replay_lambda": {
+                    "kind": "float",
+                    "factors": (0.5, 1.0, 2.0),
+                    "min": 0.0,
+                    "fallback": 1.0,
+                    "values": [0.25, 0.5, 1.0, 2.0, 5.0],
                 },
             }
         ),

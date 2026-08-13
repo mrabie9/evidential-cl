@@ -76,11 +76,17 @@ class HatConfig:
     @staticmethod
     def from_args(args: object) -> "HatConfig":
         cfg = HatConfig()
-        # Override defaults with any args attributes that match
+        # Override defaults with any args attributes that match. `None` means the
+        # argument was registered but never set -- the parser gives `gamma` a None
+        # default because MER uses the same flag name for a different quantity --
+        # so the dataclass default stands.
         for field in cfg.__dataclass_fields__:
-            if hasattr(args, field):
-                setattr(cfg, field, getattr(args, field))
-        if hasattr(args, "clipgrad") and not hasattr(args, "grad_clip_norm"):
+            value = getattr(args, field, None)
+            if value is not None:
+                setattr(cfg, field, value)
+        if getattr(args, "clipgrad", None) is not None and not hasattr(
+            args, "grad_clip_norm"
+        ):
             cfg.grad_clip_norm = getattr(args, "clipgrad")
         return cfg
 

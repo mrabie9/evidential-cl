@@ -35,7 +35,11 @@ n_epochs: 5
 optimizer: sgd
 batch_size: 256
 replay_batch_size: 64
-clipgrad: 5.0
+# `clipgrad` was here. It never reached any model -- no argparse argument
+# declares that dest -- so every tuning run to date clipped at each
+# learner's own default (100 for SI/RWalk/WoE-SI, 5 for EWC, 10 for UCL).
+# Registering it now would silently change all of those, so it is removed
+# instead. `grad_clip_norm` below is the one that actually applies.
 grad_clip_norm: 5.0
 
 # La-MAML parameters
@@ -47,10 +51,13 @@ alpha_init: 0.001  # initialization for the LRs
 memories: 5120
 n_memories: 5120  # total replay-buffer capacity across all tasks
 
-# Parameters specific to MER
-gamma: 1.0  # gamma learning rate parameter
-beta: 0.1  # beta learning rate parameter
-s: 1.0  # current example learning rate multiplier (s)
+# Parameters specific to MER were removed here. `beta` is not MER-specific as a
+# flag name -- ucl_bresnet, bcl_dual and bcl_single all have a `beta` config
+# field with different meanings and different defaults -- so once `--beta` is a
+# registered argument (it has to be, for UCL) a value left here reaches all of
+# them. It had never applied to anything: unregistered YAML keys are dropped by
+# parser._apply_config_overrides, and there is no MER tuning preset. Set MER's
+# gamma/beta/s on the command line if MER is ever tuned.
 
 # Parameters specific to Meta-BGD
 bgd_optimizer: bgd  # Optimizer (choices: [adam, adagrad, bgd, sgd])

@@ -25,6 +25,7 @@ if ROOT not in sys.path:
 from model.woe_si import (
     Net,
     compute_weights_of_evidence,
+    evidence_to_belief,
     information_content,
     per_class_total_evidence,
 )
@@ -61,6 +62,15 @@ def _make_args(loader: str, **overrides) -> object:
     o.woe_importance_stride = overrides.get("woe_importance_stride", 1)
     o.woe_conflict_weighting = overrides.get("woe_conflict_weighting", False)
     o.woe_reg_level = overrides.get("woe_reg_level", "parameter")
+    o.woe_evidence_scale = overrides.get("woe_evidence_scale", "weight")
+    o.woe_evidence_belief_tau = overrides.get("woe_evidence_belief_tau", 1.0)
+    o.woe_evidence_asymmetric = overrides.get("woe_evidence_asymmetric", False)
+    o.woe_importance_scalar = overrides.get("woe_importance_scalar", "i2")
+    o.woe_lwf_lambda = overrides.get("woe_lwf_lambda", 0.0)
+    o.woe_evidence_distill_lambda = overrides.get("woe_evidence_distill_lambda", 0.0)
+    o.woe_lwf_temperature = overrides.get("woe_lwf_temperature", 5.0)
+    o.woe_omega_winsorise = overrides.get("woe_omega_winsorise", 0.0)
+    o.woe_anchor_mode = overrides.get("woe_anchor_mode", "loss")
     return o
 
 
@@ -506,3 +516,585 @@ def test_integration_woe_si_reduces_forgetting_vs_naive() -> None:
     assert woe["omega"] > 0.0
     assert woe["bwt"] >= naive["bwt"] - 0.05
     assert woe["task0_retained"] >= naive["task0_retained"] - 0.05
+
+
+# ----------------------------------------------------------------------
+# Proximal anchor and Omega winsorisation
+# ----------------------------------------------------------------------
+def _set_omega(model: Net, name: str, value: float) -> None:
+    """Force one tracked buffer's cumulative ``Omega`` to a constant."""
+    key = model._param_to_key[name]
+    getattr(model, f"{key}_woe_omega").fill_(value)
+
+
+def test_proximal_anchor_matches_closed_form() -> None:
+    """The post-step update equals ``(theta + b*theta*) / (1 + b)`` exactly."""
+    model = Net(
+        1, 6, 2, _make_args("task_incremental_loader", woe_anchor_mode="proximal")
+    )
+    name = model._tracked_names[0]
+    key = model._param_to_key[name]
+    param = model._tracked_params[name]
+
+    omega_value, lr, lam = (
+        0.25,
+        float(model.opt.param_groups[0]["lr"]),
+        model.woe_lambda,
+    )
+    _set_omega(model, name, omega_value)
+    getattr(model, f"{key}_woe_prev").fill_(0.5)
+
+    before = param.detach().clone()
+    model._apply_proximal_anchor()
+
+    b = 2.0 * lr * lam * omega_value
+    expected = (before + b * 0.5) / (1.0 + b)
+    assert torch.allclose(param.detach(), expected, atol=1e-6)
+
+
+def test_proximal_anchor_never_overshoots() -> None:
+    """For any Omega the result stays on the segment between theta and theta*."""
+    model = Net(
+        1, 6, 2, _make_args("task_incremental_loader", woe_anchor_mode="proximal")
+    )
+    name = model._tracked_names[0]
+    key = model._param_to_key[name]
+    param = model._tracked_params[name]
+    anchor = 0.5
+
+    # 1e6 puts lr*k ~ 1e7, far outside the explicit-step stability window lr*k < 2.
+    for omega_value in (0.0, 1.0, 1e3, 1e6):
+        with torch.no_grad():
+            param.fill_(2.0)
+        _set_omega(model, name, omega_value)
+        getattr(model, f"{key}_woe_prev").fill_(anchor)
+        model._apply_proximal_anchor()
+
+        updated = param.detach()
+        assert torch.isfinite(updated).all()
+        # Convex combination of 2.0 and 0.5 => must lie within [0.5, 2.0].
+        assert (updated >= anchor - 1e-6).all() and (updated <= 2.0 + 1e-6).all()
+
+
+def test_proximal_anchor_pins_as_omega_grows() -> None:
+    """Omega -> inf drives the parameter onto its anchor; Omega = 0 leaves it free."""
+    model = Net(
+        1, 6, 2, _make_args("task_incremental_loader", woe_anchor_mode="proximal")
+    )
+    name = model._tracked_names[0]
+    key = model._param_to_key[name]
+    param = model._tracked_params[name]
+    getattr(model, f"{key}_woe_prev").fill_(0.5)
+
+    with torch.no_grad():
+        param.fill_(2.0)
+    _set_omega(model, name, 0.0)
+    model._apply_proximal_anchor()
+    assert torch.allclose(param.detach(), torch.full_like(param, 2.0))
+
+    with torch.no_grad():
+        param.fill_(2.0)
+    _set_omega(model, name, 1e12)
+    model._apply_proximal_anchor()
+    assert torch.allclose(param.detach(), torch.full_like(param, 0.5), atol=1e-4)
+
+
+def test_proximal_mode_keeps_anchor_out_of_the_backward_pass() -> None:
+    """In proximal mode the surrogate penalty contributes no gradient."""
+    args = _make_args("task_incremental_loader", woe_anchor_mode="proximal")
+    model = Net(1, 6, 2, args)
+    name = model._tracked_names[0]
+    _set_omega(model, name, 10.0)
+    getattr(model, f"{model._param_to_key[name]}_woe_prev").fill_(0.5)
+
+    assert model.use_proximal_anchor
+    # The loss-form penalty would be large here; proximal mode must not add it.
+    assert model._surrogate_loss().item() > 0.0
+    x = torch.randn(4, 2, 1024)
+    y = torch.randint(0, 3, (4,))
+    loss, _, _ = model.observe(x, y, 0)
+    assert torch.isfinite(torch.tensor(loss))
+
+
+def test_winsorise_caps_omega_at_the_requested_quantile() -> None:
+    """Capping bounds the tail without disturbing sub-quantile entries."""
+    model = Net(1, 6, 2, _make_args("task_incremental_loader", woe_omega_winsorise=0.9))
+    for name in model._tracked_names:
+        _set_omega(model, name, 1e-4)
+    spike_name = model._tracked_names[0]
+    spike_key = model._param_to_key[spike_name]
+    getattr(model, f"{spike_key}_woe_omega").reshape(-1)[0] = 1e6
+
+    model._winsorise_omega()
+
+    flat = torch.cat(
+        [
+            getattr(model, f"{model._param_to_key[n]}_woe_omega").reshape(-1)
+            for n in model._tracked_names
+        ]
+    )
+    assert flat.max().item() <= 1e-4 + 1e-9
+    assert torch.isfinite(flat).all()
+
+
+def test_winsorise_disabled_by_default() -> None:
+    """``woe_omega_winsorise = 0`` leaves the tail untouched."""
+    model = Net(1, 6, 2, _make_args("task_incremental_loader"))
+    name = model._tracked_names[0]
+    key = model._param_to_key[name]
+    _set_omega(model, name, 1e-4)
+    getattr(model, f"{key}_woe_omega").reshape(-1)[0] = 1e6
+
+    model._winsorise_omega()
+    assert getattr(model, f"{key}_woe_omega").reshape(-1)[0].item() == 1e6
+
+
+# ----------------------------------------------------------------------
+# Output mode: shared centring
+# ----------------------------------------------------------------------
+def test_output_mode_self_distillation_is_exactly_zero() -> None:
+    """A network distilled against a copy of itself must incur no penalty.
+
+    Before the centring fix the student used the live EMA ``woe_feature_mean``
+    while the teacher used its own snapshot, so the drift term absorbed the
+    difference between two reference points and an unchanged network scored a
+    non-zero loss (22-70% of the total on the 10-task run).
+    """
+
+    torch.manual_seed(7)
+    model = Net(1, 6, 2, _make_args("task_incremental_loader", woe_reg_level="output"))
+    x = torch.randn(8, 2, 1024)
+    y = torch.randint(0, 3, (8,))
+
+    # Establish a teacher and a live feature mean that deliberately disagree.
+    model.observe(x, y, 0)
+    model._snapshot_teacher()
+    model.woe_feature_mean.copy_(model.teacher_feature_mean + 3.0)
+
+    penalty = model._evidence_distillation_loss(x, 1)
+    assert float(penalty.item()) == 0.0
+
+
+def test_output_mode_still_detects_real_drift() -> None:
+    """The fix must not silence the penalty: a changed readout still registers."""
+    import copy
+
+    torch.manual_seed(8)
+    model = Net(1, 6, 2, _make_args("task_incremental_loader", woe_reg_level="output"))
+    x = torch.randn(8, 2, 1024)
+    y = torch.randint(0, 3, (8,))
+    model.observe(x, y, 0)
+    model._snapshot_teacher()
+
+    teacher_before = copy.deepcopy(model.teacher)
+    with torch.no_grad():
+        model.net.model.fc.weight.mul_(3.0)
+    model.teacher = teacher_before
+
+    assert float(model._evidence_distillation_loss(x, 1).item()) > 0.0
+
+
+# ----------------------------------------------------------------------
+# evidence_to_belief
+# ----------------------------------------------------------------------
+def test_evidence_to_belief_matches_the_simple_support_mass() -> None:
+    """Weight w leaves vacuous mass exp(-w), so the focal set gets 1 - exp(-w)."""
+    w = torch.tensor([0.0, 0.1, 0.5, 2.0, 8.0, 50.0])
+    torch.testing.assert_close(evidence_to_belief(w), 1.0 - torch.exp(-w))
+
+
+def test_evidence_to_belief_is_bounded_and_monotone() -> None:
+    """The map sends [0, inf) -> [0, 1) -- this is the whole point of using it.
+
+    The bound is ``<= 1.0`` rather than ``< 1.0`` because float32 rounds
+    ``1 - exp(-w)`` up to exactly 1 past ``w ~ 16.6``; see the hard-saturation
+    test below.
+    """
+    w = torch.linspace(0.0, 500.0, 2000)
+    belief = evidence_to_belief(w)
+    assert float(belief.min()) == 0.0
+    assert float(belief.max()) <= 1.0
+    assert bool((belief.diff() >= 0).all())
+
+
+def test_evidence_to_belief_saturates_hard_in_float32() -> None:
+    """Past w ~ 16.6 the belief is exactly 1 and the gradient is exactly 0.
+
+    This is a real constraint on using the transform, not a curiosity: the
+    penalty's gradient carries a factor ``exp(-w / tau)``, which underflows the
+    float32 gap below 1. If ``w_plus`` runs above ~16.6 the term is silently
+    dead, and ``temperature`` is mandatory rather than optional.
+    """
+    dead = torch.tensor([17.0], requires_grad=True)
+    evidence_to_belief(dead).backward()
+    assert float(dead.grad) == 0.0
+
+    alive = torch.tensor([17.0], requires_grad=True)
+    evidence_to_belief(alive, temperature=17.0).backward()
+    assert float(alive.grad) > 0.0
+
+
+def test_evidence_to_belief_weights_drops_by_belief_at_risk() -> None:
+    """Equal drops in w are very unequal losses of belief.
+
+    A squared penalty in weight space scores 8.0 -> 7.5 and 0.5 -> 0.0
+    identically. On the belief scale the second is the class losing its support
+    outright and is charged three orders of magnitude more.
+    """
+    saturated = evidence_to_belief(torch.tensor(8.0)) - evidence_to_belief(
+        torch.tensor(7.5)
+    )
+    at_risk = evidence_to_belief(torch.tensor(0.5)) - evidence_to_belief(
+        torch.tensor(0.0)
+    )
+    assert float(at_risk) / float(saturated) > 100.0
+
+
+def test_evidence_to_belief_temperature_moves_the_operating_point() -> None:
+    """Dividing by tau un-saturates evidence that sits on the flat tail."""
+    w = torch.tensor([8.0])
+    assert float(evidence_to_belief(w)) > 0.999
+    assert float(evidence_to_belief(w, temperature=50.0)) < 0.2
+
+
+def test_evidence_to_belief_rejects_non_positive_temperature() -> None:
+    try:
+        evidence_to_belief(torch.tensor([1.0]), temperature=0.0)
+    except ValueError:
+        return
+    raise AssertionError("evidence_to_belief should reject a non-positive temperature")
+
+
+# ----------------------------------------------------------------------
+# Belief scale and asymmetry in output mode (no replay buffer)
+# ----------------------------------------------------------------------
+def _output_model(**overrides) -> Net:
+    return Net(
+        1,
+        6,
+        2,
+        _make_args("task_incremental_loader", woe_reg_level="output", **overrides),
+    )
+
+
+def _teachered(model: Net):
+    """Train one batch, freeze a teacher, then perturb the readout."""
+    import copy
+
+    torch.manual_seed(8)
+    x = torch.randn(8, 2, 1024)
+    y = torch.randint(0, 3, (8,))
+    model.observe(x, y, 0)
+    model._snapshot_teacher()
+    teacher = copy.deepcopy(model.teacher)
+    return x, teacher
+
+
+def test_output_mode_defaults_to_symmetric_weight_scale() -> None:
+    """Existing output-mode runs are untouched by the new knobs."""
+    model = _output_model()
+    assert model.evidence_scale == "weight"
+    assert not model.evidence_asymmetric
+    assert model._evidence_normaliser(512) == 512.0 * 512.0
+
+
+def test_output_mode_belief_scale_drops_the_normaliser() -> None:
+    model = _output_model(woe_evidence_scale="belief")
+    assert model._evidence_normaliser(512) == 1.0
+
+
+def test_output_mode_asymmetric_ignores_pure_improvement() -> None:
+    """Raising support above the teacher's is free; dropping below is charged."""
+    model = _output_model(woe_evidence_asymmetric=True, woe_evidence_scale="belief")
+    x, teacher = _teachered(model)
+
+    # Scale the readout up: w_plus rises for every class, but so does w_minus, so
+    # exercise the hinge directly on the drift terms instead.
+    reference = (torch.tensor([[2.0, 2.0]]), torch.tensor([[1.0, 1.0]]))
+    better = (torch.tensor([[3.0, 3.0]]), torch.tensor([[0.5, 0.5]]))
+    worse = (torch.tensor([[1.0, 1.0]]), torch.tensor([[2.0, 2.0]]))
+    assert float(model._drift_terms(better, reference).sum()) == 0.0
+    assert float(model._drift_terms(worse, reference).sum()) > 0.0
+
+    model.teacher = teacher
+    assert torch.isfinite(model._evidence_distillation_loss(x, 1)).all()
+
+
+def test_output_mode_symmetric_charges_improvement_too() -> None:
+    """The default form penalises movement in either direction."""
+    model = _output_model()
+    reference = (torch.tensor([[2.0, 2.0]]), torch.tensor([[1.0, 1.0]]))
+    better = (torch.tensor([[3.0, 3.0]]), torch.tensor([[0.5, 0.5]]))
+    assert float(model._drift_terms(better, reference).sum()) > 0.0
+
+
+def test_output_mode_belief_still_zero_for_an_unchanged_network() -> None:
+    """Monotone transform plus shared centring keeps the self-distillation zero."""
+    import copy
+
+    model = _output_model(woe_evidence_scale="belief", woe_evidence_asymmetric=True)
+    x, _ = _teachered(model)
+    model.teacher = copy.deepcopy(model.net)
+    assert float(model._evidence_distillation_loss(x, 1).item()) == 0.0
+
+
+def test_output_mode_rejects_bad_scale() -> None:
+    try:
+        _output_model(woe_evidence_scale="bel")
+    except ValueError:
+        return
+    raise AssertionError("woe_evidence_scale should reject unknown values")
+
+
+# ----------------------------------------------------------------------
+# LwF logit distillation (woe_lwf_lambda)
+# ----------------------------------------------------------------------
+def test_lwf_term_is_off_by_default() -> None:
+    model = Net(1, 6, 2, _make_args("task_incremental_loader"))
+    assert model.lwf_lambda == 0.0
+    x = torch.randn(4, 2, 1024)
+    assert (
+        float(model._lwf_distillation_loss(model.net.forward_heads(x)[1], x, 1)) == 0.0
+    )
+
+
+def test_lwf_zero_before_a_teacher_exists() -> None:
+    model = Net(1, 6, 2, _make_args("task_incremental_loader", woe_lwf_lambda=1.0))
+    x = torch.randn(4, 2, 1024)
+    logits = model.net.forward_heads(x)[1]
+    assert model.teacher is None
+    assert float(model._lwf_distillation_loss(logits, x, 1).item()) == 0.0
+
+
+def test_lwf_zero_against_an_identical_teacher() -> None:
+    """KL(p || p) = 0, so a self-distilling network is charged nothing.
+
+    Both sides are scored with ``bn_training=True`` (batch statistics), matching
+    ``model.lwf``. That also activates the backbone's 4 dropout modules, so the
+    teacher forward is *stochastic* -- two forwards of the same weights on the
+    same input differ by 0.48 in logit space. The seed is reset before each
+    forward so the dropout masks coincide; without that, identical weights still
+    register 0.0151 of KL.
+    """
+    torch.manual_seed(3)
+    model = Net(1, 6, 2, _make_args("task_incremental_loader", woe_lwf_lambda=1.0))
+    x = torch.randn(6, 2, 1024)
+    model.observe(x, torch.randint(0, 3, (6,)), 0)
+    model._snapshot_teacher()
+    torch.manual_seed(123)
+    logits = model.net.forward_heads(x, bn_training=True)[1]
+    torch.manual_seed(123)
+    assert abs(float(model._lwf_distillation_loss(logits, x, 1).item())) < 1e-5
+
+
+def test_lwf_does_not_mutate_the_frozen_teacher() -> None:
+    """The teacher must stay frozen across steps, statistics included.
+
+    The teacher is scored with batch statistics (matching ``model.lwf``), which
+    would normally also *update* its BatchNorm running buffers on every call, so
+    the "frozen" reference would drift toward the current task.
+    ``_snapshot_teacher`` zeroes the teacher's BN momentum to prevent exactly
+    that, without changing the statistics used for normalisation.
+
+    ``num_batches_tracked`` is excluded: it still increments, but it is only read
+    when ``momentum is None``, so it cannot affect the teacher's output.
+    """
+    torch.manual_seed(6)
+    model = Net(1, 6, 2, _make_args("task_incremental_loader", woe_lwf_lambda=1.0))
+    x = torch.randn(6, 2, 1024)
+    model.observe(x, torch.randint(0, 3, (6,)), 0)
+    model._snapshot_teacher()
+    before = {
+        k: v.clone()
+        for k, v in model.teacher.state_dict().items()
+        if not k.endswith("num_batches_tracked")
+    }
+    for _ in range(3):
+        model.observe(x, torch.randint(3, 6, (6,)), 1)
+    after = model.teacher.state_dict()
+    changed = [
+        k for k in before if not torch.equal(before[k].float(), after[k].float())
+    ]
+    assert changed == [], f"teacher drifted on {len(changed)} buffers: {changed[:3]}"
+
+
+def test_lwf_positive_once_the_student_moves() -> None:
+    torch.manual_seed(4)
+    model = Net(1, 6, 2, _make_args("task_incremental_loader", woe_lwf_lambda=1.0))
+    x = torch.randn(6, 2, 1024)
+    model.observe(x, torch.randint(0, 3, (6,)), 0)
+    model._snapshot_teacher()
+    with torch.no_grad():
+        model.net.model.fc.weight.mul_(3.0)
+    logits = model.net.forward_heads(x)[1]
+    assert float(model._lwf_distillation_loss(logits, x, 1).item()) > 0.0
+
+
+def test_lwf_snapshots_a_teacher_under_the_parameter_anchor() -> None:
+    """Stacking needs the teacher even when reg_level is not 'output'."""
+    torch.manual_seed(5)
+    model = Net(
+        1,
+        6,
+        2,
+        _make_args(
+            "task_incremental_loader", woe_lwf_lambda=1.0, woe_reg_level="parameter"
+        ),
+    )
+    x = torch.randn(6, 2, 1024)
+    model.observe(x, torch.randint(0, 3, (6,)), 0)
+    model._consolidate_current_task()
+    assert model.teacher is not None
+
+
+def test_lwf_rejects_non_positive_temperature() -> None:
+    try:
+        Net(1, 6, 2, _make_args("task_incremental_loader", woe_lwf_temperature=0.0))
+    except ValueError:
+        return
+    raise AssertionError("woe_lwf_temperature should reject non-positive values")
+
+
+# ----------------------------------------------------------------------
+# Evidence distillation alongside the anchor (woe_evidence_distill_lambda)
+# ----------------------------------------------------------------------
+def test_evidence_distill_off_by_default() -> None:
+    model = Net(1, 6, 2, _make_args("task_incremental_loader"))
+    assert model.evidence_distill_lambda == 0.0
+
+
+def test_evidence_distill_rejects_output_reg_level() -> None:
+    """output mode already applies this term via woe_lambda; refuse to double it."""
+    try:
+        Net(
+            1,
+            6,
+            2,
+            _make_args(
+                "task_incremental_loader",
+                woe_reg_level="output",
+                woe_evidence_distill_lambda=1.0,
+            ),
+        )
+    except ValueError:
+        return
+    raise AssertionError("combining output mode with the distill lambda should raise")
+
+
+def test_evidence_distill_snapshots_teacher_under_the_anchor() -> None:
+    """Running alongside the parameter anchor still needs a frozen teacher."""
+    torch.manual_seed(7)
+    model = Net(
+        1,
+        6,
+        2,
+        _make_args(
+            "task_incremental_loader",
+            woe_reg_level="parameter",
+            woe_anchor_mode="proximal",
+            woe_evidence_distill_lambda=3.0,
+        ),
+    )
+    x = torch.randn(6, 2, 1024)
+    model.observe(x, torch.randint(0, 3, (6,)), 0)
+    model._consolidate_current_task()
+    assert model.teacher is not None
+
+
+def test_evidence_distill_adds_to_the_loss_on_later_tasks() -> None:
+    """The term is inert on task 0 and active once a teacher exists."""
+    torch.manual_seed(8)
+    args = _make_args(
+        "task_incremental_loader",
+        woe_reg_level="parameter",
+        woe_anchor_mode="proximal",
+        woe_lambda=0.0,
+        woe_evidence_distill_lambda=3.0,
+    )
+    model = Net(1, 6, 2, args)
+    x = torch.randn(6, 2, 1024)
+    model.observe(x, torch.randint(0, 3, (6,)), 0)
+    assert float(model._evidence_distillation_loss(x, 0).item()) == 0.0
+    model._consolidate_current_task()
+    model.current_task = 0
+    loss, _rec, _logits = model.observe(x, torch.randint(3, 6, (6,)), 1)
+    assert torch.isfinite(torch.tensor(loss))
+    assert float(model._evidence_distillation_loss(x, 1).item()) > 0.0
+
+
+# ----------------------------------------------------------------------
+# Importance-scalar ablation (woe_importance_scalar)
+# ----------------------------------------------------------------------
+def test_importance_scalar_defaults_to_i2() -> None:
+    model = Net(1, 6, 2, _make_args("task_incremental_loader"))
+    assert model.importance_scalar == "i2"
+
+
+def test_importance_scalar_rejects_unknown() -> None:
+    try:
+        Net(1, 6, 2, _make_args("task_incremental_loader", woe_importance_scalar="i3"))
+    except ValueError:
+        return
+    raise AssertionError("woe_importance_scalar should reject unknown values")
+
+
+def test_every_importance_scalar_accumulates_finite_omega() -> None:
+    """Each ablation drives a usable, finite, non-degenerate path integral."""
+    for scalar in ("i2", "z2", "phi2", "ce"):
+        torch.manual_seed(11)
+        model = Net(
+            1,
+            6,
+            2,
+            _make_args("task_incremental_loader", woe_importance_scalar=scalar),
+        )
+        x = torch.randn(6, 2, 1024)
+        y = torch.randint(0, 3, (6,))
+        for _ in range(3):
+            model.observe(x, y, 0)
+        model._consolidate_current_task()
+        omega = _cumulative_omega(model)
+        assert math.isfinite(omega), f"{scalar}: non-finite Omega"
+        assert omega > 0.0, f"{scalar}: Omega collapsed to zero"
+
+
+def test_importance_scalars_produce_different_omega_scales() -> None:
+    """The ablation must actually change the importance signal, not alias to i2.
+
+    Compares total cumulative Omega, not a single parameter: the first tracked
+    parameter (``input_adapter.weight``, 6 entries) accumulates exactly zero
+    under every scalar, so it discriminates nothing.
+
+    The totals also differ by five orders of magnitude (i2 3.3e-4, phi2 1.1,
+    z2 4.9, ce 51 on this toy setup), which is why ``woe_lambda`` cannot be
+    shared across scalars -- the anchor strength is ``lambda * Omega``.
+    """
+    omegas = {}
+    for scalar in ("i2", "phi2"):
+        torch.manual_seed(12)
+        model = Net(
+            1,
+            6,
+            2,
+            _make_args("task_incremental_loader", woe_importance_scalar=scalar),
+        )
+        x = torch.randn(6, 2, 1024)
+        y = torch.randint(0, 3, (6,))
+        for _ in range(3):
+            model.observe(x, y, 0)
+        model._consolidate_current_task()
+        omegas[scalar] = _cumulative_omega(model)
+    assert omegas["i2"] != omegas["phi2"]
+    assert omegas["phi2"] > 100.0 * omegas["i2"]
+
+
+def test_ce_scalar_is_negated_so_improvement_is_positive() -> None:
+    """SI's sign convention: the tracked scalar rises as the model improves."""
+    torch.manual_seed(13)
+    model = Net(
+        1, 6, 2, _make_args("task_incremental_loader", woe_importance_scalar="ce")
+    )
+    x = torch.randn(6, 2, 1024)
+    y = torch.randint(0, 3, (6,))
+    scalar = model._importance_scalar(x, y, 0)
+    assert float(scalar.item()) < 0.0  # -CE, and CE > 0 on an untrained net

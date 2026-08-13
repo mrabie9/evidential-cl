@@ -2,9 +2,27 @@
 import os
 import argparse
 from pathlib import Path
-from typing import Iterable, List, Sequence
+from typing import Dict, Iterable, List, Sequence, Set, Tuple
 
 import yaml
+
+# YAML keys that are applied under a different argparse dest. Historical spellings
+# of the inner-loop step count, kept so old configs keep working.
+CONFIG_KEY_ALIASES: Dict[str, str] = {
+    "glances": "inner_steps",
+    "update_steps": "inner_steps",
+}
+
+# YAML keys that are deliberately inert: they document the resulting behaviour
+# for a reader but must NOT be wired to an argument, because something else
+# decides the value. Anything here needs a comment saying what that something is.
+INTENTIONALLY_UNUSED_CONFIG_KEYS: Set[str] = {
+    # model.ucl_bresnet._infer_ucl_split_from_loader derives `split` from the
+    # loader name (CIL -> concatenated heads, TIL -> per-task heads) and
+    # overwrites whatever the config says. Registering it would let a config
+    # appear to set something it cannot.
+    "split",
+}
 
 
 def get_parser():
@@ -85,13 +103,6 @@ def get_parser():
         type=float,
         help="QP margin for the GEM gradient-projection constraint in ctn_gem (B2). Kept "
         "separate from CTN's memory_strength, which is the KL-distillation weight.",
-    )
-    parser.add_argument(
-        "--distill_lambda",
-        default=1.0,
-        type=float,
-        help="Weight of the KL-distillation replay term in gem_distill (added to GEM's "
-        "current-task loss). 0 disables distillation (pure GEM).",
     )
     parser.add_argument(
         "--gembob_dynamic_ring",
@@ -703,15 +714,6 @@ def get_parser():
         "under-utilisation on early tasks.",
     )
     parser.add_argument(
-        "--beta",
-        type=float,
-        default=1.0,
-        help="BCL-Dual: Reptile-style meta-step amplification coefficient "
-        "(new = before + (after-before)*beta). beta=1 makes the interpolation an "
-        "identity (no amplification); the inner/outer two-loop structure still runs. "
-        "Use --no_bilevel to ablate the two-loop structure itself.",
-    )
-    parser.add_argument(
         "--no_bilevel",
         action="store_true",
         help="BCL-Dual: ablate the bilevel two-loop optimization. Each inner round "
@@ -817,6 +819,110 @@ def get_parser():
     )
 
     # Parameters for HAT
+
+    # Regularisation-based CL methods (EWC, SI, RWalk, UCL).
+    #
+    # These were previously read only from each learner's dataclass defaults:
+    # `parser._apply_config_overrides` skips any YAML key that is not a
+    # registered argument, so `si_c`, `lamb`, `alpha`, `beta`, `ratio` and
+    # `lr_rho` in configs/models/til/*.yaml were silently discarded. They default
+    # to None here so that an unset value still falls through to the learner's
+    # own default (each `*Config.from_args` skips None), which keeps the two
+    # methods that share the name `alpha` -- RWalk's Fisher EMA momentum and
+    # UCL's mu-penalty strength -- from inheriting each other's default.
+    parser.add_argument(
+        "--anchor_mode",
+        type=str,
+        default="loss",
+        choices=["loss", "proximal"],
+        help=(
+            "How EWC / SI / RWalk / UCL apply their quadratic anchor. 'loss' "
+            "(default) adds it to the training loss and lets the optimiser "
+            "descend it. 'proximal' applies its closed-form minimiser after the "
+            "optimiser step, keeping it out of the backward pass and the "
+            "gradient-norm clip budget; unconditionally stable at any importance "
+            "scale. The two modes need separate penalty-strength sweeps."
+        ),
+    )
+    parser.add_argument(
+        "--si_c",
+        type=float,
+        default=None,
+        help="SI penalty strength c (weight on the path-integral anchor).",
+    )
+    parser.add_argument(
+        "--si_epsilon",
+        type=float,
+        default=None,
+        help="SI damping term in the per-task importance normaliser.",
+    )
+    parser.add_argument(
+        "--lamb",
+        type=float,
+        default=None,
+        help="EWC / RWalk anchor-penalty strength lambda.",
+    )
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=None,
+        help="RWalk Fisher EMA momentum; UCL mu-regularisation strength.",
+    )
+    parser.add_argument(
+        "--eps",
+        type=float,
+        default=None,
+        help="RWalk damping term in the parameter-importance score s.",
+    )
+    parser.add_argument(
+        "--beta",
+        type=float,
+        default=None,
+        help="Shared name, per-model meaning (None leaves each model's own default): "
+        "UCL sigma-regularisation strength; BCL-Dual and gem_bob's Reptile-style "
+        "meta-step amplification (new = before + (after-before)*beta), where beta=1 "
+        "makes the interpolation an identity while the inner/outer two-loop structure "
+        "still runs -- use --no_bilevel / --gembob_bilevel to ablate that structure.",
+    )
+    parser.add_argument(
+        "--ratio",
+        type=float,
+        default=None,
+        help="UCL initial posterior sigma as a ratio of the He init scale.",
+    )
+    parser.add_argument(
+        "--lr_rho",
+        type=float,
+        default=None,
+        help="UCL learning rate for the posterior rho (sigma) parameters.",
+    )
+    parser.add_argument(
+        "--gamma",
+        type=float,
+        default=None,
+        help="HAT mask-sparsity penalty weight; MER meta-update rate.",
+    )
+    parser.add_argument(
+        "--smax",
+        type=float,
+        default=None,
+        help="HAT maximum gate temperature s_max in the annealing schedule.",
+    )
+    parser.add_argument(
+        "--distill_lambda",
+        type=float,
+        default=None,
+        help="Shared name, per-model meaning (None leaves each model's own default): "
+        "LwF's weight on the logit-distillation term; gem_distill's weight on the KL "
+        "replay term added to GEM's current-task loss (0 disables it, recovering pure "
+        "GEM); and, with --gembob_distill, the same term in gem_bob.",
+    )
+    parser.add_argument(
+        "--eval_samples",
+        type=int,
+        default=None,
+        help="UCL Monte-Carlo samples drawn per evaluation forward pass.",
+    )
 
     # EUCR (Evidential Uncertainty Channel Regularisation) parameters
     parser.add_argument(
@@ -954,6 +1060,179 @@ def get_parser():
         ),
     )
 
+    parser.add_argument(
+        "--woe_omega_winsorise",
+        type=float,
+        default=0.0,
+        help=(
+            "WoE-SI: cap cumulative Omega at this global quantile after each "
+            "consolidation (e.g. 0.999). 0 (default) disables capping. The path "
+            "integral is heavy tailed; a few outliers otherwise carry curvature "
+            "the optimiser cannot integrate."
+        ),
+    )
+    parser.add_argument(
+        "--woe_anchor_mode",
+        type=str,
+        default="loss",
+        choices=["loss", "proximal"],
+        help=(
+            "WoE-SI: how to apply the quadratic anchor. 'loss' adds it to the "
+            "training loss (original). 'proximal' applies its closed-form "
+            "minimiser after the optimiser step, keeping it out of the backward "
+            "pass and the gradient-norm clip budget; unconditionally stable for "
+            "any Omega. Ignored when woe_reg_level='output'."
+        ),
+    )
+
+    parser.add_argument(
+        "--woe_replay_mode",
+        type=str,
+        default="ce",
+        choices=["ce", "evidence", "both"],
+        help=(
+            "woe_si_replay: what the reservoir contributes to the loss. 'ce' "
+            "(default) rehearses stored samples with cross-entropy. 'evidence' "
+            "stores each item's DS total evidence at insertion time and applies a "
+            "one-sided penalty when that evidence later decays, leaving increases "
+            "free. 'both' sums the two."
+        ),
+    )
+    parser.add_argument(
+        "--woe_evidence_lambda",
+        type=float,
+        default=1.0,
+        help=(
+            "woe_si_replay: weight on the evidence-decay penalty (used when "
+            "woe_replay_mode is 'evidence' or 'both'). Not on the same scale as "
+            "woe_replay_lambda; needs its own sweep."
+        ),
+    )
+    parser.add_argument(
+        "--woe_evidence_readout_only",
+        action="store_true",
+        help=(
+            "woe_si_replay: detach backbone features in the evidence-decay "
+            "penalty, so rehearsed items constrain only the linear readout and "
+            "send no gradient into the backbone. With woe_replay_mode='evidence' "
+            "the buffer becomes a pure distillation signal and the backbone is "
+            "trained solely on the current task."
+        ),
+    )
+    parser.add_argument(
+        "--woe_evidence_scale",
+        type=str,
+        default="weight",
+        choices=["weight", "belief"],
+        help=(
+            "Scale the functional evidence penalties are measured on -- both "
+            "woe_si's woe_reg_level='output' distillation and woe_si_replay's "
+            "evidence-decay hinge. "
+            "'weight' (default) uses the raw weights of evidence, which are "
+            "unbounded above -- a one-sided penalty on them can be satisfied by "
+            "inflating the readout. 'belief' uses 1 - exp(-w/tau), the mass each "
+            "channel commits, which saturates at 1 so inflation stops paying. The "
+            "two scales differ by a factor of J^2 in normalisation, so "
+            "woe_evidence_lambda does not transfer between them."
+        ),
+    )
+    parser.add_argument(
+        "--woe_importance_scalar",
+        type=str,
+        default="i2",
+        choices=["i2", "z2", "phi2", "ce"],
+        help=(
+            "woe_si: which scalar the SI path integral tracks. 'i2' (default) "
+            "is the Dempster-Shafer information content, i.e. WoE-SI proper. "
+            "The rest are ablations: 'z2' squared active-logit norm, 'phi2' "
+            "squared feature norm, 'ce' the task loss (= plain Synaptic "
+            "Intelligence). They sit on different scales, so woe_lambda must "
+            "be swept per scalar."
+        ),
+    )
+    parser.add_argument(
+        "--woe_evidence_distill_lambda",
+        type=float,
+        default=0.0,
+        help=(
+            "woe_si: weight on the DS evidence-distillation term running "
+            "*alongside* a parameter anchor, instead of replacing it. This is "
+            "the evidential counterpart of --woe_lwf_lambda: same frozen "
+            "teacher, but the target is the per-class (w_plus, w_minus) rather "
+            "than the logits. Incompatible with woe_reg_level='output', which "
+            "already applies this term weighted by woe_lambda. Its scale is "
+            "the J^2-normalised one, where the swept value was ~3."
+        ),
+    )
+    parser.add_argument(
+        "--woe_lwf_lambda",
+        type=float,
+        default=0.0,
+        help=(
+            "woe_si: weight on a Learning-without-Forgetting logit-distillation "
+            "term (temperature-scaled KL against a frozen end-of-task teacher on "
+            "previously-seen classes). 0 (default) disables it. Orthogonal to the "
+            "I_2 parameter anchor -- the anchor constrains parameters, this "
+            "constrains the function -- so both can be on at once. Setting this "
+            "with woe_lambda=0 gives an LwF control inside this module."
+        ),
+    )
+    parser.add_argument(
+        "--woe_lwf_temperature",
+        type=float,
+        default=5.0,
+        help=(
+            "woe_si: softmax temperature for --woe_lwf_lambda. Matches "
+            "model.lwf's default of 5.0."
+        ),
+    )
+    parser.add_argument(
+        "--woe_evidence_asymmetric",
+        action="store_true",
+        help=(
+            "woe_si (woe_reg_level='output'): charge only *deterioration* of the "
+            "teacher's evidence -- support for an old class falling, or evidence "
+            "against it rising -- leaving improvement free, instead of the "
+            "symmetric squared drift. Removes the upper arm that pinned the "
+            "evidence scale, so pair it with woe_evidence_scale='belief', which "
+            "is bounded; otherwise the constraint is satisfiable by inflating the "
+            "readout. woe_si_replay's decay penalty is always one-sided and "
+            "ignores this flag."
+        ),
+    )
+    parser.add_argument(
+        "--woe_evidence_belief_tau",
+        type=float,
+        default=1.0,
+        help=(
+            "Temperature in the belief map 1 - exp(-w/tau) (used "
+            "when woe_evidence_scale='belief'). w_plus is a sum over J features "
+            "and may sit on the flat tail of the curve where every drop looks "
+            "negligible; set tau near the typical w_plus to move the operating "
+            "point back onto the responsive region. 1.0 is the plain DS transform."
+        ),
+    )
+
+    # WoE-SI + reservoir experience replay (model: woe_si_replay).
+    parser.add_argument(
+        "--woe_replay_memories",
+        type=int,
+        default=5120,
+        help="woe_si_replay: reservoir buffer capacity (total stored exemplars).",
+    )
+    parser.add_argument(
+        "--woe_replay_batch_size",
+        type=int,
+        default=20,
+        help="woe_si_replay: number of replay exemplars drawn per optimiser step.",
+    )
+    parser.add_argument(
+        "--woe_replay_lambda",
+        type=float,
+        default=1.0,
+        help="woe_si_replay: weight on the reservoir-replay cross-entropy term.",
+    )
+
     return parser
 
 
@@ -984,20 +1263,54 @@ def _expanded_config_paths(config_sources: Sequence[str] | None) -> List[Path]:
 def _apply_config_overrides(
     args: argparse.Namespace, config_paths: Iterable[Path]
 ) -> argparse.Namespace:
-    """Apply YAML overrides from the provided config files to the namespace."""
+    """Apply YAML overrides from the provided config files to the namespace.
 
+    A YAML key reaches a learner only if some ``add_argument`` in
+    :func:`get_parser` declares that dest: the namespace is built by
+    ``parser.parse_args([])`` and so contains exactly the registered dests and
+    nothing else. Any other key is therefore not applicable, and this raises
+    rather than skipping it. Silently dropping such keys is how
+    ``configs/models/til/si.yaml``'s ``si_c: 0.4`` came to have no effect on any
+    run for as long as it existed, while the file read as if it did.
+
+    Args:
+        args: Namespace of parser defaults to overwrite in place.
+        config_paths: YAML files, applied in order; later files win.
+
+    Returns:
+        The same namespace, with every applicable key applied.
+
+    Raises:
+        ValueError: If any file contains a key that no argument declares and
+            that is not listed in :data:`INTENTIONALLY_UNUSED_CONFIG_KEYS`.
+
+    Usage:
+        >>> _apply_config_overrides(args, [Path("configs/base.yaml")])
+    """
+    unrecognised: List[Tuple[str, str]] = []
     for path in config_paths:
         with path.open("r", encoding="utf-8") as handle:
             data = yaml.safe_load(handle) or {}
         for key, value in data.items():
-            if key == "glances":
-                setattr(args, "inner_steps", value)
-                continue
-            if key == "update_steps":
-                setattr(args, "inner_steps", value)
+            if key in CONFIG_KEY_ALIASES:
+                setattr(args, CONFIG_KEY_ALIASES[key], value)
                 continue
             if hasattr(args, key):
                 setattr(args, key, value)
+                continue
+            if key in INTENTIONALLY_UNUSED_CONFIG_KEYS:
+                continue
+            unrecognised.append((str(path), key))
+    if unrecognised:
+        listing = "\n".join(f"    {path}: {key}" for path, key in unrecognised)
+        raise ValueError(
+            "Config key(s) that no argparse argument declares, so they would "
+            "have no effect on the run:\n"
+            f"{listing}\n"
+            "Register the argument in parser.get_parser(), remove the key, or "
+            "add it to parser.INTENTIONALLY_UNUSED_CONFIG_KEYS with a comment "
+            "explaining why it is inert."
+        )
     return args
 
 

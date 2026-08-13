@@ -52,8 +52,11 @@ class LwfConfig:
     def from_args(args: object) -> "LwfConfig":
         cfg = LwfConfig()
         for field in cfg.__dataclass_fields__:
-            if hasattr(args, field):
-                setattr(cfg, field, getattr(args, field))
+            # `None` means the argument was registered but never set, so the
+            # dataclass default stands.
+            value = getattr(args, field, None)
+            if value is not None:
+                setattr(cfg, field, value)
         return cfg
 
 
