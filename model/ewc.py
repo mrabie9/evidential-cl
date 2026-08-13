@@ -180,11 +180,15 @@ class Net(DetectionReplayMixin, nn.Module):
             else:
                 cls_tr_rec = 0.0
 
+            # The empirical Fisher is the squared gradient of the *task* loss
+            # alone, so it is taken on its own backward pass and the gradients
+            # are then cleared: leaving them in place would add a second copy of
+            # the cross-entropy gradient to the update below, silently doubling
+            # the effective learning rate on the task loss.
             self.opt.zero_grad()
-            if True:
-                torch.autograd.set_detect_anomaly(True)
-                loss_ce.backward(retain_graph=True)
-                self._accumulate_fisher(int(y_cls.size(0)))
+            loss_ce.backward(retain_graph=True)
+            self._accumulate_fisher(int(y_cls.size(0)))
+            self.opt.zero_grad()
 
             # self.opt.zero_grad()
             # det_loss = self.det_loss(det_logits, y_det.float())
