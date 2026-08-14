@@ -235,6 +235,20 @@ def build_cli(preset: TuningPreset) -> argparse.ArgumentParser:
         metavar="PARAM",
         help="Restrict the grid to specific hyperparameter(s). May be repeated or comma-separated.",
     )
+    parser.add_argument(
+        "--stage2-top-k",
+        type=int,
+        default=0,
+        help="Re-run this many top distinct trials across --stage2-seeds and pick the"
+        " winner by mean score. 0 (default) disables stage 2.",
+    )
+    parser.add_argument(
+        "--stage2-seeds",
+        type=str,
+        default=None,
+        metavar="S1,S2,...",
+        help="Comma-separated seeds used for stage 2 re-runs (see --stage2-top-k).",
+    )
     return parser
 
 
