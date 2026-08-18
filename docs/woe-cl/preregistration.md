@@ -126,3 +126,60 @@ erase differences in `Omega`; it does *not* show that separated `Omega` would
 produce separated accuracy. So PR-2a can **exonerate** the floor but cannot by
 itself **convict** it, and it cannot fully replace the retrain in the convicting
 branch. It is a screen, not a substitute.
+
+---
+
+## PR-2 / PR-2a — Amendment 2 (2026-08-18, written after the single-scalar dump, before the between-scalar dumps landed)
+
+**The registered statistic could not fire, and has been replaced.** PR-2a's
+`D(xi)` was a mean pairwise Spearman *distance* between scalars. Spearman
+distances are bounded and compressed near the top of their range, so if the
+scalars are genuinely different constructs `D(1e-3)` may already be large and
+`D(1e-6) >> D(1e-3)` cannot cleanly occur. Replaced with
+**`Spearman(Omega@xi, numerator)`** — computable from a *single* dump, not
+range-compressed, and a direct test of the floor rather than of its consequences.
+`scripts/xi_floor_check.py`.
+
+**Result: the floor is real and total.** RMS `|Delta|` = 1.03e-3 against
+`sqrt(xi)` = 3.16e-2, so `Delta^2` ~ 1e-6 against `xi` = 1e-3 — mis-sized by
+~1000x. `Spearman(Omega, numerator) = 0.999977`. **SI's path-length denominator
+has been inert throughout this project**; every `Omega` reported anywhere in
+`README.md` is a raw path integral scaled by `1/xi`, not a curvature-like
+quantity. `delta_floored_frac` is 1.0000 from task 0 *with the anchor off*, so
+the anchor is incidental — branch 3 in its widest form, and the "self-reinforcing
+loop" reading of the per-task suppression is withdrawn.
+
+**PR-2's registered fail condition fired**: floored stiff-set mass = 0.9581,
+against a convict threshold of 0.25. Spearman(Omega@1e-3, Omega@1e-6) = 0.907,
+which is the "inconclusive" band on its own.
+
+**But a measurement not in the registration points the other way, and this
+amendment is written before the deciding dumps land so that it is not a post-hoc
+escape.** The rule was a *proxy* for "the floor makes `Omega` a displacement
+measure, so the tracked scalar does no work" — the competing explanation for B6.
+Measured directly: **`Spearman(Omega, total |Delta|) = -0.060`.** Displacement
+explains none of `Omega`'s rank structure. `Omega = |sum_steps h.Delta| / xi`
+still carries the tracked scalar through `h`; an inert denominator does not make
+it scalar-blind. The proxy fired; the thing it was proxying for did not.
+
+**Registered handling.** The fail branch is **not** cancelled on this basis --
+that would be arguing out of a rule because its outcome is unwelcome. Instead the
+decision defers to the *direct* between-scalar test, whose runs (`ce`, `phi2`,
+`z2` dumps) were queued before this was written:
+
+| `min` pairwise `Spearman(Omega_a, Omega_b)` across scalars | verdict |
+|---|---|
+| >= 0.95 | the scalars produce the same `Omega`; B6's null **is** the floor; retrain branch fires |
+| <= 0.80 | the scalars produce genuinely different `Omega`; B6 survives the floor; retrain **not** required, and the -0.060 above is the supporting evidence |
+| 0.80-0.95 | retrain branch fires |
+
+**Retrain branch, repriced.** Seeds are needed only at each scalar's best lambda,
+not at every grid point: sweep lambda at one seed to locate each peak (3 x 5),
+then three seeds at the peak (3 x 3, reusing the sweep's seed) = **24 runs, ~2
+hours**, not 45/~4h. Registered because the escape hatch leaves B6 permanently
+ambiguous, which is the worst available outcome, and halving the cost is the
+difference between affordable and not.
+
+**Independent of all branches**, the xi finding is a result in its own right and
+is reported regardless: a project-wide implementation defect that changes what
+every `Omega` in this document *is*.
