@@ -37,6 +37,17 @@ re-running the comparison would only buy a second uninterpretable null.
 0.4553 against the 0.4466 bar. Best margin +0.009 at n=1 — currently *below* the
 lowest band. Registered before the arm completed and before any n=3 replication.
 
+**Amendment 1 (same day).** Those three cells are the **lambda grid**
+(0.1 / 1.0 / 10.0), all seed 0 — not three seeds. Their 0.024 spread is a lambda
+response and says nothing about seed variance, so it does not impugn the sd the
+bands were derived from. But a second problem does: **that sd was measured on
+`woe_si_lc`** (anchored, lr 0.003) and this gate runs on `woe_si_injection`
+(anchor off, lr 0.001, 256 memories). The bands inherit a number from the wrong
+host. Seeds 39 and 55 of the `ce` bar are queued; if the injection host's sd
+differs materially from 0.004, **the bands are recomputed from the measured
+value at the same multiples** (2.5x sd for the lower edge, 5x for the upper) and
+that recomputation is registered before `V` is read.
+
 ---
 
 ## PR-2 — B6 under a floored SI denominator (registered 2026-08-18, run queued)
@@ -61,6 +72,20 @@ inert bulk.
 | Spearman < 0.90 **or** floored stiff mass ≥ 0.25 | the floor is load-bearing; B6's null must be re-tested by *retraining* the scalar comparison at a smaller xi before the campaign's framing can rest on it |
 | in between | inconclusive; retrain the B6 comparison anyway |
 
+**Amendment 1 (same day) — the fail branch as first written cannot answer the
+question.** `xi` enters the anchor, so small-`xi` arms train under a different
+penalty landscape: different `Omega` scale, different effective anchor strength,
+different trajectories. Comparing tuned-lambda-at-1e-3 against
+untuned-lambda-at-1e-6 is the same class of error the A7 commensurability gate
+caught (raw against normalised at a shared lambda), and this project has three
+recorded instances of `Omega` scale failing to predict optimal lambda — a
+measured ratio places a *grid*, never a cell. **The fail branch therefore
+requires a full lambda grid at the new `xi`, per scalar, before any comparison is
+read.** Cost, registered now rather than discovered when the branch fires: 3
+scalars x 5 lambda x 3 seeds = 45 runs, ~15 min each at 3 concurrent, i.e. ~4
+hours. If that is not affordable, the honest report is that B6 could not be
+disambiguated from the floor, **not** a weaker version of B6.
+
 **Why mass-weighted and stiff-split.** A floored inert bulk is nearly harmless —
 the parameters doing the protecting are still correctly normalised. A floored
 stiff set is fatal. A count-based fraction cannot distinguish these and would
@@ -70,3 +95,34 @@ read a benign case as the fatal one.
 consolidation, so its trend in `t` is observable. The anchor-feedback loop
 predicts it rises monotonically in `t`; flat-and-high from task 0 instead means
 xi was mis-sized from the start and the anchor is incidental.
+
+
+---
+
+## PR-2a — the no-retrain screen for PR-2's fail branch (registered 2026-08-18, runs queued)
+
+**Purpose.** PR-2's fail branch is expensive (~45 runs) and confounded unless
+lambda is re-swept. This is the cheap direct test of the *confound itself* — does
+the floor erase between-scalar differences in `Omega`? — with no retraining and
+therefore no lambda problem.
+
+**Method.** One dump per candidate tracked scalar (`i2`, `ce`, `phi2`, `z2`), each
+carrying `numerator` and `delta_sq` separately at the run's own tuned lambda.
+Rebuild `Omega` offline at xi = 1e-3 and 1e-6 for each, and compare the scalars'
+`Omega` profiles *to one another* at each xi.
+
+**Quantity.** `D(xi)` = mean pairwise Spearman distance between the scalars'
+cumulative `Omega` vectors, computed at each xi.
+
+**Rule.**
+
+| outcome | verdict |
+|---|---|
+| `D(1e-6)` ≈ `D(1e-3)` | the floor is **not** erasing between-scalar structure; strong evidence B6 survives, and the expensive fail branch is not triggered |
+| `D(1e-6)` >> `D(1e-3)` | the floor *is* collapsing distinct scalars onto a common displacement measure; PR-2's fail branch fires with its lambda grid |
+
+**Stated limitation, registered up front.** A null here shows the floor does not
+erase differences in `Omega`; it does *not* show that separated `Omega` would
+produce separated accuracy. So PR-2a can **exonerate** the floor but cannot by
+itself **convict** it, and it cannot fully replace the retrain in the convicting
+branch. It is a screen, not a substitute.
