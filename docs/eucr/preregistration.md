@@ -173,3 +173,88 @@ a BatchNorm buffer artefact, not weight drift. A quadratic weight penalty cannot
 reach buffers, so the inert anchor was never going to help — and this partly
 explains BWT of -0.24 to -0.30 in the benchmark table. Recorded as a finding, not
 as a gate outcome.
+
+---
+
+## Amendment 2 (2026-08-25) — Gate B0 extended; remedies tested out of sequence
+
+The pre-registered order was B0 -> re-run -> PR-E1 -> G. Gate B0's result made the
+BatchNorm remedy the highest-value experiment available, so it was run first.
+Sequences update on evidence; statistic *definitions* do not, and none were
+changed after seeing a value.
+
+### B0 extended: more sequence positions, a non-EUCR control, batch-size sweep
+
+Gate B0's single cell (task 0, checkpoint 1) cannot distinguish "normalisation
+carries forgetting" from "the backbone barely forgets". Three extensions, all
+offline on existing checkpoints. **Like-for-like comparison** throughout: batch
+statistics at both ends, so the transductive advantage cancels.
+
+EUCR, task 0, 5 seeds, mean F1 (running / batch statistics):
+
+| checkpoint | running | batch |
+|---|---|---|
+| ck0 (just trained) | 0.776 | 0.844 |
+| ck1 (one task later) | 0.614 | 0.753 |
+| ck3 (end of sequence) | 0.107 | 0.672 |
+
+Genuine forgetting (batch@ck0 - batch@ck3) = **0.172**. Measured forgetting
+(running@ck0 - running@ck3) = **0.669**. So **~74% of EUCR's end-of-sequence
+task-0 forgetting is a normalisation artefact** and ~26% is real. Task 1 behaves
+the same way.
+
+**It is EUCR-specific, not architectural.** An EWC control on the same backbone,
+same loader, same eval path shows a running-vs-batch gap of **<= 0.013 F1 at
+every cell**. The benchmark table is *not* mismeasured for other models. The
+mechanism is the cosine-prototype head reading feature *direction*: a shift in
+normalisation statistics rotates the feature cloud onto one prototype (cf. the
+directional-coherence measurement, 0.07 under batch stats against 0.16-0.42
+under running stats). A linear head with a bias is far more robust.
+
+**Not a transduction artefact.** Batch-statistic evaluation was swept over
+test batch sizes 32/64/128/512. The ck3 recovery is stable and only mildly
+batch-size dependent (seed 1: 0.731/0.742/0.748/0.769), so even at batch 32 the
+recovery is 0.61-0.73 against a running-statistic 0.12.
+
+**There is also a within-task mismatch.** At ck0, immediately after training
+task 0, batch statistics already beat running statistics by ~0.07 F1
+(0.776 -> 0.844). That is a plain train/eval BN mismatch, not a continual one,
+and it bounds what any cross-task statistics policy can recover.
+
+### Remedies (4 tasks, 10 epochs, 3 seeds). Diagonal reported alongside BWT.
+
+| arm | diagonal F1 | final F1 | BWT |
+|---|---|---|---|
+| `running` (shipped) | 0.5864 +/- 0.0421 | 0.2843 +/- 0.0291 | -0.302 |
+| `freeze` after task 0 | 0.3644 +/- 0.0435 | 0.2128 +/- 0.0850 | **-0.152** |
+| `per_task` (select by task id) | 0.5864 +/- 0.0421 | **0.3279 +/- 0.1413** | -0.259 |
+
+`freeze` is the textbook trap: it improves BWT by 0.15 and pays 0.22 diagonal for
+it, ending 0.07 *worse* on final F1. Reporting BWT alone would have made it look
+like the best arm on the table. `per_task` leaves the diagonal untouched by
+construction (right after task t, the running statistics *are* task t's) and buys
++0.044 final F1, but with a large seed spread.
+
+`per_task` recovers much less than batch-statistic evaluation does, and the ck0
+row above says why: it fixes cross-task overwriting but not the within-task
+train/eval mismatch, which is roughly 0.07 F1 on its own.
+
+**Framing rule for the writeup.** Batch-statistic evaluation is a *measurement*
+change, not a method. Where it recovers forgetting, the claim is that the
+forgetting was never there -- not that it was fixed. Only `freeze` and `per_task`
+are interventions, and both must be reported with diagonal and BWT together.
+
+**Prior work.** This is a confirmation in a new setting, not a discovery.
+BatchNorm statistics biased toward the current task are a known continual-learning
+failure mode: Continual Normalization (Pham et al., ICLR 2022, arXiv:2203.16102),
+task-specific BatchNorm / CLBN, and the related LayerNorm-tuning line. Cite these;
+the contribution here is the *magnitude* on a direction-reading evidential head
+(74% of measured forgetting) and the EWC control showing it is head-specific
+rather than architectural.
+
+### Consequence for PR-E1
+
+Residual genuine forgetting under batch-statistic evaluation is **0.172 F1 at
+end-of-sequence** but only ~0.02 after one task. PR-E1 must therefore run at
+**end-of-sequence** (task 0 at checkpoint 3), where the denominator is large
+enough to have power; the after-task-1 position answers nothing at n=3.
