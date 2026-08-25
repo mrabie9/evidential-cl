@@ -299,3 +299,56 @@ R(k) = [F1(stats restored + top-k% weights) - F1(stats restored, 0% weights)]
 
 so it asks what restoring weights adds *on top of* restoring statistics. That is
 the 0.172 F1 denominator from Amendment 2, and it is the quantity with power.
+
+---
+
+## PR-E1 result (2026-08-25) — gate PASSES, conclusion is still negative
+
+Run offline on `b0_extra` checkpoints, seeds 1/3/11, task 0 at end-of-sequence,
+restoration = weights + BatchNorm statistics, `R(k)` relative to the
+statistics-restored baseline (Amendment 3). Per-seed denominators 0.354 / 0.689 /
+0.533 F1.
+
+**Sanity kill: not triggered.** `R_random(1%)` = 0.014 / 0.002 / 0.002.
+
+**Gate: PASS, 3/3 seeds.** `R_mas_entropy(1%) - R_random(1%)` = 0.575 / 0.187 /
+0.223, all >= 0.10.
+
+`R(k)` at the primary k = 1%, mean +/- sd over 3 seeds, ranked:
+
+| measure | R(1%) |
+|---|---|
+| `|dtheta|`  (**control**) | **+0.699 +/- 0.104** |
+| `fisher x dtheta^2` | +0.682 +/- 0.161 |
+| `mas_entropy x dtheta^2` | +0.579 +/- 0.020 |
+| `fisher` | +0.515 +/- 0.073 |
+| `mas_entropy` (shipped) | +0.334 +/- 0.222 |
+| `|dtheta . g|` | +0.318 +/- 0.248 |
+| `|theta_0*|` (control) | +0.103 +/- 0.152 |
+| `random` (control) | +0.006 +/- 0.007 |
+
+**The displacement control beats every importance measure.** Forgetting on this
+architecture *is* localisable -- 1% of coordinates restores 70% of it -- but the
+coordinates are identified by *how far they moved*, not by any importance
+functional. The shipped `mas_entropy` is less than half as good as plain
+`|dtheta|` and is the second-worst non-trivial measure on the panel.
+
+**The two product measures isolate why.** Multiplying either importance by
+`dtheta^2` moves it most of the way to `|dtheta|` (`mas` 0.334 -> 0.579; `fisher`
+0.515 -> 0.682), and neither product beats `|dtheta|`. So essentially all of the
+gain in `importance x dtheta^2` comes from the `dtheta^2` factor. The importance
+factor is not adding information over displacement; on `mas_entropy` it dilutes it.
+
+**Caveat on the statistic, stated because it cuts against the headline.**
+`R(k)` rewards L2 proximity to `theta_0*`, and ranking by `|dtheta|` maximises
+that proximity at any k by construction, so part of the control's advantage is
+mechanical rather than a claim about localisation. The products are the fair
+test, since they hold the `dtheta^2` factor fixed and vary only the importance
+term -- and they say the importance term buys nothing.
+
+**What this licenses.** Not the "everything fails" branch: localisation works.
+The finding is narrower and more specific -- on this architecture the importance
+*family* is dominated by a displacement baseline, which applies to EWC's Fisher
+as well as to EUCR's MAS-on-entropy. Combined with Gate B0 (74% of measured
+forgetting is a normalisation artefact that no weight penalty can reach), the
+case for EUCR's consolidation mechanism as a method contribution is closed.
