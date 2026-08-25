@@ -258,3 +258,44 @@ Residual genuine forgetting under batch-statistic evaluation is **0.172 F1 at
 end-of-sequence** but only ~0.02 after one task. PR-E1 must therefore run at
 **end-of-sequence** (task 0 at checkpoint 3), where the denominator is large
 enough to have power; the after-task-1 position answers nothing at n=3.
+
+---
+
+## Amendment 3 (2026-08-25) — PR-E1 needs no re-run; two product measures added
+
+**The re-run was over-scoped.** PR-E1 was blocked on serialising `importance`
+and `theta_star`. Neither is needed:
+
+* `finalize_task_after_training` runs at `main.py:1542` and the checkpoint saves
+  at `main.py:1671`, so `task_0.pt`'s `state_dict` **is** `theta_star` for task 0.
+* `importance` is a deterministic forward/backward accumulation over the task's
+  data (`cons.compute_importance`), so it is recomputable from that checkpoint.
+
+The whole panel therefore runs offline on checkpoints that already exist. The
+re-run is still wanted for prototype utilisation logging, which is a separate
+non-gating diagnostic, but it does not gate PR-E1.
+
+**Two measures added, reported not gating.** `fisher * dtheta^2` and
+`mas_entropy * dtheta^2`. These are elementwise products of arrays the panel
+already builds, so they cost nothing. They are also better motivated than
+importance alone for a *restoration* criterion: `importance * dtheta^2` is the
+second-order Taylor term for the loss increase, i.e. exactly the quantity the
+EWC/MAS penalty sums. Ranking by importance alone ignores how far a coordinate
+actually moved.
+
+The gating comparison is **unchanged**: `R_mas_entropy(1%) - R_random(1%) >= 0.10`
+in at least 2 of 3 seeds. The products are additional reported columns. Adding
+non-gating columns before execution is recorded here so it is auditable.
+
+**Specification detail the original left open.** Under the weights+statistics
+condition, restoring all BatchNorm statistics alone already recovers most of the
+measured gap (Gate B0), which would leave the weight ranking almost no headroom.
+`R(k)` is therefore measured *relative to the statistics-restored baseline*:
+
+```
+R(k) = [F1(stats restored + top-k% weights) - F1(stats restored, 0% weights)]
+       / [F1(theta_0*) - F1(stats restored, 0% weights)]
+```
+
+so it asks what restoring weights adds *on top of* restoring statistics. That is
+the 0.172 F1 denominator from Amendment 2, and it is the quantity with power.
