@@ -133,3 +133,43 @@ Not gated, but logged from the same run rather than a separate pass:
   noise rows from the ID set is *not* sufficient; the noise output must not exist.
 - All results are 3 seeds (0, 39, 55) and read from every per-seed
   `results.txt`, never seed 0 alone.
+
+---
+
+## Amendment 1 (2026-08-25) — Gate B0's statistic is ill-conditioned; result stands
+
+**Executed.** Gate B0 ran on 8 seeds (0, 39, 55 from `f_newconfig`; 1, 2, 3, 7, 11
+from `b0_extra`).
+
+**Problem found on execution.** `S` divides by the forgetting actually incurred,
+and on 2 of the first 3 seeds that denominator is degenerate: seed 0 forgot
+0.008 F1 (nothing to recover) and seed 39 forgot **-0.136** (task-0 F1 *rose*
+after training task 1 — backward transfer). `S` is meaningless there, and seed
+0's `S = 5.04` is a small recovery over a smaller denominator, not evidence.
+The rule as written would have fired on that degenerate value.
+
+**Amendment.** `S` is reported only for seeds with real forgetting
+(denominator >= 0.05 F1). Seeds outside that are reported and excluded from the
+count, not silently kept. Alongside `S`, report the two absolute quantities,
+which are well conditioned regardless of denominator:
+`F1(theta_1, batch stats)` and `F1(theta_1, running stats)`.
+
+**Result under the amended reading.** Six of eight seeds show real forgetting
+(0.078 to 0.381 F1). On those, `S` = 0.46, 0.81, 0.88, 0.91, 0.92, 1.61
+(median 0.88) — normalisation statistics carry roughly 80-90% of task-0
+forgetting. The absolute quantities are cleaner still:
+`F1(theta_1, batch)` is 0.73-0.80 across all eight seeds, while
+`F1(theta_1, running)` ranges 0.45-0.80. Batch statistics give a stable, high
+task-0 F1 regardless of seed; the running statistics inject the variance and, in
+the worst seed, a 0.32 F1 collapse.
+
+**Verdict: PASS, weights+statistics.** PR-E1's primary restoration condition is
+weights plus normalisation statistics. The weight-only condition is retained as a
+secondary arm, since it is now the more interesting comparison: it measures what
+is left once the dominant channel is excluded.
+
+**Consequence beyond PR-E1.** Most of EUCR's measured catastrophic forgetting is
+a BatchNorm buffer artefact, not weight drift. A quadratic weight penalty cannot
+reach buffers, so the inert anchor was never going to help — and this partly
+explains BWT of -0.24 to -0.30 in the benchmark table. Recorded as a finding, not
+as a gate outcome.
