@@ -31,11 +31,11 @@ import argparse
 import glob
 import json
 import os
-import re
 from itertools import product
 
 import numpy as np
 from scipy import stats
+from results_txt import f1_stats
 
 REPO = "/home/lunet/wsmr11/repos/evidential-cl"
 LOGS = os.path.join(REPO, "logs")
@@ -145,10 +145,10 @@ def _forward_zs(seed_dir):
 def parse_seed(seed_dir):
     """Return (f1_total, bwt, diag, pfa, fwt) as fractions for one seed directory."""
     txt = open(os.path.join(seed_dir, "results.txt"), errors="ignore").read()
-    f1 = float(re.search(r"Final F1:\s*([-\d.]+)", txt).group(1))
-    bwt = float(re.search(r"Backward:\s*([-\d.]+)", txt).group(1))
-    m = re.search(r"Diagonal F1:\s*([-\d.]+)", txt)
-    diag = float(m.group(1)) if m else np.nan
+    f1_values = f1_stats(txt)
+    f1 = f1_values["Final F1"]
+    bwt = f1_values["Backward"]
+    diag = f1_values.get("Diagonal F1", np.nan)
     pfa = np.nan
     smj = os.path.join(seed_dir, "seed_metrics.json")
     if os.path.exists(smj):

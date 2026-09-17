@@ -32,7 +32,7 @@ while [ $# -gt 0 ]; do
 done
 
 # Edit this list to choose which task-order seeds to run (order is preserved).
-TASK_ORDER_SEEDS=(57 1040 329)
+TASK_ORDER_SEEDS=(57 1040 329 83)
 
 overall_exit=0
 
@@ -42,6 +42,7 @@ for task_order_seed in "${TASK_ORDER_SEEDS[@]}"; do
     "$SCRIPT_DIR/full_experiments.sh"
     -d "task_order_seed_${task_order_seed}"
     --task-order-seed "$task_order_seed"
+    --single-seed
   )
   if [ "$ONE_SHOT" -eq 1 ]; then
     cmd+=(--one-shot)

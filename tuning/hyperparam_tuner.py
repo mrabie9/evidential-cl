@@ -13,7 +13,7 @@ import traceback
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Sequence
+from typing import Any, Callable, Dict, Final, List, Sequence
 
 import numpy as np
 import torch
@@ -23,11 +23,19 @@ import yaml
 sys.path.append("/home/lunet/wsmr11/repos/La-MAML")  # to import from parent directory
 import parser as file_parser
 from main import life_experience
+from main_single_round import build_single_round_loaders, run_single_round_training
 from utils import misc_utils
+from utils.metric_keys import extract_metric
 
 Grid = Dict[str, List[Any]]
 TypeHints = Dict[str, type]
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# Tuning trials run on a single seed that is deliberately distinct from the
+# 0/39/55 seeds used by the full experiments. Since the training seed also
+# drives task presentation order, this keeps hyperparameter selection from
+# being fitted to any task order that later appears in a reported result.
+TUNING_DEFAULT_SEED: Final[int] = 99
 
 
 def _dedupe_config_sources(sources: Sequence[str]) -> List[str]:
@@ -100,6 +108,9 @@ class TuningPreset:
     default_grid: Grid | None = None
     type_hints: TypeHints = field(default_factory=dict)
     grid_factory: Callable[[argparse.Namespace], Grid] | None = None
+    # When set, trials run through main_single_round.py's non-lifelong training
+    # loop (run_single_round_trial) instead of main.life_experience.
+    single_round: bool = False
 
     def resolve_description(self) -> str:
         if self.description:
@@ -167,6 +178,16 @@ def build_cli(preset: TuningPreset) -> argparse.ArgumentParser:
         help="Evaluate at most this many trials (after sampling/shuffling).",
     )
     parser.add_argument(
+        "--base-seed",
+        type=int,
+        default=TUNING_DEFAULT_SEED,
+        help=(
+            "Training seed used by every trial. Also determines task presentation "
+            f"order, so the default ({TUNING_DEFAULT_SEED}) keeps tuning off the "
+            "0/39/55 orders used by the full experiments. Overridden by --seeds."
+        ),
+    )
+    parser.add_argument(
         "--seed-offset",
         type=int,
         default=0,
@@ -184,12 +205,17 @@ def build_cli(preset: TuningPreset) -> argparse.ArgumentParser:
         metavar="S1,S2,...",
         help="Comma-separated seeds to average each trial over (e.g. 0,39,55)."
         " When set, every trial is run once per seed and the metrics are"
-        " averaged; --vary-seed and --seed-offset are ignored.",
+        " averaged; --base-seed, --vary-seed and --seed-offset are ignored."
+        " Each seed also selects its own task presentation order.",
     )
     parser.add_argument(
         "--avg-seeds",
         action="store_true",
-        help="Shortcut for --seeds 0,39,55.",
+        help=(
+            "Shortcut for --seeds 0,39,55. Note those seeds also select three "
+            "different task orders, and are the same ones used by the full "
+            "experiments."
+        ),
     )
     parser.add_argument(
         "--output-root",
@@ -597,25 +623,34 @@ def select_best_trial(
     return max(candidate_pool, key=_trial_rank_key)
 
 
-def extract_total_f1_mean_from_trial_logs(
-    log_dir: str | Path, fallback_num_tasks: int
+def extract_macro_f1_mean_from_trial_logs(
+    log_dir: str | Path, num_tasks: int, cil_mode: bool = False
 ) -> float:
-    """Extract final mean total F1 from the latest trial metrics file.
+    """Extract the final macro F1 from the latest trial metrics file.
 
-    This reads the latest ``task*.npz`` produced by a training run and resolves
-    ``val_f1`` to a single run-level score by taking the last ``n_tasks``
-    entries when needed.
+    Reads the latest ``task*.npz`` produced by a training run and resolves the
+    stored validation macro F1 to a single run-level score.
+
+    Under TIL, ``val_macro_f1`` holds one column per task-pure loader; the
+    final evaluation is the last ``num_tasks`` entries of that flattened
+    per-eval array, averaged. Under CIL, that same array instead holds
+    per-task *columns* sliced from one pooled pass (see
+    :func:`main.eval_cil_pooled`) and averaging them mixes in tasks the model
+    has since forgotten -- the run-level score is the *headline*, i.e. the
+    macro F1 over every class seen so far, stored separately as
+    ``cil_union_macro_f1`` with its last entry being the final task's value.
 
     Args:
         log_dir: Trial output directory containing ``task*.npz`` files.
-        fallback_num_tasks: Fallback task count when detection vectors are
-            unavailable in metrics.
+        num_tasks: Number of continual tasks in the run, used to slice the
+            final evaluation out of a flattened per-eval array (TIL only).
+        cil_mode: Whether the trial was run under class-incremental scoring.
 
     Returns:
-        Final mean total F1 score, or NaN when it cannot be recovered.
+        Final macro F1, or NaN when it cannot be recovered.
 
     Usage:
-        f1_score = extract_total_f1_mean_from_trial_logs("/tmp/run", 3)
+        f1_score = extract_macro_f1_mean_from_trial_logs("/tmp/run", 3)
     """
     candidate_dir = Path(log_dir)
     metrics_dir = (
@@ -628,30 +663,28 @@ def extract_total_f1_mean_from_trial_logs(
         return float("nan")
 
     latest_metrics = np.load(task_files[-1], allow_pickle=False)
-    if "val_f1" not in latest_metrics:
+
+    if cil_mode:
+        union_f1_values = extract_metric(latest_metrics, "cil_union_macro_f1")
+        if union_f1_values is None:
+            return float("nan")
+        union_f1_array = np.asarray(union_f1_values, dtype=float).reshape(-1)
+        if union_f1_array.size == 0:
+            return float("nan")
+        return float(union_f1_array[-1])
+
+    macro_f1_values = extract_metric(latest_metrics, "val_macro_f1")
+    if macro_f1_values is None:
         return float("nan")
 
-    val_f1_array = np.asarray(latest_metrics["val_f1"], dtype=float).reshape(-1)
-    if val_f1_array.size == 0:
+    macro_f1_array = np.asarray(macro_f1_values, dtype=float).reshape(-1)
+    if macro_f1_array.size == 0:
         return float("nan")
 
-    inferred_num_tasks = 0
-    if "val_det_acc" in latest_metrics:
-        inferred_num_tasks = max(
-            inferred_num_tasks, int(np.asarray(latest_metrics["val_det_acc"]).size)
-        )
-    if "val_det_fa" in latest_metrics:
-        inferred_num_tasks = max(
-            inferred_num_tasks, int(np.asarray(latest_metrics["val_det_fa"]).size)
-        )
-    if inferred_num_tasks <= 0:
-        inferred_num_tasks = max(int(fallback_num_tasks), 1)
-
-    if val_f1_array.size >= inferred_num_tasks:
-        final_slice = val_f1_array[-inferred_num_tasks:]
-        return float(np.mean(final_slice))
-
-    return float(np.mean(val_f1_array))
+    final_num_tasks = max(int(num_tasks), 1)
+    if macro_f1_array.size > final_num_tasks:
+        return float(np.mean(macro_f1_array[-final_num_tasks:]))
+    return float(np.mean(macro_f1_array))
 
 
 def run_single_trial(
@@ -699,6 +732,9 @@ def run_single_trial(
     if seed_override is not None:
         trial_timestamp = f"{trial_timestamp}-seed{args.seed}"
 
+    # Task presentation order follows the trial seed unless --task-order-seed pins it.
+    misc_utils.resolve_task_order_seed(args)
+
     misc_utils.init_seed(args.seed)
     log_dir, tf_dir = misc_utils.log_dir(args, trial_timestamp, model_name)
     args.log_dir = log_dir
@@ -733,75 +769,37 @@ def run_single_trial(
         model = model.cuda()
 
     try:
-        if args.model == "iid2":
-            # IID2 is a non-lifelong (single-round) experiment. We run the
-            # single-round training pipeline and map its metrics into the
-            # same result-tuple shape the tuner expects.
-            from main_single_round import (
-                build_single_round_loaders,
-                run_single_round_training,
-            )
-
-            train_loader, test_loader, _selected_indices = build_single_round_loaders(
-                args, loader
-            )
-            (
-                result_val_t,
-                result_val_a,
-                spent,
-                metrics_payload,
-            ) = run_single_round_training(model, train_loader, test_loader, args)
-
-            # main_single_round does not compute separate test metrics.
-            result_test_t = torch.empty((0,), dtype=torch.long)
-            result_test_a = torch.empty((0, 0), dtype=torch.float)
-            result_test_det_a = torch.empty((0,), dtype=torch.float)
-            result_test_det_fa = torch.empty((0,), dtype=torch.float)
-
-            result_val_det_a = torch.as_tensor(
-                metrics_payload.get("val_det_acc", []), dtype=torch.float
-            )
-            result_val_det_fa = torch.as_tensor(
-                metrics_payload.get("val_det_fa", []), dtype=torch.float
-            )
-        else:
-            (
-                result_val_t,
-                result_val_a,
-                result_test_t,
-                result_test_a,
-                result_val_det_a,
-                result_val_det_fa,
-                result_test_det_a,
-                result_test_det_fa,
-                _result_val_f1,
-                _result_test_f1,
-                spent,
-            ) = life_experience(model, loader, args)
+        (
+            result_val_t,
+            result_val_a,
+            _result_val_prec,
+            _result_val_f1,
+            result_test_t,
+            result_test_a,
+            spent,
+            _headline,
+        ) = life_experience(model, loader, args)
     finally:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     val_scores = extract_final_scores(result_val_a)
     test_scores = extract_final_scores(result_test_a)
-    val_det_scores = extract_final_scores(result_val_det_a)
-    val_pfa_scores = extract_final_scores(result_val_det_fa)
-    test_det_scores = extract_final_scores(result_test_det_a)
-    test_pfa_scores = extract_final_scores(result_test_det_fa)
 
+    cil_mode = args.loader == "class_incremental_loader"
     val_mean = compute_mean(val_scores)
-    val_f1_mean = extract_total_f1_mean_from_trial_logs(log_dir, len(val_scores))
-    det_mean = compute_mean(val_det_scores)
-    pfa_mean = compute_mean(val_pfa_scores)
-    if np.isnan(val_f1_mean):
+    val_macro_f1_mean = extract_macro_f1_mean_from_trial_logs(
+        log_dir, len(val_scores), cil_mode=cil_mode
+    )
+    if np.isnan(val_macro_f1_mean):
         print(
-            "[WARN] Trial {} has no usable val_f1 in {}. Falling back to val_mean ({:.4f}) for tuning score.".format(
+            "[WARN] Trial {} has no usable macro F1 in {}. Falling back to val_mean ({:.4f}) for tuning score.".format(
                 trial_idx, log_dir, val_mean
             )
         )
         score = val_mean
     else:
-        score = val_f1_mean
+        score = val_macro_f1_mean
 
     return {
         "status": "ok",
@@ -815,17 +813,143 @@ def run_single_trial(
         "fixed_params": dict(constant_overrides),
         "val_per_task": val_scores,
         "val_mean": val_mean,
-        "val_f1_mean": val_f1_mean,
-        "val_det_per_task": val_det_scores,
-        "val_det_mean": det_mean,
-        "val_pfa_per_task": val_pfa_scores,
-        "val_pfa_mean": pfa_mean,
+        "val_macro_f1_mean": val_macro_f1_mean,
         "test_per_task": test_scores,
         "test_mean": compute_mean(test_scores),
-        "test_det_per_task": test_det_scores,
-        "test_det_mean": compute_mean(test_det_scores),
-        "test_pfa_per_task": test_pfa_scores,
-        "test_pfa_mean": compute_mean(test_pfa_scores),
+        "score": score,
+        "duration_sec": float(spent),
+    }
+
+
+def run_single_round_trial(
+    base_args: argparse.Namespace,
+    constant_overrides: Dict[str, Any],
+    trial_overrides: Dict[str, Any],
+    trial_idx: int,
+    session_timestamp: str,
+    runs_root: Path,
+    seed_offset: int,
+    vary_seed: bool,
+    keep_expt_name: bool,
+    model_name: str,
+    seed_override: int | None = None,
+) -> Dict[str, Any]:
+    """Run one trial through main_single_round.py's non-lifelong training loop.
+
+    Mirrors :func:`run_single_trial`, but drives the single-round (no task
+    boundaries, no replay) training path used by ``main_single_round.py``
+    instead of ``main.life_experience``.
+
+    Usage:
+        outcome = run_single_round_trial(base_args, {}, {"lr": 0.01}, 0, ts, root, 0, False, False, "iid2")
+    """
+    args = deepcopy(base_args)
+    merged = dict(constant_overrides)
+    merged.update(trial_overrides)
+    for key, value in merged.items():
+        setattr(args, key, value)
+
+    args.model = model_name
+
+    args.log_dir = str(runs_root)
+    if seed_override is not None:
+        args.seed = int(seed_override)
+    else:
+        seed_base = int(getattr(base_args, "seed", 0) + seed_offset)
+        args.seed = seed_base + (trial_idx if vary_seed else 0)
+
+    trial_slug = slugify_params(trial_overrides)
+    if not keep_expt_name:
+        base_name = getattr(base_args, "expt_name", model_name)
+        seed_tag = f"_seed{args.seed}" if seed_override is not None else ""
+        args.expt_name = f"{base_name}_tune_{trial_idx:03d}_{trial_slug}{seed_tag}"[
+            :120
+        ]
+
+    trial_timestamp = f"{session_timestamp}-trial{trial_idx:03d}"
+    if seed_override is not None:
+        trial_timestamp = f"{trial_timestamp}-seed{args.seed}"
+
+    misc_utils.resolve_task_order_seed(args)
+
+    misc_utils.init_seed(args.seed)
+    log_dir, tf_dir = misc_utils.log_dir(args, trial_timestamp, model_name)
+    args.log_dir = log_dir
+    args.tf_dir = tf_dir
+    if hasattr(args, "data_path"):
+        data_path = Path(args.data_path).expanduser()
+        if not data_path.is_absolute() and not data_path.exists():
+            candidate = REPO_ROOT / data_path
+            if candidate.exists():
+                args.data_path = str(candidate)
+
+    loader_mod = importlib.import_module(f"dataloaders.{args.loader}")
+    loader = loader_mod.IncrementalLoader(args, seed=args.seed)
+    n_inputs, n_outputs, n_tasks = loader.get_dataset_info()
+    args.get_samples_per_task = getattr(loader, "get_samples_per_task", None)
+    args.classes_per_task = getattr(loader, "classes_per_task", None)
+
+    model_mod = importlib.import_module(f"model.{args.model}")
+    model = model_mod.Net(n_inputs, n_outputs, n_tasks, args)
+
+    if getattr(args, "cuda", False) and torch.cuda.is_available():
+        model = model.cuda()
+
+    try:
+        train_loader, test_loader, selected_indices = build_single_round_loaders(
+            args, loader
+        )
+        (
+            _result_val_t,
+            result_val_a,
+            spent,
+            metrics_payload,
+        ) = run_single_round_training(
+            model,
+            train_loader,
+            test_loader,
+            args,
+            task_index=max(selected_indices),
+        )
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    metrics_dir = Path(log_dir) / "metrics"
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    np.savez(metrics_dir / "task0.npz", **metrics_payload)
+
+    val_scores = extract_final_scores(result_val_a)
+    val_mean = compute_mean(val_scores)
+
+    val_macro_f1_per_epoch = np.asarray(
+        metrics_payload.get("val_macro_f1_per_epoch", []), dtype=float
+    )
+    finite_f1 = val_macro_f1_per_epoch[~np.isnan(val_macro_f1_per_epoch)]
+    val_macro_f1_mean = float(finite_f1[-1]) if finite_f1.size else float("nan")
+    if np.isnan(val_macro_f1_mean):
+        print(
+            "[WARN] Trial {} has no usable macro F1 in {}. Falling back to val_mean ({:.4f}) for tuning score.".format(
+                trial_idx, log_dir, val_mean
+            )
+        )
+        score = val_mean
+    else:
+        score = val_macro_f1_mean
+
+    return {
+        "status": "ok",
+        "trial": trial_idx,
+        "log_dir": log_dir,
+        "tf_dir": tf_dir,
+        "params": merged,
+        "trial_params": dict(trial_overrides),
+        "fixed_params": dict(constant_overrides),
+        "val_per_task": val_scores,
+        "val_mean": val_mean,
+        "val_macro_f1_mean": val_macro_f1_mean,
+        "test_per_task": [],
+        "test_mean": float("nan"),
         "score": score,
         "duration_sec": float(spent),
     }
@@ -872,21 +996,13 @@ def aggregate_seed_results(
     """
     scalar_keys = [
         "val_mean",
-        "val_f1_mean",
-        "val_det_mean",
-        "val_pfa_mean",
+        "val_macro_f1_mean",
         "test_mean",
-        "test_det_mean",
-        "test_pfa_mean",
         "score",
     ]
     list_keys = [
         "val_per_task",
-        "val_det_per_task",
-        "val_pfa_per_task",
         "test_per_task",
-        "test_det_per_task",
-        "test_pfa_per_task",
     ]
 
     aggregated = dict(per_seed_results[0])
@@ -925,15 +1041,19 @@ def run_trial_over_seeds(
     keep_expt_name: bool,
     model_name: str,
     seeds: Sequence[int],
+    trial_runner: Callable[..., Dict[str, Any]] = run_single_trial,
 ) -> Dict[str, Any]:
     """Run one trial, optionally averaging its metrics over several seeds.
 
     When ``seeds`` is empty the behaviour is identical to a single
-    ``run_single_trial`` call. Otherwise the trial is run once per seed and the
+    ``trial_runner`` call. Otherwise the trial is run once per seed and the
     results are combined with :func:`aggregate_seed_results`.
 
     Args:
         seeds: Seeds to average over; empty for single-seed behaviour.
+        trial_runner: The single-trial function to invoke (``run_single_trial``
+            for the lifelong path, ``run_single_round_trial`` for the
+            ``main_single_round.py`` path).
         (Remaining args mirror :func:`run_single_trial`.)
 
     Returns:
@@ -943,7 +1063,7 @@ def run_trial_over_seeds(
         record = run_trial_over_seeds(..., seeds=[0, 39, 55])
     """
     if not seeds:
-        return run_single_trial(
+        return trial_runner(
             base_args,
             constant_overrides,
             trial_overrides,
@@ -958,7 +1078,7 @@ def run_trial_over_seeds(
 
     per_seed_results: List[Dict[str, Any]] = []
     for seed in seeds:
-        outcome = run_single_trial(
+        outcome = trial_runner(
             base_args,
             constant_overrides,
             trial_overrides,
@@ -973,7 +1093,8 @@ def run_trial_over_seeds(
         )
         print(
             f"  seed {seed}: score={outcome['score']:.4f}"
-            f" (val_f1={outcome['val_f1_mean']:.4f}, val={outcome['val_mean']:.4f})"
+            f" (val_macro_f1={outcome['val_macro_f1_mean']:.4f},"
+            f" val={outcome['val_mean']:.4f})"
         )
         per_seed_results.append(outcome)
     return aggregate_seed_results(per_seed_results, seeds)
@@ -995,11 +1116,8 @@ def dump_summary(
         "seed",
         "score",
         "val_mean",
-        "val_det_mean",
-        "val_pfa_mean",
+        "val_macro_f1_mean",
         "test_mean",
-        "test_det_mean",
-        "test_pfa_mean",
         "duration_sec",
         "log_dir",
     ]
@@ -1020,11 +1138,8 @@ def dump_summary(
                 "seed": trial.get("seed"),
                 "score": trial.get("score"),
                 "val_mean": trial.get("val_mean"),
-                "val_det_mean": trial.get("val_det_mean"),
-                "val_pfa_mean": trial.get("val_pfa_mean"),
+                "val_macro_f1_mean": trial.get("val_macro_f1_mean"),
                 "test_mean": trial.get("test_mean"),
-                "test_det_mean": trial.get("test_det_mean"),
-                "test_pfa_mean": trial.get("test_pfa_mean"),
                 "duration_sec": trial["duration_sec"],
                 "log_dir": trial["log_dir"],
             }
@@ -1098,6 +1213,10 @@ def run_tuning(preset: TuningPreset) -> None:
     base_args = file_parser.parse_args_from_yaml(config_sources)
     if getattr(base_args, "model", preset.model_name) != preset.model_name:
         base_args.model = preset.model_name
+
+    # Override the config's `seed:` so trials use the tuning seed rather than a
+    # seed (and therefore a task order) that also appears in reported results.
+    base_args.seed = int(getattr(cli, "base_seed", TUNING_DEFAULT_SEED))
 
     constant_overrides = parse_override_specs(
         cli.override, base_args, preset.type_hints
@@ -1209,6 +1328,8 @@ def run_tuning(preset: TuningPreset) -> None:
     runs_root = session_dir / "runs"
     runs_root.mkdir(parents=True, exist_ok=True)
 
+    trial_runner = run_single_round_trial if preset.single_round else run_single_trial
+
     results: List[Dict[str, Any]] = []
 
     def run_trials(
@@ -1233,6 +1354,7 @@ def run_tuning(preset: TuningPreset) -> None:
                     cli.keep_expt_name,
                     preset.model_name,
                     seeds,
+                    trial_runner=trial_runner,
                 )
             except Exception as exc:  # pylint: disable=broad-except
                 trace = traceback.format_exc()
@@ -1433,9 +1555,9 @@ def run_tuning(preset: TuningPreset) -> None:
                     "stage2_std": float(np.std(finite_scores)),
                     "score": float(np.mean(finite_scores)),
                     "val_mean": _mean_of_field(per_seed_sources, "val_mean"),
-                    "val_f1_mean": _mean_of_field(per_seed_sources, "val_f1_mean"),
-                    "val_det_mean": _mean_of_field(per_seed_sources, "val_det_mean"),
-                    "val_pfa_mean": _mean_of_field(per_seed_sources, "val_pfa_mean"),
+                    "val_macro_f1_mean": _mean_of_field(
+                        per_seed_sources, "val_macro_f1_mean"
+                    ),
                     "duration_sec": _mean_of_field(per_seed_sources, "duration_sec"),
                     "log_dir": per_seed_logs[0] if per_seed_logs else candidate.get("log_dir"),
                     "stage2_log_dirs": per_seed_logs,
@@ -1496,12 +1618,18 @@ def run_tuning(preset: TuningPreset) -> None:
             )
         if cli.config and not inert_sweep:
             target_yaml = resolve_cli_config_path(cli.config[-1])
+            # ``trial_params`` holds only the winning trial's own stage; earlier
+            # hierarchical / lr-first winners ride along in ``params``. Constant
+            # overrides are not searched, so they stay out of the model YAML.
             if hierarchical_final_params and not stage2_aggregates:
-                values_to_write = dict(hierarchical_final_params)
+                winning_params = hierarchical_final_params
             else:
-                values_to_write = dict(
-                    best.get("params") or best.get("trial_params") or {}
-                )
+                winning_params = best.get("params") or {}
+            values_to_write = {
+                key: value
+                for key, value in winning_params.items()
+                if key in full_search_space
+            }
             if values_to_write:
                 try:
                     updated_yaml_values = write_best_params_to_yaml(
@@ -1552,6 +1680,8 @@ __all__ = [
     "make_main",
     "select_best_trial",
     "parse_seeds",
+    "run_single_trial",
+    "run_single_round_trial",
     "run_trial_over_seeds",
     "aggregate_seed_results",
 ]

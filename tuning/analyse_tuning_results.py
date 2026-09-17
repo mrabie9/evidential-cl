@@ -99,13 +99,10 @@ def flatten_results(results: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "params": params,
                 "score": item.get("score", float("nan")),
                 "val_mean": item.get("val_mean", float("nan")),
-                "val_det_mean": item.get("val_det_mean", float("nan")),
-                "val_pfa_mean": item.get("val_pfa_mean", float("nan")),
+                "val_macro_f1_mean": item.get("val_macro_f1_mean", float("nan")),
                 "val_min": val_min,
                 "val_max": val_max,
                 "val_std": val_std,
-                "test_det_mean": item.get("test_det_mean", float("nan")),
-                "test_pfa_mean": item.get("test_pfa_mean", float("nan")),
                 "duration_sec": item.get("duration_sec"),
                 "log_dir": item.get("log_dir"),
             }
@@ -259,12 +256,11 @@ def print_header(
     best_score = best.get("score")
     if is_finite_number(best_score):
         print(
-            "  trial #{} | score={} | val_mean={} | det_mean={} | pfa_mean={}".format(
+            "  trial #{} | score={} | val_mean={} | macro_f1={}".format(
                 best.get("trial"),
                 fmt_float(best_score),
                 fmt_float(best.get("val_mean")),
-                fmt_float(best.get("val_det_mean")),
-                fmt_float(best.get("val_pfa_mean")),
+                fmt_float(best.get("val_macro_f1_mean")),
             )
         )
     else:
@@ -306,7 +302,7 @@ def print_top_trials(
     param_header = " ".join(f"{name:>{width}}" for name, width in param_cols)
     header = (
         f"{'rank':>4} {'trial':>5} {'seed':>5} {metric_key:>10} {'val_mean':>10} "
-        f"{'det_mean':>10} {'pfa_mean':>10} {'val_std':>10} {'duration_s':>11}"
+        f"{'macro_f1':>10} {'val_std':>10} {'duration_s':>11}"
     )
     if param_header:
         header = f"{header} {param_header}"
@@ -321,8 +317,9 @@ def print_top_trials(
         print(
             f"{idx:>4} {row.get('trial', ''):>5} {('' if seed is None else seed):>5} "
             f"{fmt_float(row.get(metric_key)):>10} "
-            f"{fmt_float(row.get('val_mean')):>10} {fmt_float(row.get('val_det_mean')):>10} "
-            f"{fmt_float(row.get('val_pfa_mean')):>10} {fmt_float(row.get('val_std')):>10} "
+            f"{fmt_float(row.get('val_mean')):>10} "
+            f"{fmt_float(row.get('val_macro_f1_mean')):>10} "
+            f"{fmt_float(row.get('val_std')):>10} "
             f"{fmt_float(row.get('duration_sec'), 2):>11}"
             f"{' ' + param_values if param_values else ''}"
         )

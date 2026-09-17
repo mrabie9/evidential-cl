@@ -1,10 +1,8 @@
-# La-MAML specific defaults
 model: lamaml_cifar
 loader: class_incremental_loader
 learn_lr: false
 sync_update: true
 use_old_task_memory: false
 second_order: false
-
-opt_wt: 0.01 # beta
-alpha_init: 0.003 # alpha
+opt_wt: 0.01
+alpha_init: 0.0001

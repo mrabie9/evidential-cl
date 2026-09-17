@@ -1,5 +1,3 @@
 model: lwf
 loader: task_incremental_loader
-
-lr: 0.01
-distill_lambda: 1.0
+distill_lambda: 0.5

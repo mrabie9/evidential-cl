@@ -11,7 +11,6 @@ from torch.autograd import Variable
 
 from model.optimizers_lib import optimizers_lib
 from ast import literal_eval
-from model.detection_replay import noise_label_from_args
 from model.resnet1d import ResNet1D
 from utils.training_metrics import macro_recall
 from utils import misc_utils
@@ -48,7 +47,7 @@ class MetaBgdConfig:
     memories: int = 5120
     replay_batch_size: int = 20
     use_old_task_memory: bool = False
-    grad_clip_norm: Optional[float] = 2.0
+    grad_clip_norm: Optional[float] = 0.0
     meta_batches: int = 3
     cifar_batches: int = 1
 
@@ -135,7 +134,6 @@ class Net(torch.nn.Module):
         # else:
         #     self.nc_per_task = n_outputs
         self.n_outputs = n_outputs
-        self.noise_label: int | None = noise_label_from_args(args)
         self.is_task_incremental = True
 
         self.obseve_itr = 0
@@ -165,7 +163,6 @@ class Net(torch.nn.Module):
                 self.classes_per_task,
                 self.n_outputs,
                 cil_all_seen_upto_task=cil_all_seen_upto_task,
-                global_noise_label=self.noise_label,
                 fill_value=-10e10,
                 loader=self.incremental_loader_name,
             )

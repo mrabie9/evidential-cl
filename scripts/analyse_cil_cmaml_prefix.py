@@ -34,6 +34,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from analyse_cil_ablations import holm, paired_stats, verdict  # noqa: E402
+from results_txt import f1_matrix
 
 REPO = "/home/lunet/wsmr11/repos/evidential-cl"
 LOGS = os.path.join(REPO, "logs")
@@ -64,18 +65,10 @@ CURATED = {"M2": "cmaml/M2"}
 def parse_matrix(path):
     """Return (baseline, R) from a results.txt. baseline is the pre-training zero-shot row
     printed above the '|' separator; R is the (T, T) matrix printed below it."""
-    lines = [ln.strip() for ln in open(path)]
-    sep = lines.index("|")
-    baseline = np.array([float(v) for v in lines[sep - 1].split()])
-    rows = []
-    for ln in lines[sep + 1 :]:
-        if not ln:
-            break
-        rows.append([float(v) for v in ln.split()])
-    R = np.array(rows)
-    if R.shape[0] != R.shape[1]:
-        raise ValueError(f"non-square matrix {R.shape} in {path}")
-    return baseline, R
+    try:
+        return f1_matrix(open(path).read())
+    except ValueError as exc:
+        raise ValueError(f"{exc} in {path}") from exc
 
 
 def forward_zs(seed_dir, k):

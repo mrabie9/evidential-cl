@@ -1,5 +1,4 @@
 model: hat
 loader: task_incremental_loader
-lr: 0.003
 gamma: 1
-smax: 25
+smax: 400

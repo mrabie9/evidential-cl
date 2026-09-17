@@ -45,6 +45,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
@@ -62,6 +63,13 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 from matplotlib.ticker import MultipleLocator  # noqa: E402
 from matplotlib.transforms import Bbox  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from utils.metric_keys import (  # noqa: E402
+    extract_metric,
+    first_present_key,
+    metric_aliases,
+)
 
 try:
     # Reuse the same plot styling config (til/cil sizing & legend layout)
@@ -351,13 +359,19 @@ def load_metrics(metrics_dir: Path) -> List[TaskMetrics]:
     for path in task_files:
         data = np.load(path, allow_pickle=True)
         task_data: TaskMetrics = {key: np.asarray(data[key]) for key in data.files}
-        # Truncate validation metrics (e.g. val_acc, val_f1) in the same way as
-        # scripts/plot_metrics.py so that only the final per-task values remain.
+        # Truncate validation metrics (e.g. val_macro_rec, val_macro_f1) in the
+        # same way as scripts/plot_metrics.py so that only the final per-task
+        # values remain. val_macro_f1 in particular accumulates across the
+        # whole run (never reset per task in life_experience), so without this
+        # the same early entries get read back for every task and forgetting
+        # comes out as 0. Walk both canonical and legacy key names so runs
+        # produced before the cls_* -> macro_* rename still load correctly.
         task_idx = _task_index(path.name)
         num_tasks_seen = task_idx + 1
-        for key in ("val_acc", "val_f1"):
-            if key in task_data and len(task_data[key]) > num_tasks_seen:
-                task_data[key] = task_data[key][-num_tasks_seen:]
+        for canonical_key in ("val_macro_rec", "val_macro_f1"):
+            for key in metric_aliases(canonical_key):
+                if key in task_data and len(task_data[key]) > num_tasks_seen:
+                    task_data[key] = task_data[key][-num_tasks_seen:]
         tasks.append(task_data)
     return tasks
 
@@ -807,19 +821,19 @@ def _resolve_train_metric_for_task(
     Raises:
         KeyError: If required metric keys are missing for the selected choice.
     """
-    if train_metric_choice == "total_f1":
-        f1_values = task.get("train_f1")
+    if train_metric_choice == "macro_f1":
+        f1_values = extract_metric(task, "train_macro_f1")
         if f1_values is None:
-            raise KeyError("Requested train total_f1 but 'train_f1' is missing.")
-        return np.asarray(f1_values, dtype=float), "Train total F1"
+            raise KeyError("Requested train macro_f1 but no macro-F1 key is present.")
+        return np.asarray(f1_values, dtype=float), "Train macro F1"
 
-    # train_metric_choice == "cls_recall"
-    recall_values = task.get("cls_tr_rec")
+    # train_metric_choice == "macro_rec"
+    recall_values = extract_metric(task, "tr_macro_rec")
     if recall_values is None:
         recall_values = task.get("tr_acc")
     if recall_values is None:
-        raise KeyError("Neither 'cls_tr_rec' nor 'tr_acc' found in task metrics.")
-    return np.asarray(recall_values, dtype=float), "Train recall"
+        raise KeyError("No training macro-recall key found in task metrics.")
+    return np.asarray(recall_values, dtype=float), "Train macro recall"
 
 
 def _plot_train_metric_vs_steps(
@@ -838,7 +852,7 @@ def _plot_train_metric_vs_steps(
             task, train_metric_choice
         )
         y_label = metric_label
-        if train_metric_choice == "total_f1":
+        if train_metric_choice == "macro_f1":
             x_values = np.arange(1, len(metric_values) + 1)
             x_axis_label = "Epoch"
         else:
@@ -991,66 +1005,40 @@ def _plot_final_validation_metrics(
     tasks: Sequence[TaskMetrics],
     task_names: Sequence[str] | None,
 ) -> None:
-    """Plot final validation metrics from last task.
+    """Plot per-task final validation macro recall from the last task.
 
-    Bars are ordered with false alarm (pfa) first, followed by detection
-    recall and the selected classification validation metric.
+    Args:
+        ax: Axis to draw on.
+        tasks: Per-task metric dicts for one run, in task order.
+        task_names: Optional task names used for consistent per-task colouring.
+
+    Returns:
+        None.
+
+    Usage:
+        _plot_final_validation_metrics(ax, run.tasks, task_names)
     """
     if not tasks:
         return
 
-    last = tasks[-1]
-    val_acc = last.get("val_acc")
-    val_det_acc = last.get("val_det_acc")
-    val_det_fa = last.get("val_det_fa")
-
-    if val_acc is None and val_det_acc is None and val_det_fa is None:
+    val_recall = extract_metric(tasks[-1], "val_macro_rec")
+    if val_recall is None:
         return
 
-    # Determine number of tasks from metrics that are present, using the
-    # minimum length so that all plotted series align.
-    lengths = [len(v) for v in (val_det_fa, val_det_acc, val_acc) if v is not None]
-    if not lengths:
+    recall_values = np.asarray(val_recall, dtype=float).reshape(-1)
+    n_tasks = recall_values.size
+    if n_tasks == 0:
         return
-    n_tasks = min(lengths)
     task_indices = np.arange(n_tasks)
     colors = [get_task_color(i, task_names) for i in range(n_tasks)]
-    width = 0.25
 
-    # False alarm rate (pfa) first
-    if val_det_fa is not None:
-        fa_vals = np.asarray(val_det_fa, dtype=float)
-        ax.bar(
-            task_indices - width,
-            fa_vals[:n_tasks],
-            width=width,
-            label="Pfa",
-            color=colors,
-            hatch="//",
-        )
-
-    # Detection recall
-    if val_det_acc is not None:
-        det_vals = np.asarray(val_det_acc, dtype=float)
-        ax.bar(
-            task_indices,
-            det_vals[:n_tasks],
-            width=width,
-            label="Det recall",
-            color=colors,
-            hatch="..",
-        )
-
-    # Classification recall
-    if val_acc is not None:
-        cls_vals = np.asarray(val_acc, dtype=float)
-        ax.bar(
-            task_indices + width,
-            cls_vals[:n_tasks],
-            width=width,
-            label="Cls recall",
-            color=colors,
-        )
+    ax.bar(
+        task_indices,
+        recall_values,
+        width=0.6,
+        label="Macro recall",
+        color=colors,
+    )
 
     ax.set_xlabel("Task")
     ax.set_ylabel("Metric value")
@@ -1061,38 +1049,36 @@ def _plot_final_validation_metrics(
 
 def _mean_final_metric_for_run(
     metrics: TaskMetrics,
-    metric_key: str,
+    canonical_key: str,
     fallback_num_tasks: int,
 ) -> float | None:
     """Return a run-level final metric aligned with SUMMARY_TE semantics.
 
-    For metrics stored as per-task final vectors (e.g. ``val_det_acc``), this
-    returns the mean over that vector. For flattened per-eval arrays (e.g.
-    ``val_acc``/``val_f1`` in some logs), this uses the last ``n_tasks``
-    entries where ``n_tasks`` is inferred from detection vectors when possible.
+    Metrics may be stored either as a per-task final vector or as a flattened
+    per-eval array. In the flattened case the last ``n_tasks`` entries are the
+    final evaluation, where ``n_tasks`` is taken from the run's task count.
+
+    Args:
+        metrics: Stored metric arrays for the final task.
+        canonical_key: Canonical metric name (legacy spellings are resolved).
+        fallback_num_tasks: Number of tasks in the run.
+
+    Returns:
+        Mean of the final per-task values, or ``None`` when absent/empty.
+
+    Usage:
+        mean_rec = _mean_final_metric_for_run(last, "val_macro_rec", len(run.tasks))
     """
-    values = metrics.get(metric_key)
+    values = extract_metric(metrics, canonical_key)
     if values is None:
         return None
     arr = np.asarray(values, dtype=float).reshape(-1)
     if arr.size == 0:
         return None
 
-    # Infer final number of tasks from per-task detection vectors when present.
-    det_acc = metrics.get("val_det_acc")
-    det_fa = metrics.get("val_det_fa")
-    inferred_num_tasks = 0
-    if det_acc is not None:
-        inferred_num_tasks = max(inferred_num_tasks, int(np.asarray(det_acc).size))
-    if det_fa is not None:
-        inferred_num_tasks = max(inferred_num_tasks, int(np.asarray(det_fa).size))
-    if inferred_num_tasks <= 0:
-        inferred_num_tasks = max(int(fallback_num_tasks), 1)
-
-    if metric_key in {"val_acc", "val_f1"} and arr.size >= inferred_num_tasks:
-        final_slice = arr[-inferred_num_tasks:]
-        return float(np.mean(final_slice))
-
+    num_tasks = max(int(fallback_num_tasks), 1)
+    if arr.size > num_tasks:
+        return float(np.mean(arr[-num_tasks:]))
     return float(np.mean(arr))
 
 
@@ -1106,10 +1092,10 @@ def _concat_train_metric_for_run(
     If multiple tasks exist, task series are concatenated in task order.
     """
     if not tasks:
-        return None, "Train recall"
+        return None, "Train macro recall"
 
     per_task_series: list[np.ndarray] = []
-    metric_label = "Train recall"
+    metric_label = "Train macro recall"
     for task in tasks:
         try:
             metric_values, metric_label = _resolve_train_metric_for_task(
@@ -1130,7 +1116,7 @@ def _concat_train_metric_for_run(
 
 def _resolve_train_x_axis_label(train_metric_choice: str) -> str:
     """Resolve x-axis label for the first panel train metric plot."""
-    return "Epoch" if train_metric_choice == "total_f1" else "Step"
+    return "Epoch" if train_metric_choice == "macro_f1" else "Step"
 
 
 def _build_axis_only_export_bbox(
@@ -1192,8 +1178,8 @@ def plot_multi_algorithms(
     runs: Sequence[AlgoRun],
     output_dir: Path | None,
     same_y_limits: bool = False,
-    val_metric_choice: str = "total_f1",
-    train_metric_choice: str = "cls_recall",
+    val_metric_choice: str = "macro_f1",
+    train_metric_choice: str = "macro_rec",
     labels: Sequence[str] | None = None,
     labels_grouping: Sequence[str] | None = None,
     plot_layout: str = "separate",
@@ -1268,17 +1254,32 @@ def plot_multi_algorithms(
 
     def _resolve_val_metric_for_run(choice: str, run: AlgoRun) -> tuple[str, str]:
         """Resolve validation metric key and label for a single run."""
-        if choice == "cls_recall":
-            return "val_acc", "Cls recall"
-        # choice == "total_f1": prefer F1 when available, fall back to recall.
-        has_f1 = any("val_f1" in t for t in run.tasks)
-        if has_f1:
-            return "val_f1", "Total F1"
-        print(
-            f"[WARN] Requested val-metric=total_f1 but run '{run.name}' at "
-            f"{run.metrics_dir} has no 'val_f1'; falling back to cls recall ('val_acc')."
+        recall_key = next(
+            (
+                k
+                for task in run.tasks
+                if (k := first_present_key(task, ["val_macro_rec"]))
+            ),
+            "val_macro_rec",
         )
-        return "val_acc", "Cls recall"
+        if choice == "macro_rec":
+            return recall_key, "Macro recall"
+        # choice == "macro_f1": prefer F1 when available, fall back to recall.
+        f1_key = next(
+            (
+                k
+                for task in run.tasks
+                if (k := first_present_key(task, ["val_macro_f1"]))
+            ),
+            None,
+        )
+        if f1_key is not None:
+            return f1_key, "Macro F1"
+        print(
+            f"[WARN] Requested val-metric=macro_f1 but run '{run.name}' at "
+            f"{run.metrics_dir} has no macro-F1 key; falling back to macro recall."
+        )
+        return recall_key, "Macro recall"
 
     # Resolve label for column titles from the first run.
     first_key, first_label = _resolve_val_metric_for_run(val_metric_choice, runs[0])
@@ -1318,7 +1319,7 @@ def plot_multi_algorithms(
             )
             if train_series is None:
                 continue
-            if train_metric_choice == "total_f1":
+            if train_metric_choice == "macro_f1":
                 x_values = np.arange(1, len(train_series) + 1)
             else:
                 x_values = np.arange(len(train_series))
@@ -1342,45 +1343,31 @@ def plot_multi_algorithms(
             if not run.tasks:
                 continue
             last = run.tasks[-1]
-            val_acc = last.get("val_acc")
-            val_det_acc = last.get("val_det_acc")
-            val_det_fa = last.get("val_det_fa")
-            if val_acc is None and val_det_acc is None and val_det_fa is None:
-                continue
             # Match SUMMARY_TE aggregation (mean over final per-task values).
             x_center = run_idx
-            width = 0.2
-            mean_pfa = _mean_final_metric_for_run(last, "val_det_fa", len(run.tasks))
-            mean_det = _mean_final_metric_for_run(last, "val_det_acc", len(run.tasks))
-            mean_cls = _mean_final_metric_for_run(last, "val_acc", len(run.tasks))
+            width = 0.3
+            mean_rec = _mean_final_metric_for_run(last, "val_macro_rec", len(run.tasks))
+            mean_f1 = _mean_final_metric_for_run(last, "val_macro_f1", len(run.tasks))
+            if mean_rec is None and mean_f1 is None:
+                continue
 
-            if mean_pfa is not None:
+            if mean_rec is not None:
                 row_axes[1].bar(
-                    x_center - width,
-                    mean_pfa,
+                    x_center - width / 2,
+                    mean_rec,
                     width=width,
-                    label="Pfa" if run_idx == 0 else None,
+                    label="Macro recall" if run_idx == 0 else None,
                     color=run_color,
-                    hatch="//",
                     alpha=0.8,
                 )
-            if mean_det is not None:
+            if mean_f1 is not None:
                 row_axes[1].bar(
-                    x_center,
-                    mean_det,
+                    x_center + width / 2,
+                    mean_f1,
                     width=width,
-                    label="Det recall" if run_idx == 0 else None,
+                    label="Macro F1" if run_idx == 0 else None,
                     color=run_color,
                     hatch="..",
-                    alpha=0.8,
-                )
-            if mean_cls is not None:
-                row_axes[1].bar(
-                    x_center + width,
-                    mean_cls,
-                    width=width,
-                    label="Cls recall" if run_idx == 0 else None,
-                    color=run_color,
                     alpha=0.8,
                 )
         row_axes[1].set_ylabel("Metric value")
@@ -1543,7 +1530,7 @@ def plot_multi_algorithms(
         axes[0][2].set_title(f"Val {first_label} over tasks")
         axes[0][3].set_title(f"Average forgetting ({first_label})")
 
-        # Keep the "Final validation metrics" panel legend (Pfa/Det recall/etc.).
+        # Keep the "Final validation metrics" panel legend.
         handles_fv, _ = axes[0][1].get_legend_handles_labels()
         if handles_fv:
             axes[0][1].legend(ncol=len(handles_fv), fontsize=8)
@@ -1837,8 +1824,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--train-metric",
         type=str,
-        choices=("total_f1", "cls_recall"),
-        default="cls_recall",
+        choices=("macro_f1", "macro_rec"),
+        default="macro_rec",
         help=(
             "Training metric to use for the 'vs step' panel. "
             "Choose total_f1 for total F1 or cls_recall for recall "
@@ -1848,8 +1835,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--val-metric",
         type=str,
-        choices=("total_f1", "cls_recall"),
-        default="total_f1",
+        choices=("macro_f1", "macro_rec"),
+        default="macro_f1",
         help=(
             "Validation metric to use for 'val over tasks' and average forgetting "
             "plots. Defaults to total_f1; falls back to cls_recall when F1 is "

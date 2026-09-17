@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """Fix SUMMARY_TR lines in all job logs under a run directory.
 
+LEGACY TOOL. This repairs run logs written *before* detection metrics and the
+noise class were removed, so every pattern below deliberately matches the old
+``cls_rec=/cls_prec=/cls_f1=/det=/fa=`` summary line and the old ``Det Rec`` /
+``Det FA`` epoch line. Current runs emit ``macro_rec=/macro_prec=/macro_f1=``
+and are not matched (or modified) by this script.
+
 The script reads each ``job_*.log`` in ``<run_dir>/job_logs`` and replaces the
 ``SUMMARY_TR ...`` line using per-task *final epoch* training lines:
 

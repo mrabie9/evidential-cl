@@ -19,11 +19,8 @@ import numpy as np
 import quadprog
 
 from model.resnet1d import ResNet1D
-from model.detection_replay import (
-    DetectionReplayMixin,
-    classification_loss_zero_stub,
-    noise_label_from_args,
-    signal_mask_exclude_noise,
+from model.replay_utils import (
+    ReplayInputMixin,
     unpack_y_to_class_labels,
 )
 from utils.training_metrics import macro_recall
@@ -44,7 +41,6 @@ class GemDistillConfig:
     balanced_replay: bool = (
         False  # class-balanced reservoir sampling (A1) instead of FIFO ring
     )
-    balance_signal_only: bool = False  # exclude the noise class from balancing
     inner_steps: int = 1
     lr: float = 1e-3
     n_memories: int = 0
@@ -54,10 +50,7 @@ class GemDistillConfig:
     alpha_init: float = 1e-3
     grad_clip_norm: Optional[float] = 100.0
     input_channels: int = 2
-    det_lambda: float = 1.0
     cls_lambda: float = 1.0
-    det_memories: int = 2000
-    det_replay_batch: int = 64
 
     @staticmethod
     def from_args(args: object) -> "GemDistillConfig":
@@ -142,7 +135,7 @@ def project2cone2(gradient, memories, margin=0.5, eps=1e-3):
     gradient.copy_(torch.Tensor(x).view(-1, 1))
 
 
-class Net(DetectionReplayMixin, nn.Module):
+class Net(ReplayInputMixin, nn.Module):
     def __init__(self, n_inputs, n_outputs, n_tasks, args):
         super(Net, self).__init__()
         self.cfg = GemDistillConfig.from_args(args)
@@ -154,7 +147,6 @@ class Net(DetectionReplayMixin, nn.Module):
         self.temp = float(self.cfg.temperature)
         self.kl = nn.KLDivLoss(reduction="batchmean")
         self.balanced_replay = bool(self.cfg.balanced_replay)
-        self.balance_signal_only = bool(self.cfg.balance_signal_only)
         # Ablation toggle: when False, skip both the past-task replay-gradient pass and the
         # QP projection, reducing GEM to plain fine-tuning at matched buffer size.
         self.use_qp = not bool(self.cfg.gem_disable_qp)
@@ -176,18 +168,9 @@ class Net(DetectionReplayMixin, nn.Module):
         self.class_weighted_ce = bool(getattr(args, "class_weighted_ce", True))
         self.n_outputs = n_outputs
         self.inner_steps = self.cfg.inner_steps
-        self.det_lambda = float(self.cfg.det_lambda)
         self.cls_lambda = float(self.cfg.cls_lambda)
-        self._init_det_replay(
-            self.cfg.det_memories,
-            self.cfg.det_replay_batch,
-            enabled=bool(getattr(args, "use_detector_arch", False)),
-        )
 
         self.opt = optim.SGD(self._ll_params(), self.cfg.lr, momentum=0.9)
-        self.det_opt = optim.SGD(
-            self.net.det_head.parameters(), self.cfg.lr, momentum=0.9
-        )
 
         self.n_memories = int(self.cfg.n_memories)
         self.task_memory_capacities = self._build_task_memory_capacities(
@@ -240,7 +223,6 @@ class Net(DetectionReplayMixin, nn.Module):
             classes_per_task=getattr(args, "classes_per_task", None),
         )
         self.nc_per_task = misc_utils.max_task_class_count(self.classes_per_task)
-        self.noise_label: int | None = noise_label_from_args(args)
         self.incremental_loader_name = getattr(args, "loader", None)
 
         # --- Distillation soft targets (frozen per task at its boundary) ---
@@ -337,8 +319,6 @@ class Net(DetectionReplayMixin, nn.Module):
 
     def _ll_params(self):
         for name, param in self.net.named_parameters():
-            if name.startswith("det_head"):
-                continue
             yield param
 
     def forward(self, x, t, *, cil_all_seen_upto_task=None):
@@ -358,7 +338,6 @@ class Net(DetectionReplayMixin, nn.Module):
             self.classes_per_task,
             self.n_outputs,
             cil_all_seen_upto_task=cil_all_seen_upto_task,
-            global_noise_label=self.noise_label,
             fill_value=-10e10,
             loader=self.incremental_loader_name,
         )
@@ -406,17 +385,6 @@ class Net(DetectionReplayMixin, nn.Module):
             return None
         return torch.stack(kl_terms).mean()
 
-    def _task_noise_label(self, t):
-        """Per-task noise/detection class id in global label space.
-
-        Prefers the global ``self.noise_label`` (set by CIL loaders); otherwise
-        falls back to the highest label of task ``t`` (TIL convention).
-        """
-        if self.noise_label is not None:
-            return int(self.noise_label)
-        _, offset2 = compute_offsets(t, self.classes_per_task, self.is_cifar)
-        return int(offset2) - 1
-
     def _update_ring_buffer(self, t, task_capacity, mem_x, y_all):
         """Original GEM per-task FIFO ring admission (default)."""
         write_pointer = int(self.task_mem_ptr[t].item())
@@ -453,16 +421,8 @@ class Net(DetectionReplayMixin, nn.Module):
 
         Balances admission across observed classes with no a-priori class stats, so
         replay and the distillation soft targets are not dominated by the frequent
-        classes. When ``balance_signal_only`` is set, the noise/detection class is
-        excluded from balancing: noise keeps a plain reservoir (≈ its natural rate,
-        set during the fill phase) and is never evicted to make room for signal, so
-        only the signal classes are balanced among themselves.
+        classes.
         """
-        # The noise/detection class is the highest label *within each task* (TIL
-        # convention; ``compute_offsets(t)[1] - 1``). The global ``self.noise_label``
-        # is only populated by CIL loaders, so we must derive it per task here or
-        # signal-only silently collapses to full class-balanced CBRS.
-        noise = self._task_noise_label(t) if self.balance_signal_only else None
         for i in range(y_all.size(0)):
             y_i = int(y_all[i].item())
             self.cls_seen[t, y_i] += 1
@@ -473,18 +433,8 @@ class Net(DetectionReplayMixin, nn.Module):
                 self.task_mem_filled[t] = filled + 1
                 self.cls_stored[t, y_i] += 1
                 continue
-            # Noise (signal-only mode): keep proportional via plain reservoir; never
-            # grow it by evicting signal, never evict it for signal.
-            if noise is not None and y_i == noise:
-                self._reservoir_replace(t, y_i, mem_x[i], task_capacity)
-                continue
             stored_row = self.cls_stored[t]
-            if noise is not None:
-                candidate = stored_row.clone()
-                candidate[noise] = -1  # exclude noise from the eviction pool
-                largest_c = int(torch.argmax(candidate).item())
-            else:
-                largest_c = int(torch.argmax(stored_row).item())
+            largest_c = int(torch.argmax(stored_row).item())
             if int(stored_row[y_i].item()) < int(stored_row[largest_c].item()):
                 # Under-represented class: evict a random sample of the largest class.
                 evict = self._random_slot_of_class(t, largest_c, task_capacity)
@@ -495,7 +445,7 @@ class Net(DetectionReplayMixin, nn.Module):
                 self.cls_stored[t, largest_c] -= 1
                 self.cls_stored[t, y_i] += 1
             else:
-                # Incoming is (one of) the largest signal class: reservoir within it.
+                # Incoming is (one of) the largest classes: reservoir within it.
                 self._reservoir_replace(t, y_i, mem_x[i], task_capacity)
 
     def observe(self, x, y, t):
@@ -510,38 +460,6 @@ class Net(DetectionReplayMixin, nn.Module):
             # legacy: flatten non-IQ inputs
             x = x.view(x.size(0), -1)
         y_work = unpack_y_to_class_labels(y)
-        # noise_label = None
-        # if class_counts is not None:
-        #     _, offset2 = misc_utils.compute_offsets(t, class_counts)
-        #     noise_label = offset2 - 1
-        # y_cls, y_det = self._unpack_labels(
-        #     y,
-        #     noise_label=noise_label,
-        #     use_detector_arch=bool(getattr(self, "det_enabled", False)),
-        # )
-        # if y_det is not None and self.det_memories > 0:
-        #     self._update_det_memory(x, y_det)
-        # x_det = x
-        # signal_mask = (y_det == 1) & (y_cls >= 0)
-        # if not signal_mask.any():
-        #     if not getattr(self, "det_enabled", True):
-        #         return 0.0, 0.0
-        #     self.det_opt.zero_grad()
-        #     det_logits, _ = self.net.forward_heads(x_det)
-        #     det_loss = self.det_loss(det_logits, y_det.float())
-        #     det_replay = self._sample_det_memory()
-        #     if det_replay is not None:
-        #         mem_x, mem_y = det_replay
-        #         mem_det_logits, _ = self.net.forward_heads(mem_x)
-        #         mem_loss = self.det_loss(mem_det_logits, mem_y.float())
-        #         det_loss = 0.5 * (det_loss + mem_loss)
-        #     det_loss = self.det_lambda * det_loss
-        #     det_loss.backward()
-        #     self.det_opt.step()
-        #     return float(det_loss.item()), 0.0
-
-        # x = x[signal_mask]
-        # y = y_cls[signal_mask]
 
         # track tasks
         if t != self.old_task:
@@ -594,25 +512,13 @@ class Net(DetectionReplayMixin, nn.Module):
                         self.memory_data[past_task, :filled]
                     )  # (mem, F) or (mem, 2, L)
                     mem_y_flat = self.memory_labs[past_task, :filled]
-                    replay_mask = signal_mask_exclude_noise(
-                        mem_y_flat, self.noise_label
+                    logits_replay = self.forward(mem_x, past_task)[:, offset1:offset2]
+                    targets_replay = mem_y_flat - offset1
+                    ptloss = classification_cross_entropy(
+                        logits_replay,
+                        targets_replay,
+                        class_weighted_ce=self.class_weighted_ce,
                     )
-                    if replay_mask.any():
-                        mem_x_sub = mem_x[replay_mask]
-                        logits_replay = self.forward(mem_x_sub, past_task)[
-                            :, offset1:offset2
-                        ]
-                        targets_replay = mem_y_flat[replay_mask] - offset1
-                        ptloss = classification_cross_entropy(
-                            logits_replay,
-                            targets_replay,
-                            class_weighted_ce=self.class_weighted_ce,
-                        )
-                    else:
-                        logits_replay = self.forward(mem_x[:1], past_task)[
-                            :, offset1:offset2
-                        ]
-                        ptloss = classification_loss_zero_stub(logits_replay)
                     ptloss.backward()
                     if self.cfg.grad_clip_norm:
                         torch.nn.utils.clip_grad_norm_(
@@ -624,12 +530,8 @@ class Net(DetectionReplayMixin, nn.Module):
             self.zero_grad()
             logits_full = self.forward(x, t, cil_all_seen_upto_task=t)
             targets = y_work.long()
-            signal_mask = signal_mask_exclude_noise(y_work, self.noise_label)
-            if signal_mask.any():
-                preds = torch.argmax(logits_full[signal_mask], dim=1)
-                cls_tr_rec.append(macro_recall(preds, targets[signal_mask]))
-            else:
-                cls_tr_rec.append(0.0)
+            preds = torch.argmax(logits_full, dim=1)
+            cls_tr_rec.append(macro_recall(preds, targets))
             loss = classification_cross_entropy(
                 logits_full, targets, class_weighted_ce=self.class_weighted_ce
             )
@@ -681,18 +583,5 @@ class Net(DetectionReplayMixin, nn.Module):
 
             self.opt.step()
             metric_logits = logits_full.detach()
-        # if getattr(self, "det_enabled", True):
-        #     self.det_opt.zero_grad()
-        #     det_logits, _ = self.net.forward_heads(x_det)
-        #     det_loss = self.det_loss(det_logits, y_det.float())
-        #     det_replay = self._sample_det_memory()
-        #     if det_replay is not None:
-        #         mem_x, mem_y = det_replay
-        #         mem_det_logits, _ = self.net.forward_heads(mem_x)
-        #         mem_loss = self.det_loss(mem_det_logits, mem_y.float())
-        #         det_loss = 0.5 * (det_loss + mem_loss)
-        #     det_loss = self.det_lambda * det_loss
-        #     det_loss.backward()
-        #     self.det_opt.step()
         avg_cls_tr_rec = sum(cls_tr_rec) / len(cls_tr_rec) if cls_tr_rec else 0.0
         return loss.item(), avg_cls_tr_rec, metric_logits

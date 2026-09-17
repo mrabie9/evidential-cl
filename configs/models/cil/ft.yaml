@@ -1,0 +1,3 @@
+model: ft
+loader: class_incremental_loader
+lr: 0.01

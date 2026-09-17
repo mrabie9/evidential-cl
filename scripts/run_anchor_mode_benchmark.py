@@ -34,13 +34,11 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
+from results_txt import f1_stats
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PYTHON = "/home/lunet/wsmr11/repos/La-MAML/la-maml_env/bin/python"
 
-DIAGONAL_RE = re.compile(r"^Diagonal\s+\S+:\s+(-?[\d.]+)", re.MULTILINE)
-FINAL_RE = re.compile(r"^Final\s+\S+:\s+(-?[\d.]+)", re.MULTILINE)
-BACKWARD_RE = re.compile(r"^Backward:\s+(-?[\d.]+)", re.MULTILINE)
 RUNTIME_RE = re.compile(r"^total_runtime_seconds:\s+([\d.]+)", re.MULTILINE)
 
 # model -> (config stem, penalty-strength flag, as-configured strength, sweep grid)
@@ -148,10 +146,11 @@ def parse_results(path: Path) -> Dict[str, Optional[float]]:
         match = pattern.search(text)
         return float(match.group(1)) if match else None
 
+    f1_values = f1_stats(text)
     return {
-        "diagonal_f1": first(DIAGONAL_RE),
-        "final_f1": first(FINAL_RE),
-        "bwt": first(BACKWARD_RE),
+        "diagonal_f1": f1_values.get("Diagonal F1"),
+        "final_f1": f1_values.get("Final F1"),
+        "bwt": f1_values.get("Backward"),
         "runtime_s": first(RUNTIME_RE),
     }
 

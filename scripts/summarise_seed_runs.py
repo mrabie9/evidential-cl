@@ -1,21 +1,30 @@
 #!/usr/bin/env python3
-"""Summarise a seed-sweep log directory: mean and sample std over seeded runs.
+"""Summarise seed-sweep log directories: mean and sample std over seeded runs.
 
-Given a generic run directory that contains one sub-directory per seed
-(e.g. ``logs/lamaml/post-fix_me_til-2026-07-07_23-03-15-6051`` with ``0/``,
-``39/``, ``55/`` inside), this reads each seed's ``terminal.log`` and
+Given one or more generic run directories that each contain one sub-directory
+per seed (e.g. ``logs/lamaml/post-fix_me_til-2026-07-07_23-03-15-6051`` with
+``0/``, ``39/``, ``55/`` inside), this reads each seed's ``terminal.log`` and
 aggregates the final metrics printed on the ``SUMMARY_TE`` / ``SUMMARY_TR``
-lines.
+lines. When multiple run directories are given (e.g. one per algorithm),
+results are printed side by side as rows of a single table.
 
-The headline number is **signal-class F1**, computed as the harmonic mean of
-``cls_rec`` and ``cls_prec`` (the signal-only macro recall/precision). This is
-deliberately *not* the ``cls_f1`` field, which is the mean per-class F1 over
-all classes including noise (i.e. f1_total) and does not equal the harmonic
-mean of the reported recall/precision.
+The headline number is **macro F1** over signal classes, read straight from the
+``macro_f1`` field of the ``SUMMARY_TR`` / ``SUMMARY_TE`` line. Run logs written
+before the detection-metric removal spell these fields ``cls_rec`` / ``cls_prec``
+/ ``cls_f1``; those names are still accepted, and any trailing ``det=`` / ``fa=``
+tokens they carry are ignored.
+
+Table columns:
+    Rec   -- macro recall over signal classes
+    Prec  -- macro precision over signal classes
+    F1    -- macro F1 over signal classes
+    BWT   -- backward transfer (validation split only)
 
 Usage:
     python scripts/summarise_seed_runs.py logs/lamaml/<run-dir>
-    python scripts/summarise_seed_runs.py logs/lamaml/<run-dir> --train --json
+    python scripts/summarise_seed_runs.py logs/lamaml/<run-dir> logs/agem/<run-dir>
+    python scripts/summarise_seed_runs.py logs/lamaml/<run-dir> logs/agem/<run-dir> \\
+        --labels lamaml,agem --train --json
 """
 
 from __future__ import annotations
@@ -72,13 +81,10 @@ def _read_bwt(seed_dir: str) -> float:
     return float("nan")
 
 
-def _signal_f1(rec: float | None, prec: float | None) -> float:
-    """Harmonic mean of signal recall and precision (0 if undefined)."""
-    if rec is None or prec is None:
-        return float("nan")
-    if math.isnan(rec) or math.isnan(prec) or (rec + prec) == 0:
-        return 0.0 if (rec == 0 and prec == 0) else float("nan")
-    return 2.0 * rec * prec / (rec + prec)
+def _infer_algo_label(run_dir: str) -> str:
+    """Infer an algorithm label from a run dir's parent (e.g. logs/lamaml/<run> -> "lamaml")."""
+    parent = os.path.basename(os.path.dirname(os.path.abspath(run_dir.rstrip(os.sep))))
+    return parent or run_dir
 
 
 def _seed_sort_key(name: str):
@@ -125,15 +131,24 @@ def summarise(run_dir: str, tag: str) -> dict:
         )
 
     seeds = [name for name, _ in runs]
-    # seeds = [name for name in seeds if name in ["0", "39", "55"]]
-    # Per-seed derived signal F1 plus the raw fields we care about.
-    per_seed_signal_f1 = [_signal_f1(f.get("cls_rec"), f.get("cls_prec")) for _, f in runs]
 
     # Columns to report straight from the summary line (order preserved).
-    raw_keys = ["cls_rec", "cls_prec", "det", "fa", "cls_f1"]
-    columns: dict[str, list[float]] = {"signal_f1": per_seed_signal_f1}
-    for key in raw_keys:
-        columns[key] = [f.get(key, float("nan")) for _, f in runs]
+    # ``macro_*`` is the current spelling; ``cls_*`` is the pre-removal name and
+    # is accepted so older run logs still summarise.
+    raw_keys = {
+        "macro_rec": ("macro_rec", "cls_rec"),
+        "macro_prec": ("macro_prec", "cls_prec"),
+        "macro_f1": ("macro_f1", "cls_f1"),
+    }
+    columns: dict[str, list[float]] = {}
+    for column_name, aliases in raw_keys.items():
+        columns[column_name] = [
+            next(
+                (f[alias] for alias in aliases if alias in f),
+                float("nan"),
+            )
+            for _, f in runs
+        ]
 
     # BWT lives in each seed's results.txt (validation recall matrix), so it is
     # only meaningful for the validation split.
@@ -151,64 +166,127 @@ def summarise(run_dir: str, tag: str) -> dict:
     }
 
 
-# Human-readable labels for each reported metric.
-_LABELS = {
-    "signal_f1": "Signal F1  (2·P·R/(P+R))",
-    "cls_rec": "cls_rec  (signal recall)",
-    "cls_prec": "cls_prec (signal precision)",
-    "det": "det      (detection recall)",
-    "fa": "fa       (false alarm)",
-    "cls_f1": "cls_f1   (f1_total, reference)",
-    "bwt": "bwt      (backward transfer)",
-}
+# Table columns for the multi-algorithm summary: (header, underlying column key).
+_TABLE_COLUMNS = [
+    ("Rec", "macro_rec"),
+    ("Prec", "macro_prec"),
+    ("F1", "macro_f1"),
+    ("BWT", "bwt"),
+]
 
 
-def _fmt_row(label: str, mean: float, std: float, per_seed: list[float]) -> str:
-    per = ", ".join("nan" if math.isnan(v) else f"{v:.4f}" for v in per_seed)
-    std_s = "  nan" if math.isnan(std) else f"{std:.4f}"
-    return f"  {label:<30} {mean:.4f} +/- {std_s}   [{per}]"
+def _fmt_cell(mean: float, std: float) -> str:
+    """Format a "mean±std%" cell (values scaled x100, 1dp), falling back to "nan" when undefined."""
+    if math.isnan(mean):
+        return "nan"
+    std_s = "nan" if math.isnan(std) else f"{std * 100:.1f}"
+    return f"{mean * 100:.1f}±{std_s}%"
 
 
-def print_report(result: dict) -> None:
-    split = "Validation" if result["tag"] == "TE" else "Training"
-    print(f"Seed-sweep summary ({split}, SUMMARY_{result['tag']})")
-    print(f"Dir:   {result['run_dir']}")
-    print(f"Seeds: {', '.join(result['seeds'])}")
-    print(f"Runs:  {result['n']}")
-    print()
-    order = ["signal_f1", "cls_rec", "cls_prec", "det", "fa", "cls_f1", "bwt"]
-    for key in order:
-        if key not in result["columns"]:
-            continue
-        mean, std = result["stats"][key]
-        print(_fmt_row(_LABELS[key], mean, std, result["columns"][key]))
+def print_algo_table(entries: list[tuple[str, dict]], tag: str) -> None:
+    """Print one row per (label, summarise() result) with the shared metric columns."""
+    split = "Validation" if tag == "TE" else "Training"
+    # BWT is only computed for the validation split (see summarise()).
+    columns = [
+        (header, key) for header, key in _TABLE_COLUMNS if tag == "TE" or key != "bwt"
+    ]
+
+    label_width = max([len("algo")] + [len(label) for label, _ in entries]) + 2
+    col_width = 16
+    header_row = (
+        f"{'algo':<{label_width}}"
+        + "".join(f"{header:>{col_width}}" for header, _ in columns)
+        + f"{'n':>5}"
+    )
+
+    def _f1_cl_sort_key(entry: tuple[str, dict]) -> float:
+        mean, _ = entry[1]["stats"].get("cls_f1", (float("nan"), float("nan")))
+        return math.inf if math.isnan(mean) else mean
+
+    entries = sorted(entries, key=_f1_cl_sort_key)
+
+    print(f"Seed-sweep summary ({split}, SUMMARY_{tag})")
+    print(header_row)
+    print("-" * len(header_row))
+    for label, result in entries:
+        row = f"{label:<{label_width}}"
+        for _, key in columns:
+            mean, std = result["stats"].get(key, (float("nan"), float("nan")))
+            row += f"{_fmt_cell(mean, std):>{col_width}}"
+        row += f"{result['n']:>5}"
+        print(row)
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("run_dir", help="Log dir containing one sub-dir per seed.")
-    ap.add_argument("--train", action="store_true", help="Also report the training split (SUMMARY_TR).")
-    ap.add_argument("--only-train", action="store_true", help="Report only the training split, not validation.")
-    ap.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead of a table.")
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument(
+        "run_dirs",
+        nargs="+",
+        help="One or more log dirs, each containing one sub-dir per seed (e.g. one dir per algorithm).",
+    )
+    ap.add_argument(
+        "--labels",
+        help="Comma-separated row labels, one per run_dir (default: inferred from each run_dir's parent directory name).",
+    )
+    ap.add_argument(
+        "--train",
+        action="store_true",
+        help="Also report the training split (SUMMARY_TR).",
+    )
+    ap.add_argument(
+        "--only-train",
+        action="store_true",
+        help="Report only the training split, not validation.",
+    )
+    ap.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON instead of a table.",
+    )
     args = ap.parse_args(argv)
 
-    if not os.path.isdir(args.run_dir):
-        ap.error(f"not a directory: {args.run_dir}")
+    for run_dir in args.run_dirs:
+        if not os.path.isdir(run_dir):
+            ap.error(f"not a directory: {run_dir}")
+
+    if args.labels:
+        labels = [label.strip() for label in args.labels.split(",")]
+        if len(labels) != len(args.run_dirs):
+            ap.error(
+                f"--labels has {len(labels)} entries but {len(args.run_dirs)} run_dirs were given"
+            )
+    else:
+        labels = [_infer_algo_label(run_dir) for run_dir in args.run_dirs]
 
     tags = ["TR"] if args.only_train else ["TE"]
     if args.train and not args.only_train:
         tags.append("TR")
 
-    results = [summarise(args.run_dir, tag) for tag in tags]
+    results_by_tag = {
+        tag: [
+            (label, summarise(run_dir, tag))
+            for label, run_dir in zip(labels, args.run_dirs)
+        ]
+        for tag in tags
+    }
 
     if args.json:
-        json.dump(results, sys.stdout, indent=2)
+        json.dump(
+            {
+                tag: [{"label": label, **result} for label, result in entries]
+                for tag, entries in results_by_tag.items()
+            },
+            sys.stdout,
+            indent=2,
+        )
         print()
     else:
-        for i, res in enumerate(results):
+        for i, tag in enumerate(tags):
             if i:
                 print()
-            print_report(res)
+            print_algo_table(results_by_tag[tag], tag)
     return 0
 
 

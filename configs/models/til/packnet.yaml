@@ -1,8 +1,4 @@
-# Model-specific overrides for packnet.
 model: packnet
 loader: task_incremental_loader
-lr: 0.003
-prune_perc: 0.75
-# Optional SGD epochs on this task's train data after packing; grads only on
-# weights newly assigned to the task (owner == task). 0 disables finetune.
+prune_perc: 0.8
 post_prune_epochs: 2

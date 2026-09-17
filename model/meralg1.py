@@ -17,7 +17,6 @@ import ipdb
 import warnings
 
 warnings.filterwarnings("ignore")
-from model.detection_replay import noise_label_from_args
 from model.resnet1d import ResNet1D
 from utils.training_metrics import macro_recall
 from utils import misc_utils
@@ -38,7 +37,7 @@ class MerAlgConfig:
     beta: float = 1.0
     gamma: float = 0.0
     cuda: bool = True
-    grad_clip_norm: Optional[float] = 2.0
+    grad_clip_norm: Optional[float] = 0.0
     input_channels: int = 1
 
     @staticmethod
@@ -86,7 +85,6 @@ class Net(nn.Module):
             classes_per_task=getattr(args, "classes_per_task", None),
         )
         self.nc_per_task = misc_utils.max_task_class_count(self.classes_per_task)
-        self.noise_label: int | None = noise_label_from_args(args)
         self.incremental_loader_name = getattr(args, "loader", None)
         self.is_task_incremental = True
         # if self.is_cifar:
@@ -120,7 +118,6 @@ class Net(nn.Module):
                 self.classes_per_task,
                 self.n_outputs,
                 cil_all_seen_upto_task=cil_all_seen_upto_task,
-                global_noise_label=self.noise_label,
                 fill_value=-10e10,
                 loader=self.incremental_loader_name,
             )

@@ -16,10 +16,8 @@ import torch
 import torch.nn as nn
 
 from model.resnet1d import ResNet1D
-from model.detection_replay import (
-    DetectionReplayMixin,
-    noise_label_from_args,
-    signal_mask_exclude_noise,
+from model.replay_utils import (
+    ReplayInputMixin,
     unpack_y_to_class_labels,
 )
 from model.lwf_regulariser import LwfDistillationMixin
@@ -47,11 +45,8 @@ class RWalkConfig:
     eps: float = 0.01
 
     optimizer: str = "sgd"
-    clipgrad: Optional[float] = 100.0
-    det_lambda: float = 1.0
+    clipgrad: Optional[float] = 0.0
     cls_lambda: float = 1.0
-    det_memories: int = 2000
-    det_replay_batch: int = 64
 
     @staticmethod
     def from_args(args: object | None) -> "RWalkConfig":
@@ -70,7 +65,7 @@ class RWalkConfig:
         return cfg
 
 
-class Net(DetectionReplayMixin, LwfDistillationMixin, nn.Module):
+class Net(ReplayInputMixin, LwfDistillationMixin, nn.Module):
     """RWalk continual learner built on top of ``ResNet1D``."""
 
     def __init__(
@@ -93,7 +88,6 @@ class Net(DetectionReplayMixin, LwfDistillationMixin, nn.Module):
         )
         self.nc_per_task = misc_utils.max_task_class_count(self.classes_per_task)
         self.is_task_incremental = getattr(args, "class_incremental", True)
-        self.noise_label: int | None = noise_label_from_args(args)
         self.incremental_loader_name: str | None = (
             getattr(args, "loader", None) if args is not None else None
         )
@@ -111,13 +105,7 @@ class Net(DetectionReplayMixin, LwfDistillationMixin, nn.Module):
         self.use_proximal_anchor = self.anchor_mode == "proximal"
         self._init_lwf_distillation(args, "rwalk")
         self.clipgrad = self.cfg.clipgrad
-        self.det_lambda = float(self.cfg.det_lambda)
         self.cls_lambda = float(self.cfg.cls_lambda)
-        self._init_det_replay(
-            self.cfg.det_memories,
-            self.cfg.det_replay_batch,
-            enabled=bool(getattr(args, "use_detector_arch", False)),
-        )
 
         self.current_task: Optional[int] = None
         self.tasks_trained: int = 0
@@ -145,7 +133,6 @@ class Net(DetectionReplayMixin, LwfDistillationMixin, nn.Module):
             self.classes_per_task,
             self.n_outputs,
             cil_all_seen_upto_task=cil,
-            global_noise_label=self.noise_label,
             loader=self.incremental_loader_name,
         )
 
@@ -161,17 +148,11 @@ class Net(DetectionReplayMixin, LwfDistillationMixin, nn.Module):
 
         self.net.train()
 
-        # class_counts = getattr(self, "classes_per_task", None)
-        # noise_label = None
-        # if class_counts is not None:
-        #     _, offset2 = misc_utils.compute_offsets(t, class_counts)
-        #     noise_label = offset2 - 1
         metric_logits = None
         for _ in range(self.cfg.inner_steps):
             self.opt.zero_grad()
             y_cls = unpack_y_to_class_labels(y)
-            cls_logits = self.net.forward_heads(x)[1]
-            signal_mask = signal_mask_exclude_noise(y_cls, self.noise_label)
+            cls_logits = self.net(x)
             logits_for_loss = cls_logits
             if self.is_task_incremental:
                 logits_for_loss = misc_utils.apply_task_incremental_logit_mask(
@@ -180,7 +161,6 @@ class Net(DetectionReplayMixin, LwfDistillationMixin, nn.Module):
                     self.classes_per_task,
                     self.n_outputs,
                     cil_all_seen_upto_task=t,
-                    global_noise_label=self.noise_label,
                     loader=self.incremental_loader_name,
                 )
             targets_for_loss = y_cls.long()
@@ -190,22 +170,11 @@ class Net(DetectionReplayMixin, LwfDistillationMixin, nn.Module):
                 class_weighted_ce=self.class_weighted_ce,
             )
 
-            if signal_mask.any():
-                preds = torch.argmax(logits_for_loss[signal_mask], dim=1)
-                cls_tr_rec = macro_recall(preds, y_cls[signal_mask].long())
-            else:
-                cls_tr_rec = 0.0
+            preds = torch.argmax(logits_for_loss, dim=1)
+            cls_tr_rec = macro_recall(preds, y_cls.long())
             # else:
             #     loss_ce = cls_logits.new_zeros(1)
             #     cls_tr_rec = 0.0
-
-            # det_loss = self.det_loss(det_logits, y_det.float())
-            # det_replay = self._sample_det_memory()
-            # if det_replay is not None:
-            #     mem_x, mem_y = det_replay
-            #     mem_det_logits, _ = self.net.forward_heads(mem_x)
-            #     mem_loss = self.det_loss(mem_det_logits, mem_y.float())
-            #     det_loss = 0.5 * (det_loss + mem_loss)
 
             if self.use_proximal_anchor:
                 # The anchor is applied in closed form after the optimiser step
@@ -214,11 +183,7 @@ class Net(DetectionReplayMixin, LwfDistillationMixin, nn.Module):
                 regulariser = torch.zeros(1, device=self._device())
             else:
                 regulariser = self._regulariser()
-            loss = (
-                self.cls_lambda * loss_ce
-                # + self.det_lambda * det_loss
-                + self.lamb * regulariser
-            )
+            loss = self.cls_lambda * loss_ce + self.lamb * regulariser
             if self.lwf_lambda != 0.0:
                 # Function-space regulariser running alongside the parameter
                 # anchor. Its gradient reaches `param.grad` and therefore the
@@ -230,7 +195,7 @@ class Net(DetectionReplayMixin, LwfDistillationMixin, nn.Module):
                 )
             loss.backward()
 
-            if self.clipgrad is not None:
+            if self.clipgrad is not None and self.clipgrad > 0:
                 torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.clipgrad)
             self.opt.step()
             if self.use_proximal_anchor:
@@ -268,8 +233,6 @@ class Net(DetectionReplayMixin, LwfDistillationMixin, nn.Module):
         for name, param in self.net.named_parameters():
             if not param.requires_grad:
                 continue
-            if name.startswith("det_head"):
-                continue
             zero = torch.zeros_like(param)
             device = param.device
             self.fisher[name] = zero.clone().to(device)
@@ -288,8 +251,6 @@ class Net(DetectionReplayMixin, LwfDistillationMixin, nn.Module):
         for name, param in self.net.named_parameters():
             if not param.requires_grad:
                 continue
-            if name.startswith("det_head"):
-                continue
             self._ensure_state_device(name, param)
             fisher = self.fisher.get(name)
             s_term = self.s.get(name)
@@ -304,8 +265,6 @@ class Net(DetectionReplayMixin, LwfDistillationMixin, nn.Module):
     def _update_running_statistics(self) -> None:
         for name, param in self.net.named_parameters():
             if not param.requires_grad:
-                continue
-            if name.startswith("det_head"):
                 continue
             self._ensure_state_device(name, param)
             grad = param.grad
@@ -332,8 +291,6 @@ class Net(DetectionReplayMixin, LwfDistillationMixin, nn.Module):
             return
         for name, param in self.net.named_parameters():
             if not param.requires_grad:
-                continue
-            if name.startswith("det_head"):
                 continue
             self._ensure_state_device(name, param)
             self.fisher[name] = self.fisher_running[name].detach().clone()
@@ -376,7 +333,7 @@ class Net(DetectionReplayMixin, LwfDistillationMixin, nn.Module):
             optimizer_learning_rate(self.opt), anchor_curvature("rwalk", self.lamb)
         )
         for name, param in self.net.named_parameters():
-            if not param.requires_grad or name.startswith("det_head"):
+            if not param.requires_grad:
                 continue
             self._ensure_state_device(name, param)
             fisher = self.fisher.get(name)

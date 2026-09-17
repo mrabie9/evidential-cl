@@ -1,0 +1,20 @@
+# AdaB1N settings for the ER-Alg4 host. Layer on top of
+# configs/models/til/eralg4.yaml, which supplies the host's tuned lr.
+#
+# Swept 2026-09-11 (15 trials x 3 seeds, n_epochs=10, val_macro_f1):
+#   adab1n_init_weight  0.0 -> 0.3158   2.0 -> 0.3983   4.0 -> 0.3623
+#     best vs worst +0.0825 +/- 0.0356, so 2.0 is a real effect; the peak in the
+#     middle fits the mechanism, since exp(2) competes with per-task row counts
+#     while exp(4) over-balances toward equal per-task weight.
+#   kappa  best vs worst only +0.0323 +/- 0.0460, i.e. within noise, and kappa
+#     0.0 and 1.0 scored identically. Left at 1.0 (ordinary BatchNorm momentum)
+#     rather than the arbitrary winner, and dropped from future grids.
+#
+# Within-trial seed std was 0.0895 — roughly twice the whole kappa range — so add
+# seeds before trusting any further ranking on this axis.
+#
+# NOTE: tune_adab1n.py rewrites this file with the winning params and strips these
+# comments, so re-read it after any sweep.
+norm_type: adab1n
+kappa: 1.0
+adab1n_init_weight: 2.0

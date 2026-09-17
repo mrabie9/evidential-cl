@@ -332,26 +332,22 @@ def _collect_untrained_zero_shot(
     # Evaluate all tasks in one pass so evaluator task indices match the
     # original continual task ids (important for split-head models).
     independent_output = evaluator(model, test_task_loaders, run_args)
-    ind_rec, ind_prec, ind_f1, ind_det, ind_pfa = _split_eval_output(independent_output)
+    ind_rec, ind_prec, ind_f1 = _split_eval_output(independent_output)
     for task_index, task_info in enumerate(task_infos):
         rec_cls = _extract_metric_at_index(ind_rec, task_index)
         prec_cls = _extract_metric_at_index(ind_prec, task_index)
-        total_f1_zs = _extract_metric_at_index(ind_f1, task_index)
-        det_value = _extract_metric_at_index(ind_det, task_index)
-        pfa_value = _extract_metric_at_index(ind_pfa, task_index)
-        f1_cls = _harmonic_mean_f1(prec_cls, rec_cls)
+        total_macro_f1_zs = _extract_metric_at_index(ind_f1, task_index)
+        macro_f1 = _harmonic_mean_f1(prec_cls, rec_cls)
 
         independent_rows.append(
             {
                 "algo": run_args.model,
                 "task": task_index,
                 "task_name": task_info.get("task_name", ""),
-                "f1_cls": f1_cls,
-                "rec_cls": rec_cls,
-                "prec_cls": prec_cls,
-                "det": det_value,
-                "pfa": pfa_value,
-                "total_f1_zs": total_f1_zs,
+                "macro_f1": macro_f1,
+                "macro_rec": rec_cls,
+                "macro_prec": prec_cls,
+                "total_macro_f1_zs": total_macro_f1_zs,
             }
         )
 
@@ -360,20 +356,18 @@ def _collect_untrained_zero_shot(
             cumulative_output = evaluator(
                 model, test_task_loaders[: checkpoint_task_index + 1], run_args
             )
-            cum_rec, cum_prec, cum_f1, cum_det, cum_pfa = _split_eval_output(
-                cumulative_output
-            )
+            cum_rec, cum_prec, cum_f1 = _split_eval_output(cumulative_output)
             for eval_task_idx in range(checkpoint_task_index + 1):
                 cumulative_rows.append(
                     {
                         "algo": run_args.model,
                         "checkpoint_task_index": checkpoint_task_index,
                         "evaluated_task_index": eval_task_idx,
-                        "rec_cls": _extract_metric_at_index(cum_rec, eval_task_idx),
-                        "prec_cls": _extract_metric_at_index(cum_prec, eval_task_idx),
-                        "total_f1_zs": _extract_metric_at_index(cum_f1, eval_task_idx),
-                        "det": _extract_metric_at_index(cum_det, eval_task_idx),
-                        "pfa": _extract_metric_at_index(cum_pfa, eval_task_idx),
+                        "macro_rec": _extract_metric_at_index(cum_rec, eval_task_idx),
+                        "macro_prec": _extract_metric_at_index(cum_prec, eval_task_idx),
+                        "total_macro_f1_zs": _extract_metric_at_index(
+                            cum_f1, eval_task_idx
+                        ),
                     }
                 )
 
@@ -391,17 +385,17 @@ def _print_rows(rows: Sequence[Dict[str, Any]]) -> None:
         True
     """
     header = (
-        f"{'algo':<12} {'task':>4} {'f1_cls':>10} {'rec_cls':>10} "
-        f"{'prec_cls':>10} {'det':>10} {'pfa':>10} {'total_f1_zs':>12}"
+        f"{'algo':<12} {'task':>4} {'macro_f1':>10} {'macro_rec':>10} "
+        f"{'macro_prec':>10} {'total_macro_f1_zs':>18}"
     )
     print(header)
     print("-" * len(header))
     for row in rows:
         print(
             f"{row['algo']:<12} {int(row['task']):4d} "
-            f"{float(row['f1_cls']):10.6f} {float(row['rec_cls']):10.6f} "
-            f"{float(row['prec_cls']):10.6f} {float(row['det']):10.6f} "
-            f"{float(row['pfa']):10.6f} {float(row['total_f1_zs']):12.6f}"
+            f"{float(row['macro_f1']):10.6f} {float(row['macro_rec']):10.6f} "
+            f"{float(row['macro_prec']):10.6f} "
+            f"{float(row['total_macro_f1_zs']):18.6f}"
         )
 
 

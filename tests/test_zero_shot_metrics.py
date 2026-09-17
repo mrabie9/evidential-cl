@@ -27,6 +27,7 @@ from main import (  # noqa: E402
     life_experience,
 )
 from scripts.plot_metrics import load_metrics  # noqa: E402
+from utils.metric_keys import extract_metric  # noqa: E402
 
 
 class _TqdmPassthrough:
@@ -113,8 +114,35 @@ def test_zero_shot_metric_helpers() -> None:
     assert row[0] == 1.0 and row[1] == 2.0 and np.isnan(row[2])
 
 
-def test_load_metrics_accepts_legacy_plus_zero_shot_keys() -> None:
-    """``plot_metrics.load_metrics`` must still load npz with new zero-shot arrays."""
+def test_load_metrics_accepts_current_zero_shot_keys() -> None:
+    """``plot_metrics.load_metrics`` loads npz written with the macro_* names."""
+    with tempfile.TemporaryDirectory() as tmp:
+        metrics_dir = os.path.join(tmp, "metrics")
+        os.makedirs(metrics_dir)
+        np.savez(
+            os.path.join(metrics_dir, "task0.npz"),
+            losses=np.array([0.1, 0.2]),
+            tr_macro_rec=np.array([0.5, 0.6]),
+            val_macro_rec=np.array([0.7]),
+            zero_shot_macro_rec=np.float64(0.11),
+            zero_shot_macro_prec=np.float64(0.22),
+            zero_shot_macro_f1=np.float64(0.33),
+            zero_shot_total_macro_f1=np.float64(0.66),
+            zero_shot_per_task_macro_rec=np.array([0.11]),
+            zero_shot_per_task_macro_prec=np.array([0.22]),
+            zero_shot_per_task_macro_f1=np.array([0.33]),
+        )
+        tasks = load_metrics(Path(metrics_dir))
+        assert len(tasks) == 1
+        task0 = tasks[0]
+        assert "losses" in task0
+        assert "val_macro_rec" in task0
+        assert task0["zero_shot_macro_rec"].shape == ()
+        assert task0["zero_shot_per_task_macro_rec"].shape == (1,)
+
+
+def test_load_metrics_still_reads_pre_removal_key_names() -> None:
+    """Runs written before the rename resolve through the alias table."""
     with tempfile.TemporaryDirectory() as tmp:
         metrics_dir = os.path.join(tmp, "metrics")
         os.makedirs(metrics_dir)
@@ -124,28 +152,18 @@ def test_load_metrics_accepts_legacy_plus_zero_shot_keys() -> None:
             cls_tr_rec=np.array([0.5, 0.6]),
             val_acc=np.array([0.7]),
             zero_shot_rec_cls=np.float64(0.11),
-            zero_shot_prec_cls=np.float64(0.22),
             zero_shot_f1_cls=np.float64(0.33),
             zero_shot_det=np.float64(0.44),
             zero_shot_pfa=np.float64(0.55),
-            zero_shot_total_f1=np.float64(0.66),
-            zero_shot_per_task_rec_cls=np.array([0.11]),
-            zero_shot_per_task_prec_cls=np.array([0.22]),
-            zero_shot_per_task_f1_cls=np.array([0.33]),
-            zero_shot_per_task_det=np.array([0.44]),
-            zero_shot_per_task_pfa=np.array([0.55]),
         )
-        tasks = load_metrics(Path(metrics_dir))
-        assert len(tasks) == 1
-        task0 = tasks[0]
-        assert "losses" in task0
-        assert "val_acc" in task0
-        assert task0["zero_shot_rec_cls"].shape == ()
-        assert task0["zero_shot_per_task_rec_cls"].shape == (1,)
+        task0 = load_metrics(Path(metrics_dir))[0]
+        assert extract_metric(task0, "val_macro_rec") is not None
+        assert extract_metric(task0, "zero_shot_macro_rec").item() == 0.11
+        assert extract_metric(task0, "zero_shot_macro_f1").item() == 0.33
 
 
-def test_life_experience_npz_has_zero_shot_and_legacy_keys() -> None:
-    """Integration: ``life_experience`` writes zero-shot fields without dropping legacy keys."""
+def test_life_experience_npz_has_macro_metric_keys() -> None:
+    """Integration: ``life_experience`` writes the macro_* schema and no det keys."""
     with tempfile.TemporaryDirectory() as tmp:
         log_dir = os.path.join(tmp, "run0")
         os.makedirs(log_dir)
@@ -157,7 +175,6 @@ def test_life_experience_npz_has_zero_shot_and_legacy_keys() -> None:
         args.cuda = False
         args.arch = ""
         args.model = "stub_model_name"
-        args.use_detector_arch = False
         args.calc_test_accuracy = False
         args.log_dir = log_dir
 
@@ -177,29 +194,30 @@ def test_life_experience_npz_has_zero_shot_and_legacy_keys() -> None:
 
             for key in (
                 "losses",
-                "cls_tr_rec",
-                "val_acc",
-                "zero_shot_rec_cls",
-                "zero_shot_prec_cls",
-                "zero_shot_f1_cls",
-                "zero_shot_det",
-                "zero_shot_pfa",
-                "zero_shot_total_f1",
-                "zero_shot_per_task_rec_cls",
-                "zero_shot_per_task_prec_cls",
-                "zero_shot_per_task_f1_cls",
-                "zero_shot_per_task_det",
-                "zero_shot_per_task_pfa",
+                "tr_macro_rec",
+                "val_macro_rec",
+                "zero_shot_macro_rec",
+                "zero_shot_macro_prec",
+                "zero_shot_macro_f1",
+                "zero_shot_total_macro_f1",
+                "zero_shot_per_task_macro_rec",
+                "zero_shot_per_task_macro_prec",
+                "zero_shot_per_task_macro_f1",
             ):
                 assert key in data.files, f"missing {key} in task{task_i}.npz"
 
-            assert data["zero_shot_per_task_rec_cls"].shape == (expected_len,)
-            assert not np.isnan(data["zero_shot_rec_cls"].item())
-            assert not np.isnan(data["zero_shot_total_f1"].item())
+            # Detection metrics and the noise class are gone for good.
+            for removed_key in data.files:
+                assert "det" not in removed_key, removed_key
+                assert "pfa" not in removed_key, removed_key
+
+            assert data["zero_shot_per_task_macro_rec"].shape == (expected_len,)
+            assert not np.isnan(data["zero_shot_macro_rec"].item())
+            assert not np.isnan(data["zero_shot_total_macro_f1"].item())
 
         plot_tasks = load_metrics(Path(metrics_path))
         assert len(plot_tasks) == 2
-        assert "zero_shot_total_f1" in plot_tasks[1]
+        assert "zero_shot_total_macro_f1" in plot_tasks[1]
 
 
 def test_eval_tasks_runs_with_variable_wrapped_batch() -> None:

@@ -12,7 +12,11 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from torch.func import functional_call
+from model.adab1n import AdaB1N
 from utils.iq_features import append_iq_augmented_features
+
+# Ceiling for AdaB1N's per-task concentration logits, not an exact task count.
+ADAB1N_MAX_TASKS = 20
 
 
 class BasicBlock1D(nn.Module):
@@ -67,7 +71,10 @@ class AdcIqAdapter(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(2, 3))
+        # Single ADC mixing vector shared by both the I and Q channels: the
+        # same linear combination of ADC0/ADC1/ADC2 is applied to whichever
+        # channel it sees, rather than learning separate per-channel mixes.
+        self.weight = nn.Parameter(torch.ones(3))
         # The adapter's effective bias is always forced to 0 in `forward`.
         self.bias = nn.Parameter(torch.zeros(2), requires_grad=False)
         # Used by the 3D path: (B, 3, L) -> (B, 2, L). The 4D path uses
@@ -97,7 +104,8 @@ class AdcIqAdapter(nn.Module):
         on the default random initialization.
 
         Args:
-            weight_4d: Optional weight for the 4D path with shape (2, 3).
+            weight_4d: Optional weight for the 4D path with shape (3,), shared
+                across the I and Q channels.
             bias_4d: Optional bias for the 4D path with shape (2,).
             weight_3d: Optional weight for the 3D Conv1d path. Accepts either
                 a tensor of shape (2, 3) or (2, 3, 1); the latter will be
@@ -163,15 +171,13 @@ class AdcIqAdapter(nn.Module):
                 param.requires_grad = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Enforce row-stochastic mixing: each output row sums to 1.
-        row_sums = self.weight.sum(dim=1, keepdim=True)  # (2, 1)
-        zero_row_mask = row_sums.abs() <= 1e-12
-        denom = torch.where(zero_row_mask, torch.ones_like(row_sums), row_sums)
-        normalized_weight = self.weight / denom  # (2, 3)
-        uniform = torch.full_like(self.weight, 1.0 / self.weight.size(1))
-        normalized_weight = torch.where(
-            zero_row_mask.expand_as(normalized_weight), uniform, normalized_weight
-        )
+        # Enforce a stochastic mix: the (shared) weight vector sums to 1.
+        weight_sum = self.weight.sum()
+        zero_sum_mask = weight_sum.abs() <= 1e-12
+        denom = torch.where(zero_sum_mask, torch.ones_like(weight_sum), weight_sum)
+        normalized_weight = self.weight / denom  # (3,)
+        uniform = torch.full_like(self.weight, 1.0 / self.weight.size(0))
+        normalized_weight = torch.where(zero_sum_mask, uniform, normalized_weight)
 
         # Bias is always 0 (and does not receive gradients).
         self.bias.data.zero_()
@@ -200,16 +206,23 @@ class AdcIqAdapter(nn.Module):
             raise ValueError(
                 f"ADC adapter expects (B, 3, 2, L) or (B, 3, L); got shape {tuple(x.shape)}."
             )
-        # If ADC1/ADC2 are padded with exact zeros (e.g. IID2 mixing 2-channel
-        # and 3-channel datasets), short-circuit and return ADC0's I/Q
-        # channels without applying the learned 3->2 mixing weights.
-        if torch.all(x[:, 1:, :, :] == 0).item():
-            return x[:, 0, :, :]
+        # Rows whose ADC1/ADC2 are padded with exact zeros (e.g. a 2-channel
+        # dataset batched alongside a 3-channel one) keep ADC0's I/Q channels
+        # instead of the learned 3->2 mixing, which would merely rescale them.
+        #
+        # This is decided per row. Deciding it for the whole batch made a
+        # sample's output depend on which other samples shared its batch: one
+        # genuine 3-ADC row switched every padded row in the batch onto the
+        # mixing path, scaling it by the ADC0 weight (~0.5 in trained runs).
+        # Training and batch-statistic evaluation hid this, because BatchNorm
+        # cancels a uniform scale, but running-statistic evaluation did not.
+        zero_adc_rows = x[:, 1:, :, :].abs().amax(dim=(1, 2, 3)) == 0
         # (B, 3, 2, L) -> (B, 2, 3, L)
-        x = x.permute(0, 2, 1, 3)
-        # Mix ADCs per IQ channel: (B, 2, 3, L) x (2, 3) -> (B, 2, L)
-        y = torch.einsum("bial,ia->bil", x, normalized_weight)
-        return y + self.bias.view(1, 2, 1)
+        permuted = x.permute(0, 2, 1, 3)
+        # Mix ADCs with the same weights for both I and Q: (B, 2, 3, L) x (3,) -> (B, 2, L)
+        y = torch.einsum("bial,a->bil", permuted, normalized_weight)
+        y = y + self.bias.view(1, 2, 1)
+        return torch.where(zero_adc_rows.view(-1, 1, 1), x[:, 0, :, :], y)
 
 
 class _ResNet1D(nn.Module):
@@ -245,13 +258,9 @@ class _ResNet1D(nn.Module):
         self.maxpool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
 
         self.layer1 = self._make_layer(block, 64, layers[0])
-        self.drop1 = nn.Dropout(p=0.2)
         self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
-        self.drop2 = nn.Dropout(p=0.2)
         self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
-        self.drop3 = nn.Dropout(p=0.2)
         self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
-        self.drop4 = nn.Dropout(p=0.2)
 
         self.avgpool = nn.AdaptiveAvgPool1d(1)
         out_dim = 512 * block.expansion
@@ -323,13 +332,9 @@ class _ResNet1D(nn.Module):
             x = self.maxpool(x)
 
             x = self.layer1(x)
-            x = self.drop1(x)
             x = self.layer2(x)
-            x = self.drop2(x)
             x = self.layer3(x)
-            x = self.drop3(x)
             x = self.layer4(x)
-            x = self.drop4(x)
 
             if return_h4:
                 return x
@@ -370,7 +375,6 @@ class ResNet1D(nn.Module):
             iq_aug_feature_type=self.iq_aug_feature_type,
         )
         self.feature_dim = self.model.fc.in_features
-        self.det_head = nn.Linear(self.feature_dim, 1)
 
         # Ordered names for mapping fast weights
         self.param_names = [n for n, _ in self.model.named_parameters()]
@@ -392,12 +396,22 @@ class ResNet1D(nn.Module):
         self,
         x: torch.Tensor,
         vars=None,
-        bn_training: bool = True,
+        bn_training: bool | None = None,
         classify_feats=False,
         ret_feats=False,
     ) -> torch.Tensor:
+        """Run the backbone.
+
+        Args:
+            bn_training: Overrides the normalisation layers' train/eval mode for
+                this call, for meta-learning inner loops that need to suppress or
+                force running-stat updates. ``None`` (the default) leaves the
+                ambient mode alone, so ``eval()`` normalises with the tracked
+                running statistics instead of the current batch's.
+        """
         prev = self.model.training
-        self.model.train(bn_training)
+        if bn_training is not None:
+            self.model.train(bn_training)
         try:
             if not classify_feats:
                 # print(f"Input shape: {tuple(x.shape)}")
@@ -419,29 +433,21 @@ class ResNet1D(nn.Module):
                     {"return_features": ret_feats, "classify_feats": classify_feats},
                 )
         finally:
-            self.model.train(prev)
+            if bn_training is not None:
+                self.model.train(prev)
         return out
 
     def forward_features(
-        self, x: torch.Tensor, vars=None, bn_training: bool = True
+        self, x: torch.Tensor, vars=None, bn_training: bool | None = None
     ) -> torch.Tensor:
         return self.forward(x, vars=vars, bn_training=bn_training, ret_feats=True)
 
     def forward_classifier(
-        self, feats: torch.Tensor, vars=None, bn_training: bool = True
+        self, feats: torch.Tensor, vars=None, bn_training: bool | None = None
     ) -> torch.Tensor:
         return self.forward(
             feats, vars=vars, bn_training=bn_training, classify_feats=True
         )
-
-    def forward_detection(self, feats: torch.Tensor) -> torch.Tensor:
-        return self.det_head(feats).squeeze(1)
-
-    def forward_heads(self, x: torch.Tensor, vars=None, bn_training: bool = True):
-        feats = self.forward_features(x, vars=vars, bn_training=bn_training)
-        det_logits = self.forward_detection(feats)
-        cls_logits = self.forward_classifier(feats, vars=vars, bn_training=bn_training)
-        return det_logits, cls_logits
 
     # Expose only the underlying model parameters, excluding alpha lrs
     def parameters(self, recurse: bool = True):
@@ -512,6 +518,18 @@ class ResNet1D(nn.Module):
 
     # ------------------------------------------------------------------
     def _build_norm_factory(self, args):
+        """Build the per-channel normalization layer factory for this backbone.
+
+        Selected via ``args.norm_type`` (``"batchnorm"`` (default),
+        ``"groupnorm"``, or ``"adab1n"``); ``args.use_groupnorm`` remains
+        supported as a legacy alias for ``norm_type="groupnorm"``.
+
+        Args:
+            args: Experiment arguments, or ``None`` for the BatchNorm1d default.
+
+        Returns:
+            A callable mapping a channel count to a fresh normalization module.
+        """
         if args is None:
             return lambda channels: nn.BatchNorm1d(channels)
 
@@ -533,7 +551,37 @@ class ResNet1D(nn.Module):
 
             return gn_factory
 
+        if norm_type in {"adab1n", "ada_b1n", "adab2n"}:
+            return self._build_adab1n_factory(args)
+
         return lambda c: nn.BatchNorm1d(c)
+
+    def _build_adab1n_factory(self, args):
+        """Build an :class:`~model.adab1n.AdaB1N` factory sized from ``args``.
+
+        Args:
+            args: Experiment arguments; reads ``n_tasks``, ``kappa`` and
+                ``adab1n_init_weight`` when present.
+
+        Returns:
+            A callable mapping a channel count to a fresh ``AdaB1N`` module.
+        """
+        # num_tasks only needs to be a ceiling: unused ``task_weight`` entries are
+        # sliced out of the forward and never receive gradient, so over-allocating
+        # is numerically inert, while under-allocating makes end_task() raise.
+        num_tasks = max(ADAB1N_MAX_TASKS, int(getattr(args, "n_tasks", 1) or 1))
+        kappa = float(getattr(args, "kappa", 1.0) or 1.0)
+        init_weight = float(getattr(args, "adab1n_init_weight", 0.0) or 0.0)
+
+        def adab1n_factory(channels: int):
+            return AdaB1N(
+                channels,
+                num_tasks=num_tasks,
+                kappa=kappa,
+                init_weight=init_weight,
+            )
+
+        return adab1n_factory
 
 
 __all__ = ["ResNet1D"]

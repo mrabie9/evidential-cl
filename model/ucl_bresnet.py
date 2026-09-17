@@ -4,8 +4,8 @@ This variant mirrors the behaviour of :mod:`model.ucl` but replaces the
 deterministic ``ResNet1D`` feature extractor with a fully Bayesian
 counterpart.  All convolutional layers now maintain Gaussian posteriors over
 their weights, enabling epistemic uncertainty estimation deeper in the
-network while keeping the multi-head Bayesian linear classifiers used for
-task-specific outputs.
+network. Task heads are deterministic linear layers, and the regulariser follows
+the reference UCL ``custom_regularization``.
 """
 
 from __future__ import annotations
@@ -19,22 +19,14 @@ from typing import Iterable, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.modules.batchnorm import _BatchNorm
-from model.resnet1d import AdcIqAdapter, ResNet1D
-from model.detection_replay import (
-    noise_label_from_args,
-    signal_mask_exclude_noise,
-    unpack_y_to_class_labels,
-)
+from model.resnet1d import AdcIqAdapter
+from model.replay_utils import unpack_y_to_class_labels
+from model import task_bn
+from model.task_bn import frozen_running_stats
 from utils.iq_features import append_iq_augmented_features
 from utils.training_metrics import macro_recall
 from utils import misc_utils
 from utils.class_weighted_loss import classification_cross_entropy
-from utils.proximal_anchor import (
-    apply_proximal_anchor,
-    optimizer_learning_rate,
-    resolve_anchor_mode,
-)
 
 
 def _calculate_fan_in_and_fan_out(tensor: torch.Tensor) -> Tuple[int, int]:
@@ -109,9 +101,9 @@ class BayesianLinear(BayesianLayer):
         nn.init.uniform_(self.weight_mu, -bound, bound)
 
         rho_init = float(math.log(math.expm1(noise_std)))
-        self.weight_rho = nn.Parameter(
-            torch.full((out_features, in_features), rho_init)
-        )
+        # Tie sigma per output node: the incoming weights to node ``i`` share one
+        # rho_i (paper Sec. 3.3). Shape (out, 1) broadcasts across ``in_features``.
+        self.weight_rho = nn.Parameter(torch.full((out_features, 1), rho_init))
 
         self.bias = nn.Parameter(torch.zeros(out_features))
         self.weight = Gaussian(self.weight_mu, self.weight_rho)
@@ -159,7 +151,10 @@ class BayesianConv1d(BayesianLayer):
         nn.init.uniform_(self.weight_mu, -bound, bound)
 
         rho_init = float(math.log(math.expm1(noise_std)))
-        self.weight_rho = nn.Parameter(torch.full(weight_shape, rho_init))
+        # Tie sigma per output channel (filter): one rho per filter, shared across
+        # input channels and kernel taps (paper Supp. Sec. 5.1.2). Shape
+        # (out_channels, 1, 1) broadcasts over the full weight tensor.
+        self.weight_rho = nn.Parameter(torch.full((out_channels, 1, 1), rho_init))
 
         self.weight = Gaussian(self.weight_mu, self.weight_rho)
 
@@ -318,6 +313,31 @@ class BayesianResNet1D(nn.Module):
             )
         return layers
 
+    def ucl_regularisation_chain(self) -> List[Tuple[BayesianConv1d, Optional[int]]]:
+        """List every Bayesian conv with the index of the conv feeding its input.
+
+        UCL's node-wise L2 strength takes, per weight, the max of its output
+        node's strength and its input node's strength (the feeding layer's output
+        node). The reference implementation used a plain sequential net; here a
+        block's input is taken from the previous block's main-path ``conv2``, and
+        the downsample conv shares its block's input. The stem conv has no
+        feeding layer (``None``), matching the reference's zero initial strength.
+
+        Returns:
+            ``(layer, feeding_index)`` pairs in forward order.
+        """
+        chain: List[Tuple[BayesianConv1d, Optional[int]]] = [(self.conv1, None)]
+        block_input = 0
+        for stage in (self.layer1, self.layer2, self.layer3, self.layer4):
+            for block in stage:
+                chain.append((block.conv1, block_input))
+                chain.append((block.conv2, len(chain) - 1))
+                main_path_output = len(chain) - 1
+                if block.downsample is not None:
+                    chain.append((block.downsample.conv, block_input))
+                block_input = main_path_output
+        return chain
+
     def _forward_layer(
         self, layer: nn.ModuleList, x: torch.Tensor, sample: bool
     ) -> torch.Tensor:
@@ -354,11 +374,10 @@ class UCLConfig:
     beta: float = 0.0002
     alpha: float = 0.3
     ratio: float = 0.125
-    det_lambda: float = 1.0
 
     split: bool = True
     eval_samples: int = 1
-    clipgrad: float = 10.0
+    clipgrad: float = 0.0
     class_weighted_ce: bool = True
 
     @staticmethod
@@ -372,6 +391,7 @@ class UCLConfig:
             value = getattr(args, field, None)
             if value is not None:
                 setattr(cfg, field, value)
+        print(f"Configs: {cfg}")
         return cfg
 
 
@@ -395,7 +415,12 @@ def _infer_ucl_split_from_loader(args: object, cfg: UCLConfig) -> None:
 
 
 class BayesianClassifier(nn.Module):
-    """Bayesian ResNet feature extractor followed by per-task Bayesian heads."""
+    """Bayesian ResNet feature extractor with a split or single-head classifier.
+
+    Mirrors the reference UCL networks: ``split`` uses deterministic per-task
+    heads, otherwise one Bayesian output layer spans all classes and is part of
+    the regularised network.
+    """
 
     def __init__(
         self,
@@ -431,14 +456,30 @@ class BayesianClassifier(nn.Module):
         )
         self.feature_dim = self.feature_net.feature_dim
 
-        self.heads = nn.ModuleList(
-            [
-                BayesianLinear(self.feature_dim, c, ratio=cfg.ratio)
-                for c in classes_per_task
-            ]
-        )
-
         self.split = cfg.split
+        if self.split:
+            # Deterministic task heads, as in the reference split network (``self.last``).
+            self.heads = nn.ModuleList(
+                [nn.Linear(self.feature_dim, c) for c in classes_per_task]
+            )
+        else:
+            self.output = BayesianLinear(self.feature_dim, n_outputs, ratio=cfg.ratio)
+
+    def ucl_regularisation_chain(self) -> List[Tuple[BayesianLayer, Optional[int]]]:
+        """Regularised layers in forward order with their feeding-layer indices.
+
+        Returns:
+            The feature-net chain, plus the single-head output layer (fed by the
+            last main-path conv) when not ``split``.
+        """
+        chain: List[Tuple[BayesianLayer, Optional[int]]] = list(
+            self.feature_net.ucl_regularisation_chain()
+        )
+        if not self.split:
+            last_conv = self.feature_net.layer4[-1].conv2
+            feeding = next(i for i, (layer, _) in enumerate(chain) if layer is last_conv)
+            chain.append((self.output, feeding))
+        return chain
 
     def forward(
         self, x: torch.Tensor, sample: bool = False
@@ -462,10 +503,9 @@ class BayesianClassifier(nn.Module):
                 feature_type=self.iq_aug_feature_type,
             )
         feats = self.feature_net(x, sample=sample, ret_feats=True)
-        outputs = [head(feats, sample=sample) for head in self.heads]
         if self.split:
-            return outputs
-        return torch.cat(outputs, dim=1)
+            return [head(feats) for head in self.heads]
+        return self.output(feats, sample=sample)
 
 
 class Net(nn.Module):
@@ -491,33 +531,17 @@ class Net(nn.Module):
             or getattr(args, "nc_per_task", None),
             classes_per_task=getattr(args, "classes_per_task", None),
         )
-        self.classes_per_task = self._extend_cil_heads_with_global_noise(
-            self.classes_per_task
-        )
         self.nc_per_task = misc_utils.max_task_class_count(self.classes_per_task)
 
         self.model = BayesianClassifier(
             n_outputs, n_tasks, self.cfg, args, self.classes_per_task
         )
         self.split = self.cfg.split
-        in_channels = getattr(args, "in_channels", 2)
-        self.detector = ResNet1D(num_classes=1, args=args, in_channels=in_channels)
-        self.det_loss = nn.BCEWithLogitsLoss()
-        self.det_lambda = float(self.cfg.det_lambda)
-        self.det_optimizer = torch.optim.SGD(
-            self.detector.parameters(),
-            lr=self.cfg.lr,
-            momentum=0.9,
-            weight_decay=0.0,
-        )
 
         mu_params: List[nn.Parameter] = []
         rho_params: List[nn.Parameter] = []
-
-        for module in self._iter_bayesian_modules(self.model):
-            mu_params.extend(module.mu_parameters())
-            rho_params.extend(module.rho_parameters())
-        mu_params.extend(self.model.input_adapter.parameters())
+        for name, param in self.model.named_parameters():
+            (rho_params if name.endswith("weight_rho") else mu_params).append(param)
 
         self.optimizer = torch.optim.SGD(
             [
@@ -529,71 +553,22 @@ class Net(nn.Module):
             weight_decay=0.0,
         )
 
-        self.anchor_mode = resolve_anchor_mode(args)
-        # Only the mu penalty is a diagonal quadratic anchor, so only it moves to
-        # the proximal path; the sigma KL and the L1 term stay in the loss. See
-        # `_apply_proximal_mu_anchor`.
-        self.use_proximal_anchor = self.anchor_mode == "proximal"
-        self._regularised_parameter_count = 0
-
         self.current_task: Optional[int] = None
         self.model_old: Optional[BayesianClassifier] = None
         self.saved = False
         self.is_task_incremental: bool = True
         self._debug_step_counter = 0
-        self.noise_label: int | None = noise_label_from_args(args)
         self.incremental_loader_name = getattr(args, "loader", None)
-        self._use_task_bn_state = bool(
-            self.split and self.incremental_loader_name == "task_incremental_loader"
-        )
-        self._bn_modules: List[_BatchNorm] = [
-            module for module in self.model.modules() if isinstance(module, _BatchNorm)
-        ]
-        self._bn_task_stats: dict[int, List[Tuple[torch.Tensor, torch.Tensor, int]]] = (
-            {}
-        )
-        self._bn_task_affine: dict[
-            int, List[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]]
-        ] = {}
-        self._bn_finalized_tasks: set[int] = set()
-
-    def _extend_cil_heads_with_global_noise(
-        self, classes_per_task: List[int]
-    ) -> List[int]:
-        """Ensure CIL concatenated heads include a slot for global noise labels.
-
-        In IQ CIL mode, `class_incremental_loader` remaps noise targets to a
-        single global class id (typically the last label). UCL uses per-task
-        heads and concatenates them when `split=False`; if head widths only sum
-        to signal classes, CE receives out-of-range noise targets.
-
-        This method adds one class slot to the final head only when needed.
-
-        Args:
-            classes_per_task: Per-task class counts used to size UCL heads.
-
-        Returns:
-            Possibly adjusted per-task class counts.
-        """
-
-        is_cil = not bool(self.cfg.split)
-        if not is_cil:
-            return classes_per_task
-
-        total_classes = int(sum(classes_per_task))
-        if total_classes >= int(self.n_outputs):
-            return classes_per_task
-
-        missing_classes = int(self.n_outputs) - total_classes
-        if missing_classes <= 0:
-            return classes_per_task
-
-        adjusted = list(classes_per_task)
-        adjusted[-1] += missing_classes
-        return adjusted
+        # Per-task BatchNorm running statistics are handled centrally by
+        # :mod:`model.task_bn`, installed from ``main`` once the model is built.
 
     @contextmanager
     def _temporarily_enable_bn_training(self):
+        """Put BatchNorm in train mode for multi-sample Bayesian evaluation.
+
+        Running-statistic updates stay frozen throughout: this is an evaluation
+        path, so it must read each task's statistics without writing them.
+        """
         bn_modules: List[nn.BatchNorm1d] = []
         states: List[bool] = []
         for module in self.model.modules():
@@ -602,158 +577,11 @@ class Net(nn.Module):
                 states.append(module.training)
                 module.train(True)
         try:
-            yield
+            with frozen_running_stats(self):
+                yield
         finally:
             for module, state in zip(bn_modules, states):
                 module.train(state)
-
-    # ------------------------------------------------------------------
-    def _reset_bn_stats(self) -> None:
-        """Reset BatchNorm running statistics for a fresh TIL task."""
-        if not self._use_task_bn_state:
-            return
-        for batch_norm_module in self._bn_modules:
-            batch_norm_module.running_mean.zero_()
-            batch_norm_module.running_var.fill_(1.0)
-            batch_norm_module.num_batches_tracked.zero_()
-
-    def _snapshot_bn_stats(self, task: int) -> None:
-        """Store task-specific BatchNorm state for TIL evaluation.
-
-        Args:
-            task: Completed task index whose BatchNorm state should be restored
-                for future task-incremental evaluation.
-        """
-        if not self._use_task_bn_state:
-            return
-        stats: List[Tuple[torch.Tensor, torch.Tensor, int]] = []
-        affine: List[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]] = []
-        for batch_norm_module in self._bn_modules:
-            stats.append(
-                (
-                    batch_norm_module.running_mean.detach().clone(),
-                    batch_norm_module.running_var.detach().clone(),
-                    int(batch_norm_module.num_batches_tracked.item()),
-                )
-            )
-            if batch_norm_module.affine:
-                affine.append(
-                    (
-                        batch_norm_module.weight.detach().clone(),
-                        batch_norm_module.bias.detach().clone(),
-                    )
-                )
-            else:
-                affine.append((None, None))
-        self._bn_task_stats[task] = stats
-        self._bn_task_affine[task] = affine
-        self._bn_finalized_tasks.add(task)
-
-    def _capture_bn_state(
-        self,
-    ) -> Tuple[
-        List[Tuple[torch.Tensor, torch.Tensor, int]],
-        List[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]],
-    ]:
-        """Capture currently active BatchNorm state.
-
-        Returns:
-            Running-stat and affine snapshots that can be restored after a
-            temporary task-specific evaluation forward.
-        """
-        stats: List[Tuple[torch.Tensor, torch.Tensor, int]] = []
-        affine: List[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]] = []
-        for batch_norm_module in self._bn_modules:
-            stats.append(
-                (
-                    batch_norm_module.running_mean.detach().clone(),
-                    batch_norm_module.running_var.detach().clone(),
-                    int(batch_norm_module.num_batches_tracked.item()),
-                )
-            )
-            if batch_norm_module.affine:
-                affine.append(
-                    (
-                        batch_norm_module.weight.detach().clone(),
-                        batch_norm_module.bias.detach().clone(),
-                    )
-                )
-            else:
-                affine.append((None, None))
-        return stats, affine
-
-    def _apply_bn_state(
-        self,
-        stats: List[Tuple[torch.Tensor, torch.Tensor, int]],
-        affine: List[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]],
-    ) -> None:
-        """Apply a previously captured BatchNorm state.
-
-        Args:
-            stats: Running-stat snapshots from :meth:`_capture_bn_state`.
-            affine: Affine parameter snapshots from :meth:`_capture_bn_state`.
-        """
-        if len(stats) != len(self._bn_modules) or len(affine) != len(self._bn_modules):
-            raise RuntimeError(
-                "BatchNorm state snapshot is out of sync with model BatchNorm modules."
-            )
-        for batch_norm_module, (running_mean, running_var, num_batches) in zip(
-            self._bn_modules, stats
-        ):
-            batch_norm_module.running_mean.data.copy_(running_mean)
-            batch_norm_module.running_var.data.copy_(running_var)
-            batch_norm_module.num_batches_tracked.data.fill_(num_batches)
-        for batch_norm_module, (weight, bias) in zip(self._bn_modules, affine):
-            if weight is not None and batch_norm_module.affine:
-                batch_norm_module.weight.data.copy_(weight)
-                batch_norm_module.bias.data.copy_(bias)
-
-    def _restore_bn_stats(self, task: int) -> None:
-        """Restore saved task BatchNorm state, or reset for unseen TIL tasks.
-
-        Args:
-            task: Task index whose BatchNorm state should become active.
-        """
-        if not self._use_task_bn_state:
-            return
-        stats = self._bn_task_stats.get(task)
-        affine = self._bn_task_affine.get(task)
-        if stats is None:
-            self._reset_bn_stats()
-            return
-        if affine is None:
-            raise RuntimeError(
-                f"BatchNorm affine snapshot missing for task {task} despite saved stats."
-            )
-        self._apply_bn_state(stats, affine)
-
-    def finalize_task_after_training(
-        self,
-        train_loader: object | None = None,
-        *,
-        completed_task_index: int | None = None,
-    ) -> None:
-        """Snapshot task-specific BatchNorm state after TIL task training.
-
-        Args:
-            train_loader: Unused hook argument accepted for compatibility with
-                the repository training loop.
-            completed_task_index: Completed task index. Defaults to the current
-                task tracked by the UCL learner.
-
-        Usage:
-            The main training loop calls ``model.finalize_task_after_training(
-            train_loader)`` after finishing each task.
-        """
-        del train_loader
-        if not self._use_task_bn_state:
-            return
-        task = (
-            self.current_task if completed_task_index is None else completed_task_index
-        )
-        if task is None:
-            raise RuntimeError("finalize_task_after_training requires a current task.")
-        self._snapshot_bn_stats(task)
 
     # ------------------------------------------------------------------
     def compute_offsets(self, task: int) -> Tuple[int, int]:
@@ -779,24 +607,16 @@ class Net(nn.Module):
         concatenated heads; TIL → separate heads). With concatenated logits,
         :func:`~utils.misc_utils.apply_task_incremental_logit_mask` applies in
         eval. With ``split=True``, only head ``t`` is returned.
+
+        Per-task BatchNorm statistics are selected by the caller (see
+        :func:`utils.training_forward.model_forward_for_metric_loop`), so this
+        forward no longer swaps BatchNorm state itself.
         """
-        previous_bn_state = (
-            self._capture_bn_state()
-            if self._use_task_bn_state and not self.training
-            else None
+        return self._forward_with_active_bn(
+            x,
+            t,
+            cil_all_seen_upto_task=cil_all_seen_upto_task,
         )
-        if self._use_task_bn_state and not self.training:
-            self._restore_bn_stats(t)
-        try:
-            logits = self._forward_with_active_bn(
-                x,
-                t,
-                cil_all_seen_upto_task=cil_all_seen_upto_task,
-            )
-        finally:
-            if previous_bn_state is not None:
-                self._apply_bn_state(*previous_bn_state)
-        return logits
 
     def _forward_with_active_bn(
         self,
@@ -853,99 +673,66 @@ class Net(nn.Module):
                 self.classes_per_task,
                 self.n_outputs,
                 cil_all_seen_upto_task=cil_all_seen_upto_task,
-                global_noise_label=self.noise_label,
                 fill_value=-10e10,
                 loader=self.incremental_loader_name,
             )
         return logits
 
-    def forward_heads(
-        self, x: torch.Tensor, sample: bool = False
-    ) -> Tuple[torch.Tensor, List[torch.Tensor] | torch.Tensor]:
-        det_logits = self.detector.forward_detection(self.detector.forward_features(x))
-        cls_logits = self.model(x, sample=sample)
-        return det_logits, cls_logits
-
     def observe(
         self, x: torch.Tensor, y: torch.Tensor, t: int
     ) -> Tuple[float, float, torch.Tensor | None]:
-        y_cls, y_det = self._split_labels(y)
-        if not torch.is_tensor(y_cls):
-            y_cls = torch.as_tensor(y_cls)
-        if y_det is not None and not torch.is_tensor(y_det):
-            y_det = torch.as_tensor(y_det)
-        y_cls_glob = unpack_y_to_class_labels(
-            (y_cls, y_det) if y_det is not None else y_cls
-        ).long()
-        if (self.current_task is None) or (t != self.current_task):
-            if self.current_task is not None:
-                if (
-                    self._use_task_bn_state
-                    and self.current_task not in self._bn_finalized_tasks
-                ):
-                    self._snapshot_bn_stats(self.current_task)
-                self.model_old = self._snapshot_model()
-                self.saved = True
+        y_cls_glob = unpack_y_to_class_labels(y).long()
+        if self.current_task is None:
+            # The reference regularises the first task towards the initial weights.
+            self.model_old = self._snapshot_model()
             self.current_task = t
-            self._restore_bn_stats(t)
+        elif t != self.current_task:
+            self.model_old = self._snapshot_model()
+            self.saved = True
+            self.current_task = t
 
         device = self._device()
 
         x_cls = x
         y_cls_filtered = y_cls_glob
-        # if y_det is not None:
-        #     signal_mask = (y_det == 1) & (y_cls >= 0)
-        #     if not signal_mask.any():
-        #         x = x.to(device)
-        #         y_det = y_det.to(device)
-        #         self.detector.train()
-        #         det_logits = self.detector.forward_detection(self.detector.forward_features(x))
-        #         det_loss = self.det_loss(det_logits, y_det.float())
-        #         self.det_optimizer.zero_grad(set_to_none=True)
-        #         det_loss = self.det_lambda * det_loss
-        #         det_loss.backward()
-        #         if self.cfg.clipgrad > 0:
-        #             torch.nn.utils.clip_grad_norm_(self.detector.parameters(), self.cfg.clipgrad)
-        #         self.det_optimizer.step()
-        #         return float(det_loss.detach().cpu()), 0.0
-        #     x_cls = x[signal_mask]
-        #     y_cls_filtered = y_cls[signal_mask]
-
-        signal_mask = signal_mask_exclude_noise(y_cls_filtered, self.noise_label)
         if self.split:
             offset1, _ = self.compute_offsets(t)
             y_local = y_cls_filtered.clone() - offset1
             task_classes = self.classes_per_task[t]
-            if signal_mask.any():
-                y_sig = y_local[signal_mask]
-                if (y_sig.min() < 0) or (y_sig.max() >= task_classes):
-                    raise ValueError(
-                        f"Labels out of range for task {t}: expected in [0, {task_classes - 1}] after offset, got "
-                        f"[{int(y_sig.min())}, {int(y_sig.max())}]"
-                    )
+            if y_local.numel() and (
+                (y_local.min() < 0) or (y_local.max() >= task_classes)
+            ):
+                raise ValueError(
+                    f"Labels out of range for task {t}: expected in [0, {task_classes - 1}] after offset, got "
+                    f"[{int(y_local.min())}, {int(y_local.max())}]"
+                )
             y_cls_filtered = y_local
 
         x = x.to(device)
         x_cls = x_cls.to(device)
         y_cls_filtered = y_cls_filtered.to(device)
-        signal_mask = signal_mask.to(device)
-        if y_det is not None:
-            y_det = y_det.to(device)
 
         self.train()
         # Let BatchNorm update running buffers so ``model.eval()`` matches training stats.
         metric_logits = None
         for _ in range(self.cfg.inner_steps):
             outputs = self.model(x_cls, sample=True)
-            logits = outputs[t] if self.split else outputs
+            if self.split:
+                logits = outputs[t]
+            else:
+                # Not in the reference (its single head shares labels across tasks):
+                # unseen-class rows would otherwise be pushed down, then anchored there.
+                logits = misc_utils.apply_task_incremental_logit_mask(
+                    outputs,
+                    t,
+                    self.classes_per_task,
+                    self.n_outputs,
+                    cil_all_seen_upto_task=t,
+                    loader=self.incremental_loader_name,
+                )
 
             preds = torch.argmax(logits, dim=1)
-            if signal_mask.any():
-                cls_tr_rec = macro_recall(
-                    preds[signal_mask], y_cls_filtered[signal_mask]
-                )
-            else:
-                cls_tr_rec = 0.0
+            cls_tr_rec = macro_recall(preds, y_cls_filtered)
             metric_logits = logits.detach()
             self._maybe_log_training_debug(
                 task_index=t,
@@ -965,19 +752,6 @@ class Net(nn.Module):
             if self.cfg.clipgrad > 0:
                 torch.nn.utils.clip_grad_norm_(self.parameters(), self.cfg.clipgrad)
             self.optimizer.step()
-            if self.use_proximal_anchor:
-                self._apply_proximal_mu_anchor(int(y_cls_filtered.size(0)))
-
-        # if y_det is not None:
-        #     self.detector.train()
-        #     det_logits = self.detector.forward_detection(self.detector.forward_features(x))
-        #     det_loss = self.det_loss(det_logits, y_det.float())
-        #     self.det_optimizer.zero_grad(set_to_none=True)
-        #     det_loss = self.det_lambda * det_loss
-        #     det_loss.backward()
-        #     if self.cfg.clipgrad > 0:
-        #         torch.nn.utils.clip_grad_norm_(self.detector.parameters(), self.cfg.clipgrad)
-        #     self.det_optimizer.step()
 
         return float(loss.detach().cpu()), cls_tr_rec, metric_logits
 
@@ -1037,6 +811,15 @@ class Net(nn.Module):
         clone = BayesianClassifier(
             self.n_outputs, self.n_tasks, self.cfg, self.args, self.classes_per_task
         )
+        # ``self.model`` may have had its BatchNorm layers converted in place by
+        # :mod:`model.task_bn` after construction, which adds per-task buffers to
+        # its state dict. Give the freshly built clone the same layer types
+        # before loading, or the load fails on unexpected keys.
+        task_bn_layers = task_bn.task_bn_layers(self.model)
+        if task_bn_layers:
+            task_bn.convert_batchnorm_to_task_specific(
+                clone, task_bn_layers[0].num_tasks
+            )
         clone.load_state_dict(self.model.state_dict())
         clone.to(self._device())
         clone.eval()
@@ -1044,290 +827,96 @@ class Net(nn.Module):
             param.requires_grad_(False)
         return clone
 
-    def _compute_layer_regularisation_terms(
-        self,
-        old_layer: BayesianLayer,
-        new_layer: BayesianLayer,
-        eps: float,
-    ) -> Tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        int,
-    ]:
-        """Compute UCL regularisation terms for a Bayesian layer pair.
-
-        Args:
-            old_layer: Frozen layer snapshot from the previous task.
-            new_layer: Trainable layer for the current task.
-            eps: Small constant for numerical stability.
-
-        Returns:
-            A tuple containing sigma_weight_reg, sigma_weight_normal_reg,
-            mu_weight_reg, mu_bias_reg, l1_mu_weight_reg, and l1_mu_bias_reg.
-        """
-        trainer_weight_mu = new_layer.weight_mu
-        saver_weight_mu = old_layer.weight_mu
-        trainer_weight_sigma = new_layer.weight_sigma
-        saver_weight_sigma = old_layer.weight_sigma
-        safe_saver_weight_sigma = saver_weight_sigma.clamp_min(eps)
-
-        fan_in, _ = _calculate_fan_in_and_fan_out(trainer_weight_mu)
-        std_init = math.sqrt((2.0 / fan_in) * self.cfg.ratio)
-
-        curr_strength = std_init / safe_saver_weight_sigma
-        saver_strength_flat = curr_strength.view(curr_strength.size(0), -1)
-        bias_strength = saver_strength_flat.mean(dim=1)
-
-        mu_weight_reg = (
-            (curr_strength * (trainer_weight_mu - saver_weight_mu)) ** 2
-        ).sum()
-        l1_mu_weight_reg = (
-            (saver_weight_mu.pow(2) / safe_saver_weight_sigma.pow(2))
-            * (trainer_weight_mu - saver_weight_mu).abs()
-        ).sum() * (std_init**2)
-
-        mu_bias_reg = torch.zeros_like(mu_weight_reg)
-        l1_mu_bias_reg = torch.zeros_like(mu_weight_reg)
-        regularized_parameter_count = (
-            trainer_weight_mu.numel() + trainer_weight_sigma.numel()
-        )
-        trainer_bias = getattr(new_layer, "bias", None)
-        saver_bias = getattr(old_layer, "bias", None)
-        if trainer_bias is not None and saver_bias is not None:
-            mu_bias_reg = ((bias_strength * (trainer_bias - saver_bias)) ** 2).sum()
-            saver_sigma_flat = saver_weight_sigma.view(saver_weight_sigma.size(0), -1)
-            l1_mu_bias_reg = (
-                (saver_bias.pow(2) / saver_sigma_flat.mean(dim=1).clamp_min(eps).pow(2))
-                * (trainer_bias - saver_bias).abs()
-            ).sum() * (std_init**2)
-            regularized_parameter_count += trainer_bias.numel()
-
-        weight_sigma_ratio = trainer_weight_sigma.pow(2) / (
-            safe_saver_weight_sigma.pow(2)
-        )
-        sigma_weight_reg = (
-            weight_sigma_ratio - torch.log(weight_sigma_ratio + eps)
-        ).sum()
-        sigma_weight_normal_reg = (
-            trainer_weight_sigma.pow(2) - torch.log(trainer_weight_sigma.pow(2) + eps)
-        ).sum()
-        return (
-            sigma_weight_reg,
-            sigma_weight_normal_reg,
-            mu_weight_reg,
-            mu_bias_reg,
-            l1_mu_weight_reg,
-            l1_mu_bias_reg,
-            regularized_parameter_count,
-        )
-
     def _apply_regularisation(
         self, base_loss: torch.Tensor, batch_size: int
     ) -> torch.Tensor:
-        """Apply UCL regularisation against the previous-task posterior snapshot.
+        """Add the UCL regulariser, following the reference ``custom_regularization``.
+
+        During the first task ``model_old`` holds the initial weights and ``alpha``
+        is ``cfg.alpha``; once a task has been consolidated ``alpha`` is 1 and the
+        L1 term switches on. Terms are summed over layers and scaled only by the
+        minibatch size. Split task heads are deterministic and not regularised;
+        the single-head output layer is.
 
         Args:
-            base_loss: Current task classification loss.
+            base_loss: Mean classification loss of the current minibatch.
             batch_size: Current minibatch size.
 
         Returns:
             The total loss including UCL regularisation.
         """
-        if not self.saved or self.model_old is None:
-            return base_loss
+        alpha = 1.0 if self.saved else float(self.cfg.alpha)
 
-        sigma_weight_reg = torch.zeros_like(base_loss)
-        sigma_weight_normal_reg = torch.zeros_like(base_loss)
-        mu_weight_reg = torch.zeros_like(base_loss)
-        mu_bias_reg = torch.zeros_like(base_loss)
-        l1_mu_weight_reg = torch.zeros_like(base_loss)
-        l1_mu_bias_reg = torch.zeros_like(base_loss)
-        regularized_parameter_count = 0
-        eps = 1e-8
+        mu_reg = base_loss.new_zeros(())
+        l1_mu_reg = base_loss.new_zeros(())
+        sigma_weight_reg = base_loss.new_zeros(())
+        sigma_weight_normal_reg = base_loss.new_zeros(())
 
-        for old_layer, new_layer in zip(
-            self._iter_bayesian_modules(self.model_old.feature_net),
-            self._iter_bayesian_modules(self.model.feature_net),
+        saver_strengths: List[torch.Tensor] = []
+        for (saver_layer, feeding_index), (trainer_layer, _) in zip(
+            self.model_old.ucl_regularisation_chain(),
+            self.model.ucl_regularisation_chain(),
         ):
-            (
-                sigma_term,
-                sigma_normal_term,
-                mu_weight_term,
-                mu_bias_term,
-                l1_weight_term,
-                l1_bias_term,
-                param_count,
-            ) = self._compute_layer_regularisation_terms(old_layer, new_layer, eps)
-            sigma_weight_reg = sigma_weight_reg + sigma_term
-            sigma_weight_normal_reg = sigma_weight_normal_reg + sigma_normal_term
-            mu_weight_reg = mu_weight_reg + mu_weight_term
-            mu_bias_reg = mu_bias_reg + mu_bias_term
-            l1_mu_weight_reg = l1_mu_weight_reg + l1_weight_term
-            l1_mu_bias_reg = l1_mu_bias_reg + l1_bias_term
-            regularized_parameter_count += param_count
+            trainer_weight_mu = trainer_layer.weight_mu
+            saver_weight_mu = saver_layer.weight_mu
+            trainer_weight_sigma = trainer_layer.weight_sigma
+            saver_weight_sigma = saver_layer.weight_sigma
 
-        current_task_index = (
-            int(self.current_task) if self.current_task is not None else 0
-        )
-        for head_index in range(min(current_task_index, len(self.model.heads))):
-            old_head = self.model_old.heads[head_index]
-            new_head = self.model.heads[head_index]
-            (
-                sigma_term,
-                sigma_normal_term,
-                mu_weight_term,
-                mu_bias_term,
-                l1_weight_term,
-                l1_bias_term,
-                param_count,
-            ) = self._compute_layer_regularisation_terms(old_head, new_head, eps)
-            sigma_weight_reg = sigma_weight_reg + sigma_term
-            sigma_weight_normal_reg = sigma_weight_normal_reg + sigma_normal_term
-            mu_weight_reg = mu_weight_reg + mu_weight_term
-            mu_bias_reg = mu_bias_reg + mu_bias_term
-            l1_mu_weight_reg = l1_mu_weight_reg + l1_weight_term
-            l1_mu_bias_reg = l1_mu_bias_reg + l1_bias_term
-            regularized_parameter_count += param_count
+            # The reference uses fan_in for linear layers and fan_out for convolutions.
+            fan_in, fan_out = _calculate_fan_in_and_fan_out(trainer_weight_mu)
+            is_linear = isinstance(trainer_layer, BayesianLinear)
+            std_init = math.sqrt(
+                (2.0 / (fan_in if is_linear else fan_out)) * self.cfg.ratio
+            )
 
-        normaliser = max(1, regularized_parameter_count)
-        # Cached for `_apply_proximal_mu_anchor`, which needs the same divisor to
-        # reproduce this term's curvature exactly.
-        self._regularised_parameter_count = normaliser
-        sigma_weight_reg = sigma_weight_reg / normaliser
-        sigma_weight_normal_reg = sigma_weight_normal_reg / normaliser
-        mu_weight_reg = mu_weight_reg / normaliser
-        mu_bias_reg = mu_bias_reg / normaliser
-        l1_mu_weight_reg = l1_mu_weight_reg / normaliser
-        l1_mu_bias_reg = l1_mu_bias_reg / normaliser
+            saver_weight_strength = std_init / saver_weight_sigma
+            saver_strengths.append(saver_weight_strength)
+            l2_strength = saver_weight_strength
+            if feeding_index is not None:
+                # One strength per feeding output node, repeated over the input
+                # features it produces (the reference's conv -> linear flatten).
+                feeding_strength = saver_strengths[feeding_index]
+                in_features = trainer_weight_mu.size(1)
+                prev_strength = (
+                    feeding_strength.reshape(feeding_strength.size(0), 1)
+                    .expand(-1, in_features // feeding_strength.size(0))
+                    .reshape(1, in_features, *([1] * (trainer_weight_mu.dim() - 2)))
+                )
+                l2_strength = torch.max(saver_weight_strength, prev_strength)
+
+            delta_mu = trainer_weight_mu - saver_weight_mu
+            mu_reg = mu_reg + (l2_strength * delta_mu).pow(2).sum()
+            l1_mu_reg = l1_mu_reg + (
+                (saver_weight_mu.pow(2) / saver_weight_sigma.pow(2)) * delta_mu
+            ).abs().sum() * (std_init**2)
+
+            trainer_bias = getattr(trainer_layer, "bias", None)
+            if trainer_bias is not None:
+                saver_bias = saver_layer.bias
+                delta_bias = trainer_bias - saver_bias
+                bias_strength = saver_weight_strength.reshape(-1)
+                bias_sigma = saver_weight_sigma.reshape(-1)
+                mu_reg = mu_reg + (bias_strength * delta_bias).pow(2).sum()
+                l1_mu_reg = l1_mu_reg + (
+                    (saver_bias.pow(2) / bias_sigma.pow(2)) * delta_bias
+                ).abs().sum() * (std_init**2)
+
+            weight_sigma = trainer_weight_sigma.pow(2) / saver_weight_sigma.pow(2)
+            normal_weight_sigma = trainer_weight_sigma.pow(2)
+            sigma_weight_reg = sigma_weight_reg + (
+                weight_sigma - torch.log(weight_sigma)
+            ).sum()
+            sigma_weight_normal_reg = sigma_weight_normal_reg + (
+                normal_weight_sigma - torch.log(normal_weight_sigma)
+            ).sum()
 
         loss = base_loss
-        if not self.use_proximal_anchor:
-            # In proximal mode this quadratic is applied in closed form after the
-            # optimiser step instead; the L1 and sigma terms below are not
-            # quadratic anchors and stay in the loss either way.
-            loss = loss + self.cfg.alpha * (mu_weight_reg + mu_bias_reg) / (
-                2 * batch_size
-            )
-        loss = loss + self.saved * (l1_mu_weight_reg + l1_mu_bias_reg) / batch_size
+        loss = loss + alpha * mu_reg / (2 * batch_size)
+        loss = loss + float(self.saved) * l1_mu_reg / batch_size
         loss = loss + self.cfg.beta * (sigma_weight_reg + sigma_weight_normal_reg) / (
             2 * batch_size
         )
         return loss
-
-    def _iter_regularised_layer_pairs(
-        self,
-    ) -> Iterable[Tuple[BayesianLayer, BayesianLayer]]:
-        """Yield ``(old_layer, new_layer)`` for every regularised Bayesian layer.
-
-        The regularised set is the whole feature extractor plus the heads of
-        tasks already completed -- exactly the pairs ``_apply_regularisation``
-        walks. Factored out so the proximal mu anchor cannot drift out of sync
-        with the loss term it replaces.
-
-        Yields:
-            Pairs of frozen-snapshot and live Bayesian layers. Empty until the
-            first snapshot exists.
-
-        Usage:
-            >>> for old_layer, new_layer in self._iter_regularised_layer_pairs():
-            ...     ...
-        """
-        if self.model_old is None:
-            return
-        yield from zip(
-            self._iter_bayesian_modules(self.model_old.feature_net),
-            self._iter_bayesian_modules(self.model.feature_net),
-        )
-        current_task_index = (
-            int(self.current_task) if self.current_task is not None else 0
-        )
-        for head_index in range(min(current_task_index, len(self.model.heads))):
-            yield self.model_old.heads[head_index], self.model.heads[head_index]
-
-    @torch.no_grad()
-    def _apply_proximal_mu_anchor(self, batch_size: int) -> None:
-        """Apply UCL's mu anchor as a closed-form post-step update.
-
-        UCL's regulariser is three terms, only one of which is a diagonal
-        quadratic anchor::
-
-            alpha * sum_i (S_i * (mu_i - mu_i^*))^2 / (2 * B * N)
-
-        with ``S_i = std_init / sigma_i^*`` the "strength" of the frozen
-        posterior. Matching the canonical form
-        ``(k/2) * sum_i Omega_i (theta_i - theta_i^*)^2`` gives importance
-        ``Omega_i = S_i^2`` and curvature ``k = alpha / (B * N)``, where ``B`` is
-        the minibatch size and ``N`` the regularised-parameter count. Both vary
-        per step, so unlike EWC/SI/RWalk the curvature cannot be precomputed and
-        ``utils.proximal_anchor.anchor_curvature`` does not carry an entry for
-        UCL.
-
-        This is the term with the worst conditioning in the method: ``S_i``
-        is an *inverse* posterior standard deviation, so a layer that a previous
-        task made confident about (small ``sigma^*``) contributes curvature that
-        grows without bound. That is precisely the regime where explicit descent
-        on the anchor is unstable and the closed form is not.
-
-        The L1 term (``|mu - mu^*|`` weighted by the frozen signal-to-noise
-        ratio) and the sigma KL terms stay in the loss: neither is a quadratic
-        anchor, and the L1 gradient is bounded by construction, so neither has
-        the stability problem this addresses.
-
-        Args:
-            batch_size: Size of the minibatch the step was taken on -- the same
-                ``B`` that scaled the loss term being replaced.
-        """
-        if not self.saved or self.model_old is None:
-            return
-        normaliser = max(1, int(self._regularised_parameter_count))
-        curvature = float(self.cfg.alpha) / (float(batch_size) * float(normaliser))
-        # Group 0 holds the mu parameters (see the optimiser construction in
-        # __init__); the rho group has its own learning rate and is not anchored.
-        coefficient = optimizer_learning_rate(self.optimizer, group_index=0) * curvature
-        if coefficient == 0.0:
-            return
-        eps = 1e-8
-        for old_layer, new_layer in self._iter_regularised_layer_pairs():
-            saver_weight_sigma = old_layer.weight_sigma.clamp_min(eps)
-            fan_in, _ = _calculate_fan_in_and_fan_out(new_layer.weight_mu)
-            std_init = math.sqrt((2.0 / fan_in) * self.cfg.ratio)
-            weight_strength = std_init / saver_weight_sigma
-            apply_proximal_anchor(
-                new_layer.weight_mu,
-                weight_strength.pow(2),
-                old_layer.weight_mu,
-                coefficient,
-            )
-
-            trainer_bias = getattr(new_layer, "bias", None)
-            saver_bias = getattr(old_layer, "bias", None)
-            if trainer_bias is None or saver_bias is None:
-                continue
-            bias_strength = weight_strength.view(weight_strength.size(0), -1).mean(
-                dim=1
-            )
-            apply_proximal_anchor(
-                trainer_bias, bias_strength.pow(2), saver_bias, coefficient
-            )
-
-    def _iter_bayesian_modules(self, module: nn.Module) -> Iterable[BayesianLayer]:
-        for sub in module.modules():
-            if isinstance(sub, BayesianLayer):
-                yield sub
-
-    def _split_labels(
-        self, y: torch.Tensor | Tuple[torch.Tensor, torch.Tensor] | dict
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if isinstance(y, (tuple, list)) and len(y) == 2:
-            return y[0], y[1]
-        if isinstance(y, dict):
-            y_cls = y.get("y_cls", y.get("y"))
-            return y_cls, y.get("y_det")
-        return y, None
 
     @torch.no_grad()
     def mc_epistemic_classification(self, x, t, S=20, temperature=1.0, clamp_eps=1e-8):

@@ -29,7 +29,7 @@ def _unique_labels(values: np.ndarray, debug_context: str) -> np.ndarray:
         1D array of unique class ids cast to `np.int64`.
 
     Usage:
-        labels = _unique_labels(targets_np, "macro_f1_including_noise")
+        labels = _unique_labels(targets_np, "macro_f1")
     """
     if values.size == 0:
         return np.asarray([], dtype=np.int64)
@@ -150,28 +150,26 @@ def _to_numpy(preds: TensorLike, targets: TensorLike) -> tuple[np.ndarray, np.nd
     return preds_np, targets_np
 
 
-def macro_precision_signal_only(
-    preds: TensorLike,
-    targets: TensorLike,
-    noise_label: int | None,
-) -> float:
-    """Macro precision over signal classes only (excludes noise)."""
+def macro_precision(preds: TensorLike, targets: TensorLike) -> float:
+    """Macro-averaged precision over the signal classes present in the batch.
+
+    Args:
+        preds: Predicted class ids.
+        targets: Ground-truth class ids.
+
+    Returns:
+        Macro precision in ``[0, 1]``; ``0.0`` for an empty batch.
+
+    Usage:
+        precision = macro_precision(predictions, labels)
+    """
     preds_np, targets_np = _to_numpy(preds, targets)
     if preds_np.size == 0 or targets_np.size == 0:
         return 0.0
-    if noise_label is not None:
-        preds_np = _coerce_to_class_ids(preds_np)
-        targets_np = _coerce_to_class_ids(targets_np)
-        mask = targets_np != noise_label
-        if not np.any(mask):
-            return 0.0
-        preds_np = preds_np[mask]
-        targets_np = targets_np[mask]
-    else:
-        preds_np = _coerce_to_class_ids(preds_np)
-        targets_np = _coerce_to_class_ids(targets_np)
+    preds_np = _coerce_to_class_ids(preds_np)
+    targets_np = _coerce_to_class_ids(targets_np)
 
-    unique_labels = _unique_labels(targets_np, "macro_precision_signal_only")
+    unique_labels = _unique_labels(targets_np, "macro_precision")
     return precision_score(
         targets_np,
         preds_np,
@@ -181,21 +179,43 @@ def macro_precision_signal_only(
     )
 
 
-def macro_f1_including_noise(preds: TensorLike, targets: TensorLike) -> float:
-    """Macro F1 over all classes (including noise)."""
+def macro_f1(preds: TensorLike, targets: TensorLike) -> float:
+    """Macro-averaged F1 over the signal classes present in the batch.
+
+    Args:
+        preds: Predicted class ids.
+        targets: Ground-truth class ids.
+
+    Returns:
+        Macro F1 in ``[0, 1]``; ``0.0`` for an empty batch.
+
+    Usage:
+        f1 = macro_f1(predictions, labels)
+    """
     preds_np, targets_np = _to_numpy(preds, targets)
     if preds_np.size == 0 or targets_np.size == 0:
         return 0.0
     preds_np = _coerce_to_class_ids(preds_np)
     targets_np = _coerce_to_class_ids(targets_np)
-    unique_labels = _unique_labels(targets_np, "macro_f1_including_noise")
+    unique_labels = _unique_labels(targets_np, "macro_f1")
     return f1_score(
         targets_np, preds_np, labels=unique_labels, average="macro", zero_division=0
     )
 
 
 def macro_recall(preds: TensorLike, targets: TensorLike) -> float:
-    """Compute macro-averaged recall for a batch of predictions."""
+    """Macro-averaged recall over the signal classes present in the batch.
+
+    Args:
+        preds: Predicted class ids.
+        targets: Ground-truth class ids.
+
+    Returns:
+        Macro recall in ``[0, 1]``; ``0.0`` for an empty batch.
+
+    Usage:
+        recall = macro_recall(predictions, labels)
+    """
     if isinstance(preds, torch.Tensor):
         preds_np = preds.detach().cpu().numpy()
     else:

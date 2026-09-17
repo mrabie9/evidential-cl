@@ -1,4 +1,3 @@
 model: agem
 loader: class_incremental_loader
-lr: 0.01
-memory_loss_lambda: 5
+memory_loss_lambda: 1.0

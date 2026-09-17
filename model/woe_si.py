@@ -63,10 +63,8 @@ import torch
 import torch.nn as nn
 
 from model.resnet1d import ResNet1D
-from model.detection_replay import (
-    DetectionReplayMixin,
-    noise_label_from_args,
-    signal_mask_exclude_noise,
+from model.replay_utils import (
+    ReplayInputMixin,
     unpack_y_to_class_labels,
 )
 from utils.training_metrics import macro_recall
@@ -339,10 +337,8 @@ class WoeSiConfig:
     woe_anchor_mode: str = "loss"
 
     optimizer: str = "sgd"
-    clipgrad: Optional[float] = 100.0
+    clipgrad: Optional[float] = 0.0
     cls_lambda: float = 1.0
-    det_memories: int = 2000
-    det_replay_batch: int = 64
 
     @staticmethod
     def from_args(args: object) -> "WoeSiConfig":
@@ -356,7 +352,7 @@ class WoeSiConfig:
 # ======================================================================
 # Learner
 # ======================================================================
-class Net(DetectionReplayMixin, nn.Module):
+class Net(ReplayInputMixin, nn.Module):
     """Weight-of-Evidence Synaptic Intelligence learner built on ``ResNet1D``.
 
     Mirrors ``model.si.Net``: the only behavioural difference is that the
@@ -387,7 +383,6 @@ class Net(DetectionReplayMixin, nn.Module):
 
         self.net = ResNet1D(n_outputs, args)
         self.class_weighted_ce = bool(getattr(args, "class_weighted_ce", True))
-        self.noise_label: int | None = noise_label_from_args(args)
         self.incremental_loader_name = getattr(args, "loader", None)
         # CIL <-> full shared head; TIL <-> task-masked head. Mirrors the rule in
         # utils.misc_utils._effective_cil_upto_for_loader.
@@ -465,11 +460,6 @@ class Net(DetectionReplayMixin, nn.Module):
         self.lwf_kl = nn.KLDivLoss(reduction="batchmean")
         self.clipgrad = self.cfg.clipgrad
         self.cls_lambda = float(self.cfg.cls_lambda)
-        self._init_det_replay(
-            self.cfg.det_memories,
-            self.cfg.det_replay_batch,
-            enabled=bool(getattr(args, "use_detector_arch", False)),
-        )
 
         self.feature_dim = int(self.net.feature_dim)
         self.current_task: Optional[int] = None
@@ -500,7 +490,6 @@ class Net(DetectionReplayMixin, nn.Module):
             self.classes_per_task,
             self.n_outputs,
             cil_all_seen_upto_task=cil,
-            global_noise_label=self.noise_label,
             loader=self.incremental_loader_name,
         )
 
@@ -530,8 +519,7 @@ class Net(DetectionReplayMixin, nn.Module):
             # ----- 2) Standard CE update (drives the parameters) -----------
             self.opt.zero_grad()
             y_cls = unpack_y_to_class_labels(y)
-            cls_logits = self.net.forward_heads(x)[1]
-            signal_mask = signal_mask_exclude_noise(y_cls, self.noise_label)
+            cls_logits = self.net(x)
             logits_for_loss = cls_logits
             if self.is_task_incremental:
                 logits_for_loss = misc_utils.apply_task_incremental_logit_mask(
@@ -540,7 +528,6 @@ class Net(DetectionReplayMixin, nn.Module):
                     self.classes_per_task,
                     self.n_outputs,
                     cil_all_seen_upto_task=t,
-                    global_noise_label=self.noise_label,
                     loader=self.incremental_loader_name,
                 )
             targets_for_loss = y_cls.long()
@@ -549,11 +536,8 @@ class Net(DetectionReplayMixin, nn.Module):
                 targets_for_loss,
                 class_weighted_ce=self.class_weighted_ce,
             )
-            if signal_mask.any():
-                preds = torch.argmax(logits_for_loss[signal_mask], dim=1)
-                cls_tr_rec = macro_recall(preds, y_cls[signal_mask].long())
-            else:
-                cls_tr_rec = 0.0
+            preds = torch.argmax(logits_for_loss, dim=1)
+            cls_tr_rec = macro_recall(preds, y_cls.long())
 
             if self.reg_level == "output":
                 reg = self._evidence_distillation_loss(x, t)
@@ -583,7 +567,7 @@ class Net(DetectionReplayMixin, nn.Module):
             loss = loss + self._classification_replay_loss(t)
 
             loss.backward()
-            if self.clipgrad is not None:
+            if self.clipgrad is not None and self.clipgrad > 0:
                 torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.clipgrad)
             self.opt.step()
             if self.use_proximal_anchor:
@@ -627,11 +611,8 @@ class Net(DetectionReplayMixin, nn.Module):
 
     # ------------------------------------------------------------------
     def _is_tracked(self, name: str, param: nn.Parameter) -> bool:
-        if not param.requires_grad:
-            return False
-        if name.startswith("det_head"):
-            return False
-        return True
+        del name
+        return bool(param.requires_grad)
 
     # ------------------------------------------------------------------
     def _initialise_woe_state(self) -> None:
@@ -701,7 +682,6 @@ class Net(DetectionReplayMixin, nn.Module):
             self.classes_per_task,
             self.n_outputs,
             cil_all_seen_upto_task=t,
-            global_noise_label=self.noise_label,
             loader=self.incremental_loader_name,
         )
         return -classification_cross_entropy(
@@ -919,7 +899,7 @@ class Net(DetectionReplayMixin, nn.Module):
             # buffers -- unlike `model.lwf`, where each distillation pass updates
             # them. Those buffers are never read in this mode, so the numerics
             # match `model.lwf` exactly; the teacher simply stays genuinely frozen.
-            teacher_logits = self.teacher.forward_heads(x, bn_training=True)[1]
+            teacher_logits = self.teacher(x, bn_training=True)
             teacher_probs = torch.softmax(
                 teacher_logits.index_select(1, previous) / self.lwf_temperature,
                 dim=1,
@@ -1082,11 +1062,6 @@ class Net(DetectionReplayMixin, nn.Module):
             return torch.zeros(1, device=features.device)
 
         distill_x = x
-        if self.det_enabled:
-            replay = self._sample_det_memory()
-            if replay is not None:
-                distill_x = torch.cat([x, replay[0].to(x.device)], dim=0)
-                features = self.net.forward_features(distill_x, bn_training=False)
 
         # Both networks are centred with the teacher's mu: a shared reference is
         # what makes the difference measure evidence drift rather than a shift in
@@ -1230,9 +1205,9 @@ class Net(DetectionReplayMixin, nn.Module):
     def _active_class_indices(self, t: int, device: torch.device) -> torch.Tensor:
         """Active output columns: cumulative seen classes (CIL) or task slice (TIL).
 
-        Matches ``utils.misc_utils.apply_task_incremental_logit_mask``: the global
-        noise label (if any) is always kept active so the DS frame ``Theta``
-        spans the same classes the CE head is actually predicting over.
+        Matches ``utils.misc_utils.apply_task_incremental_logit_mask``, so the DS
+        frame ``Theta`` spans the same classes the CE head is actually predicting
+        over.
         """
         offset1, offset2 = misc_utils.compute_offsets(t, self.classes_per_task)
         offset2 = min(self.n_outputs, offset2)
@@ -1240,16 +1215,11 @@ class Net(DetectionReplayMixin, nn.Module):
             indices = list(range(0, offset2))
         else:
             indices = list(range(offset1, offset2))
-        if self.noise_label is not None:
-            noise = int(self.noise_label)
-            if 0 <= noise < self.n_outputs and noise not in indices:
-                indices.append(noise)
-        indices = sorted(set(indices))
         return torch.tensor(indices, dtype=torch.long, device=device)
 
     # ------------------------------------------------------------------
     def _previous_class_indices(self, t: int, device: torch.device) -> torch.Tensor:
-        """Output columns of classes from *completed* tasks ``< t`` (plus noise).
+        """Output columns of classes from *completed* tasks ``< t``.
 
         Used by the output-mode distillation to penalise evidence drift only on
         previously-seen classes (analogous to ``model.lwf``'s previous-class ids).
@@ -1260,11 +1230,6 @@ class Net(DetectionReplayMixin, nn.Module):
         offset1, _ = misc_utils.compute_offsets(t, self.classes_per_task)
         offset1 = min(self.n_outputs, offset1)
         indices = list(range(0, offset1))
-        if self.noise_label is not None:
-            noise = int(self.noise_label)
-            if 0 <= noise < self.n_outputs and noise not in indices:
-                indices.append(noise)
-        indices = sorted(set(indices))
         return torch.tensor(indices, dtype=torch.long, device=device)
 
     # ------------------------------------------------------------------
@@ -1325,8 +1290,7 @@ class Net(DetectionReplayMixin, nn.Module):
         """Write the current batch into a rehearsal buffer (hook).
 
         No-op in base WoE-SI; overridden by ``woe_si_replay`` to feed its
-        reservoir buffer. Kept separate from the detector-replay buffer that
-        ``DetectionReplayMixin`` maintains for the detection head.
+        reservoir buffer.
 
         Args:
             x: Current input batch.

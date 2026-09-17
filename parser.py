@@ -65,16 +65,38 @@ def get_parser():
         help="Debug mode with more frequent logging and smaller data splits",
     )
     parser.add_argument(
-        "--use_detector_arch",
-        default=False,
-        action="store_true",
-        help="Enable the detector architecture; when disabled, treat -1 class labels as an extra task class.",
-    )
-    parser.add_argument(
         "--use_groupnorm",
         default=False,
         action="store_true",
         help="Use GroupNorm in compatible backbones instead of BatchNorm.",
+    )
+    parser.add_argument(
+        "--norm_type",
+        type=str,
+        default="batchnorm",
+        choices=["batchnorm", "groupnorm", "adab1n"],
+        help=(
+            "Normalization layer used by compatible backbones (currently "
+            "resnet1d). 'adab1n' is a task-aware adaptive BatchNorm1d "
+            "(see model/adab1n.py); --use_groupnorm remains a legacy alias "
+            "for norm_type=groupnorm."
+        ),
+    )
+    parser.add_argument(
+        "--kappa",
+        type=float,
+        default=1.0,
+        help=(
+            "AdaB1N running-stat momentum schedule exponent in [0, 1]: 0 is a "
+            "cumulative average, 1 matches ordinary BatchNorm's fixed "
+            "momentum. Ignored unless norm_type=adab1n."
+        ),
+    )
+    parser.add_argument(
+        "--adab1n_init_weight",
+        type=float,
+        default=0.0,
+        help="Initial value of AdaB1N's per-task concentration logits.",
     )
     parser.add_argument(
         "--gem_disable_qp",
@@ -165,15 +187,8 @@ def get_parser():
         default=False,
         action="store_true",
         help="Use class-balanced reservoir sampling (CBRS) for the gem_distill buffer instead "
-        "of the per-task FIFO ring, so replay/distillation are not dominated by the noise/"
-        "frequent classes (A1).",
-    )
-    parser.add_argument(
-        "--balance_signal_only",
-        default=False,
-        action="store_true",
-        help="With --balanced_replay: exclude the noise/detection class from balancing so it "
-        "stays at its natural rate (avoids starving detection); only signal classes are balanced.",
+        "of the per-task FIFO ring, so replay/distillation are not dominated by frequent "
+        "classes (A1).",
     )
 
     # optimizer parameters influencing all models
@@ -212,6 +227,12 @@ def get_parser():
         help="number of total memories stored in a reservoir sampling based buffer",
     )
     parser.add_argument(
+        "--use_ring_buffer",
+        default=False,
+        action="store_true",
+        help="Store La-MAML replay exemplars in a per-task ring buffer (FIFO) instead of the default reservoir sampler.",
+    )
+    parser.add_argument(
         "--lr", type=float, default=1e-3, help="learning rate (For baselines)"
     )
     parser.add_argument(
@@ -239,6 +260,40 @@ def get_parser():
         ),
     )
     parser.add_argument(
+        "--bn_mode",
+        type=str,
+        default="shared",
+        choices=["task_specific", "shared"],
+        help=(
+            "BatchNorm statistics policy for task-incremental runs. "
+            "'shared' (default) trains a single BatchNorm instance continuously "
+            "across all tasks. 'task_specific' gives every task its own running "
+            "mean/variance, selected by task id at train and eval time (see "
+            "model/task_bn.py); the affine weight/bias stay shared across "
+            "tasks. Not recommended: a task's statistics freeze at its task "
+            "boundary while shared weights keep drifting, so old tasks collapse "
+            "to chance for any method that does not freeze old-task weights. "
+            "Ignored for class_incremental_loader runs and for norm_type "
+            "groupnorm/adab1n."
+        ),
+    )
+    parser.add_argument(
+        "--eval_bn_stats",
+        type=str,
+        default="batch",
+        choices=["batch", "running"],
+        help=(
+            "BatchNorm statistics read by evaluation forwards (metric loops and "
+            "LwF's frozen teacher) in task-incremental runs with --bn_mode "
+            "shared. 'batch' (default) normalizes each eval batch with its own "
+            "statistics without writing any buffer; eval loaders are per task, "
+            "so this is task-conditional, which TIL allows. 'running' reads the "
+            "shared running statistics, which track the most recently trained "
+            "task and so misnormalize every earlier one. Class-incremental runs "
+            "always use running statistics."
+        ),
+    )
+    parser.add_argument(
         "--no_class_weighted_ce",
         dest="class_weighted_ce",
         action="store_false",
@@ -252,8 +307,8 @@ def get_parser():
         "--eralg4_masked_loss",
         action="store_true",
         help="eralg4 (ER-reservoir): apply per-sample TIL/CIL logit masking in "
-        "the training loss (as er_ring and C-MAML do). Now the DEFAULT; this "
-        "flag is kept for script compatibility.",
+        "the training loss (as er_ring and lamaml_cifar do). Now the DEFAULT; "
+        "this flag is kept for script compatibility.",
     )
     parser.add_argument(
         "--eralg4_unmasked_loss",
@@ -267,10 +322,10 @@ def get_parser():
     parser.add_argument(
         "--eralg4_joint_er",
         action="store_true",
-        help="eralg4 (ER-reservoir): PROBE flag. Use the sister-repo two-forward "
-        "training loop (current live batch + replay in separate forwards, adapter "
-        "and backbone co-trained jointly in one opt_wt step) instead of the default "
-        "concatenated single-batch forward with a decoupled manual adapter step.",
+        help="eralg4 (ER-reservoir): no-op, kept for old launch scripts. It "
+        "selected the two-forward training step (current live batch + replay in "
+        "separate forwards, adapter and backbone co-trained in one opt_wt step), "
+        "which is now the only step.",
     )
     parser.set_defaults(eralg4_joint_er=False)
     parser.add_argument(
@@ -311,15 +366,10 @@ def get_parser():
     parser.add_argument(
         "--cmaml_joint_er",
         action="store_true",
-        help="C-MAML / La-MAML (lamaml_cifar): PROBE flag, twin of "
-        "--eralg4_joint_er. Split the meta-loss forward into two separate "
-        "net.forward passes (replay rows and current rows) instead of the "
-        "default single forward over the concatenated getBatch batch, so "
-        "backbone BatchNorm normalizes replay and current rows with their own "
-        "statistics. Logits are concatenated and scored with the identical mask "
-        "+ single CE, so the ONLY change is the forward split -- isolating the "
-        "concat BN-mixing retention effect (see eralg4-bn-mixing memory / "
-        "docs/reduction_experiments.md).",
+        help="C-MAML / La-MAML (lamaml_cifar): no-op, kept for old launch "
+        "scripts. It split the meta-loss forward into separate replay and "
+        "current passes so BatchNorm normalizes each with its own statistics; "
+        "meta_loss now always does that.",
     )
     parser.set_defaults(cmaml_joint_er=False)
     parser.add_argument(
@@ -417,6 +467,29 @@ def get_parser():
         ),
     )
     parser.add_argument(
+        "--parallel-seeds",
+        dest="parallel_seeds",
+        type=int,
+        default=1,
+        help=(
+            "Maximum number of seed subprocesses to run concurrently during a "
+            "multi-seed sweep. 1 (default) runs seeds sequentially. Values >1 "
+            "launch that many child processes at once; use --seed-gpu-ids to "
+            "pin each worker to a distinct GPU and avoid contention."
+        ),
+    )
+    parser.add_argument(
+        "--seed-gpu-ids",
+        dest="seed_gpu_ids",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated GPU ids to distribute parallel seed workers across "
+            "(round-robin via CUDA_VISIBLE_DEVICES), e.g. '0,1,2'. Only used when "
+            "--parallel-seeds > 1. Empty leaves CUDA_VISIBLE_DEVICES untouched."
+        ),
+    )
+    parser.add_argument(
         "--timestamp",
         type=str,
         default="",
@@ -507,9 +580,12 @@ def get_parser():
         type=int,
         default=None,
         help=(
-            "When set, randomly permute task presentation order after resolving "
-            "--task-order-files / default alphabetical order, using this seed via "
-            "numpy.random.Generator (independent of --seed). Omit for the base order."
+            "Seed for permuting task presentation order, applied after resolving "
+            "--task-order-files / default alphabetical order via a private "
+            "numpy.random.Generator. Omit (the default) to derive it from --seed, "
+            "so sweeping seeds sweeps task order too. Set an integer to pin the "
+            "order while --seed varies, which isolates training noise from "
+            "task-order effects."
         ),
     )
     parser.add_argument(
@@ -647,8 +723,8 @@ def get_parser():
     parser.add_argument(
         "--grad_clip_norm",
         type=float,
-        default=2.0,
-        help="Clip the gradients by this value",
+        default=0.0,
+        help="Clip gradients to this norm. 0 disables clipping (the default).",
     )
     parser.add_argument(
         "--meta_batches",
@@ -717,14 +793,6 @@ def get_parser():
         "Composable with --er_distill.",
     )
     parser.add_argument(
-        "--er_replay_noise",
-        action="store_true",
-        help="ER-ring: include noise-labeled buffer samples in replay, scoring replay "
-        "rows on task-masked global logits (C-MAML's meta-batch construction) instead "
-        "of the task-local gather that must exclude the shared noise class. Isolates "
-        "whether replaying noise explains C-MAML's lower p_fa vs plain replay.",
-    )
-    parser.add_argument(
         "--er_dynamic_ring",
         action="store_true",
         help="ER-ring: dynamically re-split the replay budget across only the tasks "
@@ -768,8 +836,6 @@ def get_parser():
     # # parameters specific to MER
     # parser.add_argument('--gamma', type=float, default=1.0,
     #                     help='gamma learning rate parameter')
-    # parser.add_argument('--beta', type=float, default=1.0,
-    #                     help='beta learning rate parameter')
     # parser.add_argument('--s', type=float, default=1,
     #                     help='current example learning rate multiplier (s)')
     # parser.add_argument('--batches_per_example', type=float, default=1,
@@ -855,15 +921,17 @@ def get_parser():
     parser.add_argument(
         "--anchor_mode",
         type=str,
-        default="loss",
+        default="proximal",
         choices=["loss", "proximal"],
         help=(
-            "How EWC / SI / RWalk / UCL apply their quadratic anchor. 'loss' "
-            "(default) adds it to the training loss and lets the optimiser "
-            "descend it. 'proximal' applies its closed-form minimiser after the "
-            "optimiser step, keeping it out of the backward pass and the "
-            "gradient-norm clip budget; unconditionally stable at any importance "
-            "scale. The two modes need separate penalty-strength sweeps."
+            "How EWC / SI / RWalk apply their quadratic anchor. 'proximal' "
+            "(default, and the only mode upstream La-MAML has) applies its "
+            "closed-form minimiser after the optimiser step, keeping it out of "
+            "the backward pass and the gradient-norm clip budget; "
+            "unconditionally stable at any importance scale. 'loss' adds it to "
+            "the training loss and lets the optimiser descend it. The two modes "
+            "need separate penalty-strength sweeps. UCL follows its reference "
+            "implementation and ignores this flag."
         ),
     )
     parser.add_argument(
@@ -968,7 +1036,9 @@ def get_parser():
         "--gamma",
         type=float,
         default=None,
-        help="HAT mask-sparsity penalty weight; MER meta-update rate.",
+        help="Shared name, per-model meaning (None leaves each model's own default): "
+        "GEM's margin added to the dual QP constraint (gamma in the paper); HAT's "
+        "mask-sparsity penalty weight; MER's meta-update rate.",
     )
     parser.add_argument(
         "--smax",

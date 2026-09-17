@@ -8,12 +8,11 @@ from dataclasses import dataclass
 
 import torch
 from model.resnet1d import ResNet1D
-from model.detection_replay import (
-    DetectionReplayMixin,
-    noise_label_from_args,
-    signal_mask_exclude_noise,
+from model.replay_utils import (
+    ReplayInputMixin,
     unpack_y_to_class_labels,
 )
+from model.task_bn import frozen_running_stats
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
@@ -35,10 +34,7 @@ class BclDualConfig:
 
     cuda: bool = True
     replay_batch_size: int = 20
-    det_lambda: float = 10.0
     cls_lambda: float = 1.0
-    det_memories: int = 2000
-    det_replay_batch: int = 64
 
     @staticmethod
     def from_args(args: object) -> "BclDualConfig":
@@ -75,7 +71,7 @@ class BclDualConfig:
         return cfg
 
 
-class Net(DetectionReplayMixin, torch.nn.Module):
+class Net(ReplayInputMixin, torch.nn.Module):
 
     def __init__(self, n_inputs, n_outputs, n_tasks, args):
         super(Net, self).__init__()
@@ -94,13 +90,7 @@ class Net(DetectionReplayMixin, torch.nn.Module):
             self.net.parameters(), lr=self.inner_lr, momentum=0.9
         )
         self.class_weighted_ce = bool(getattr(args, "class_weighted_ce", True))
-        self.det_lambda = float(self.cfg.det_lambda)
         self.cls_lambda = float(self.cfg.cls_lambda)
-        self._init_det_replay(
-            self.cfg.det_memories,
-            self.cfg.det_replay_batch,
-            enabled=bool(getattr(args, "use_detector_arch", False)),
-        )
 
         self.classes_per_task = misc_utils.build_task_class_list(
             n_tasks,
@@ -113,7 +103,6 @@ class Net(DetectionReplayMixin, torch.nn.Module):
             self.nc_per_task = misc_utils.max_task_class_count(self.classes_per_task)
         else:
             self.nc_per_task = n_outputs
-        self.noise_label = noise_label_from_args(args)
         self.incremental_loader_name = getattr(args, "loader", None)
 
         # setup one memory buffer per task
@@ -230,7 +219,6 @@ class Net(DetectionReplayMixin, torch.nn.Module):
                 self.classes_per_task,
                 self.n_outputs,
                 cil_all_seen_upto_task=cil_all_seen_upto_task,
-                global_noise_label=self.noise_label,
                 fill_value=-10e10,
                 loader=self.incremental_loader_name,
             )
@@ -260,8 +248,6 @@ class Net(DetectionReplayMixin, torch.nn.Module):
         device = mem_x.device
         slot_ids = torch.arange(mem_y.size(1), device=device).unsqueeze(0)
         valid_mask = (slot_ids < filled.unsqueeze(1)) & (mem_y >= 0)
-        if self.noise_label is not None:
-            valid_mask &= mem_y != self.noise_label
         tk, sm = torch.nonzero(valid_mask, as_tuple=True)
         total_filled = int(tk.numel())
         if total_filled == 0:
@@ -338,7 +324,6 @@ class Net(DetectionReplayMixin, torch.nn.Module):
         for _ in range(self.inner_steps):
             x_train = self._canonicalize_input(raw_x_train, detach=False)
             pred = self.forward(x_train, t)
-            signal_mask = signal_mask_exclude_noise(y_work, self.noise_label)
             logits_for_loss = pred
             if self.is_task_incremental:
                 logits_for_loss = misc_utils.apply_task_incremental_logit_mask(
@@ -347,16 +332,10 @@ class Net(DetectionReplayMixin, torch.nn.Module):
                     self.nc_per_task,
                     self.n_outputs,
                     cil_all_seen_upto_task=t,
-                    global_noise_label=self.noise_label,
                 )
             targets = y_work.long()
             preds = torch.argmax(logits_for_loss, dim=1)
-            if signal_mask.any():
-                cls_tr_rec.append(
-                    macro_recall(preds[signal_mask], targets[signal_mask])
-                )
-            else:
-                cls_tr_rec.append(0.0)
+            cls_tr_rec.append(macro_recall(preds, targets))
             loss1 = classification_cross_entropy(
                 logits_for_loss,
                 targets,
@@ -366,7 +345,10 @@ class Net(DetectionReplayMixin, torch.nn.Module):
                 sampled = self.memory_sampling(t)
                 if sampled is not None:
                     xx, yy, feat, mask, list_t, class_sizes = sampled
-                    pred_ = self.net(xx)
+                    # Replay rows span earlier tasks: keep them out of the
+                    # current task's BatchNorm running statistics.
+                    with frozen_running_stats(self):
+                        pred_ = self.net(xx)
                     pred = torch.gather(pred_, 1, mask)
                     for row, size in enumerate(class_sizes):
                         if size < pred.size(1):
@@ -388,7 +370,8 @@ class Net(DetectionReplayMixin, torch.nn.Module):
             sampled_validation = self.memory_sampling(tt, valid=True)
             if sampled_validation is not None:
                 xval, yval, _, mask_val, list_t, class_sizes_val = sampled_validation
-                pred_ = self.net(xval)
+                with frozen_running_stats(self):
+                    pred_ = self.net(xval)
                 pred = torch.gather(pred_, 1, mask_val)
                 for row, size in enumerate(class_sizes_val):
                     if size < pred.size(1):
@@ -408,7 +391,6 @@ class Net(DetectionReplayMixin, torch.nn.Module):
                             self.nc_per_task,
                             self.n_outputs,
                             cil_all_seen_upto_task=t,
-                            global_noise_label=self.noise_label,
                         )
                     )
                 outer_loss = classification_cross_entropy(

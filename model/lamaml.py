@@ -22,7 +22,6 @@ class Net(BaseNet):
             self.classes_per_task,
             self.n_outputs,
             cil_all_seen_upto_task=cil_all_seen_upto_task,
-            global_noise_label=self.noise_label,
             loader=self.incremental_loader_name,
         )
 

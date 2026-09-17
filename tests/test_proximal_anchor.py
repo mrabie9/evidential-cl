@@ -123,11 +123,11 @@ def test_resolve_anchor_mode_falls_back_when_absent_or_none() -> None:
         pass
 
     args = Args()
-    assert resolve_anchor_mode(args) == "loss"
-    args.anchor_mode = None
-    assert resolve_anchor_mode(args) == "loss"
-    args.anchor_mode = "proximal"
     assert resolve_anchor_mode(args) == "proximal"
+    args.anchor_mode = None
+    assert resolve_anchor_mode(args) == "proximal"
+    args.anchor_mode = "loss"
+    assert resolve_anchor_mode(args) == "loss"
 
 
 def test_optimizer_learning_rate_reads_the_live_group_value() -> None:
@@ -148,9 +148,7 @@ def _minimal_args(anchor_mode: str, **overrides: object) -> object:
     args.classes_per_task = [2, 2]
     args.nc_per_task_list = ""
     args.nc_per_task = None
-    args.noise_label = None
     args.class_weighted_ce = False
-    args.use_detector_arch = False
     args.use_iq_aug_features = False
     args.data_scaling = "none"
     args.iq_aug_feature_type = "power"
@@ -160,10 +158,7 @@ def _minimal_args(anchor_mode: str, **overrides: object) -> object:
     args.inner_steps = 1
     args.anchor_mode = anchor_mode
     args.clipgrad = 100.0
-    args.det_lambda = 1.0
     args.cls_lambda = 1.0
-    args.det_memories = 0
-    args.det_replay_batch = 8
     args.norm_track_stats = True
     args.alpha_init = 1e-3
     for key, value in overrides.items():

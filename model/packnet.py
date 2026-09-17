@@ -19,11 +19,8 @@ import torch
 import torch.nn as nn
 from torch.nn.modules.batchnorm import _BatchNorm
 
-from model.detection_replay import (
-    noise_label_from_args,
-    signal_mask_exclude_noise,
-    unpack_y_to_class_labels,
-)
+from model import task_bn
+from model.replay_utils import unpack_y_to_class_labels
 from model.resnet1d import ResNet1D
 from utils.training_metrics import macro_recall
 from utils import misc_utils
@@ -39,9 +36,13 @@ class PackNetConfig:
     optimizer: str = "sgd"
     n_tasks: int = 3
     prune_perc: float = 0.75  # fraction of currently used weights to prune
-    clipgrad: Optional[float] = 100.0
     # Extra SGD passes on task data after packing; gradients only on owner==task.
     post_prune_epochs: int = 0
+    clipgrad: Optional[float] = 0.0
+    # "shared" (default): a single BN instance trained across all tasks, as for
+    # every other method. "task_specific": per-task running stats via
+    # model/task_bn.py (affine params shared).
+    bn_mode: str = "shared"
 
     @staticmethod
     def from_args(args: object) -> "PackNetConfig":
@@ -65,6 +66,12 @@ class Net(nn.Module):
 
         self.args = args
         self.cfg = PackNetConfig.from_args(args)
+        self.bn_mode = str(self.cfg.bn_mode).lower()
+        if self.bn_mode not in task_bn.BN_MODES:
+            raise ValueError(
+                f"Unsupported bn_mode {self.cfg.bn_mode!r}; "
+                f"expected one of {sorted(task_bn.BN_MODES)}."
+            )
         self.n_outputs = n_outputs
         self.n_tasks = n_tasks
         self.classes_per_task = misc_utils.build_task_class_list(
@@ -81,7 +88,6 @@ class Net(nn.Module):
         self._named_modules = dict(self.net.named_modules())
         self._non_prunable_params = self._compute_non_prunable_params()
         self.class_weighted_ce = bool(getattr(args, "class_weighted_ce", True))
-        self.noise_label: int | None = noise_label_from_args(args)
         self.incremental_loader_name = getattr(args, "loader", None)
         self.opt = self._build_optimizer()
         self.clipgrad = self.cfg.clipgrad
@@ -95,27 +101,12 @@ class Net(nn.Module):
         self._param_to_buffers: Dict[str, Tuple[str, str]] = {}
         self._init_masks_and_frozen()
 
-        # BatchNorm handling: keep separate running stats per task to avoid
-        # cross-task interference while allowing task-specific affine params.
-        self._bn_modules: List[_BatchNorm] = [
-            m for m in self.net.modules() if isinstance(m, _BatchNorm)
-        ]
-        # print(f"Found {len(self._bn_modules)} BN modules in the model.")
-        # Mapping: task_id -> list of (running_mean, running_var, num_batches_tracked)
-        self._bn_task_stats: Dict[int, List[Tuple[torch.Tensor, torch.Tensor, int]]] = (
-            {}
-        )
-        # Mapping: task_id -> list of (weight, bias) snapshots (None when affine=False).
-        self._bn_task_affine: Dict[
-            int, List[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]]
-        ] = {}
+        # Per-task BatchNorm running statistics are handled centrally by
+        # :mod:`model.task_bn`, installed from ``main`` once the model is built
+        # (gated on ``bn_mode`` and a task-incremental loader).
 
     # ------------------------------------------------------------------
     def forward(self, x: torch.Tensor, t: int, **kwargs) -> torch.Tensor:
-        # Ensure BN stats for the queried task are active (important for eval).
-        if self._bn_modules and t in self._bn_task_stats:
-            self._restore_bn_stats(t)
-
         allow_free = self.current_task is None or t >= self.current_task
         with self._apply_task_mask(t, allow_free):
             logits = self.net(x)
@@ -129,7 +120,6 @@ class Net(nn.Module):
             self.classes_per_task,
             self.n_outputs,
             cil_all_seen_upto_task=cil,
-            global_noise_label=self.noise_label,
             loader=self.incremental_loader_name,
         )
 
@@ -137,21 +127,16 @@ class Net(nn.Module):
     def observe(
         self, x: torch.Tensor, y: torch.Tensor, t: int
     ) -> Tuple[float, float, torch.Tensor | None]:
-        if self.current_task is None:
-            self.current_task = t
-            self._restore_bn_stats(t)
-        elif t != self.current_task:
-            # Packing and BN snapshot for the previous task run in
+        if self.current_task is None or t != self.current_task:
+            # Packing for the previous task runs in
             # ``finalize_task_after_training`` at the end of that task.
             self.current_task = t
-            self._restore_bn_stats(t)
 
         self.net.train()
         metric_logits = None
         for _ in range(self.cfg.inner_steps):
             logits = self.net(x)
             y_cls = unpack_y_to_class_labels(y)
-            signal_mask = signal_mask_exclude_noise(y_cls, self.noise_label)
             logits_for_loss = logits
             if self.is_task_incremental:
                 logits_for_loss = misc_utils.apply_task_incremental_logit_mask(
@@ -160,7 +145,6 @@ class Net(nn.Module):
                     self.classes_per_task,
                     self.n_outputs,
                     cil_all_seen_upto_task=t,
-                    global_noise_label=self.noise_label,
                     loader=self.incremental_loader_name,
                 )
             targets_for_loss = y_cls.long()
@@ -169,12 +153,8 @@ class Net(nn.Module):
                 targets_for_loss,
                 class_weighted_ce=self.class_weighted_ce,
             )
-            if signal_mask.any():
-                preds = torch.argmax(logits_for_loss[signal_mask], dim=1)
-                cls_tr_rec = macro_recall(preds, y_cls[signal_mask].long())
-            else:
-                cls_tr_rec = 0.0
-
+            preds = torch.argmax(logits_for_loss, dim=1)
+            cls_tr_rec = macro_recall(preds, y_cls.long())
             self.opt.zero_grad()
             loss.backward()
             self._zero_frozen_grads()
@@ -225,8 +205,6 @@ class Net(nn.Module):
             )
 
         self._pack_current_task()
-        if self._bn_modules:
-            self._snapshot_bn_stats(task_id)
 
         epochs = int(self.cfg.post_prune_epochs)
         if epochs > 0 and train_loader is not None:
@@ -248,7 +226,6 @@ class Net(nn.Module):
                                     self.classes_per_task,
                                     self.n_outputs,
                                     cil_all_seen_upto_task=task_id,
-                                    global_noise_label=self.noise_label,
                                     loader=self.incremental_loader_name,
                                 )
                             )
@@ -367,7 +344,7 @@ class Net(nn.Module):
             )
             frozen_name = f"{key}_frozen"  # Name of buffer ...
             self.register_buffer(
-                owner_name, torch.full_like(param, fill_value=-1, dtype=torch.long)
+                owner_name, torch.full_like(param, fill_value=-1, dtype=torch.int8)
             )
             self.register_buffer(frozen_name, param.detach().clone())
             self._param_to_buffers[name] = (
@@ -546,58 +523,6 @@ class Net(nn.Module):
     # ------------------------------------------------------------------
     def _device(self) -> torch.device:
         return next(self.net.parameters()).device
-
-    # ------------------------------------------------------------------
-    # BatchNorm per-task statistics helpers
-    # ------------------------------------------------------------------
-    def _snapshot_bn_stats(self, task: int) -> None:
-        """Store running stats and affine params for all BN layers for the given task."""
-        stats: List[Tuple[torch.Tensor, torch.Tensor, int]] = []
-        affine: List[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]] = []
-        for bn in self._bn_modules:
-            running_mean = bn.running_mean.detach().clone()
-            running_var = bn.running_var.detach().clone()
-            num_batches = int(bn.num_batches_tracked.item())
-            stats.append((running_mean, running_var, num_batches))
-        self._bn_task_stats[task] = stats
-        for bn in self._bn_modules:
-            if bn.affine:
-                w = bn.weight.detach().clone()
-                b = bn.bias.detach().clone()
-            else:
-                w = None
-                b = None
-            affine.append((w, b))
-        self._bn_task_affine[task] = affine
-        # print(f"Snapshot BN stats and affine params for task {task}, stats: {stats}, affine: {affine}")
-
-    def _restore_bn_stats(self, task: int) -> None:
-        """Load BN running stats and affine params for ``task`` or reset if unseen."""
-        if not self._bn_modules:
-            return
-
-        stats = self._bn_task_stats.get(task)
-        affine = self._bn_task_affine.get(task)
-        if stats is None:
-            # Fresh task: reset stats to defaults. Affine params are left as-is
-            # so new tasks can initialize from the most recently trained state.
-            for bn in self._bn_modules:
-                bn.running_mean.zero_()
-                bn.running_var.fill_(1.0)
-                bn.num_batches_tracked.zero_()
-            return
-
-        for bn, (running_mean, running_var, num_batches) in zip(
-            self._bn_modules, stats
-        ):
-            bn.running_mean.data.copy_(running_mean)
-            bn.running_var.data.copy_(running_var)
-            bn.num_batches_tracked.data.fill_(num_batches)
-        if affine is not None:
-            for bn, (w, b) in zip(self._bn_modules, affine):
-                if w is not None and bn.affine:
-                    bn.weight.data.copy_(w)
-                    bn.bias.data.copy_(b)
 
 
 __all__ = ["Net"]

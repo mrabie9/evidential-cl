@@ -9,7 +9,7 @@ Usage:
 
     python scripts/plot_fwt_metrics.py \
         --json-path logs/full_experiments/one-shot_cil/fwt_metrics.json \
-        --metric forward_transfer_total_f1_zs \
+        --metric forward_transfer_total_macro_f1_zs \
         --output-path logs/full_experiments/one-shot_cil/fwt_metrics_plot.png
 """
 
@@ -20,6 +20,9 @@ import json
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from utils.metric_keys import extract_metric  # noqa: E402
 
 import matplotlib.pyplot as plt
 
@@ -86,7 +89,7 @@ PLOT_STYLES_BY_EXPERIMENT: Dict[str, PlotStyle] = {
     },
     "til": {
         "figsize": IEEE_DOUBLE_COLUMN_FIGSIZE,
-        "ylim": None,
+        "ylim": (-0.06, 0.15),
     },
 }
 ALGORITHM_DISPLAY_NAMES: Dict[str, str] = {
@@ -312,7 +315,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--metric",
         type=str,
-        default="forward_transfer_total_f1_zs",
+        default="forward_transfer_total_macro_f1_zs",
         help="Metric key to plot from each record.",
     )
     parser.add_argument(
@@ -436,7 +439,7 @@ def build_series_by_algo(
             continue
         task_index = int(record.get("task_index", -1))
         task_name = str(record.get("task_name", f"task_{task_index}"))
-        raw_metric_value = record.get(metric_name, None)
+        raw_metric_value = extract_metric(record, metric_name)
         metric_value = float(raw_metric_value) if raw_metric_value is not None else None
 
         series_by_algorithm.setdefault(algorithm_name, []).append(
@@ -454,6 +457,7 @@ def plot_series(
     output_path: Path,
     plot_style: PlotStyle,
     title: Optional[str] = None,
+    task_index_to_dataset_name_override: Optional[Dict[int, str]] = None,
 ) -> None:
     """Create and save the metric line plot.
 
@@ -462,6 +466,10 @@ def plot_series(
         metric_name: Metric key being plotted.
         output_path: Where to save the PNG.
         title: Optional custom chart title.
+        task_index_to_dataset_name_override: Ready-made x-axis dataset labels.
+            Callers that discovered the runs themselves (and therefore read
+            ``metrics/task_order.txt``) should pass them so the labels do not
+            depend on the metrics JSON carrying ``task_name``.
 
     Usage:
         >>> plot_series({"algo": [(0, 0.1, "t0")]}, "metric", Path("out.png"))
@@ -471,6 +479,8 @@ def plot_series(
     sorted_task_indices, task_index_to_dataset_name = _extract_task_axis_metadata(
         series_by_algorithm
     )
+    if task_index_to_dataset_name_override:
+        task_index_to_dataset_name = dict(task_index_to_dataset_name_override)
     total_lines = sum(len(member_names) for _, member_names in ordered_groups)
     maximum_group_size = max(
         (len(member_names) for _, member_names in ordered_groups), default=0

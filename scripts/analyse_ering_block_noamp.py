@@ -21,8 +21,8 @@ import glob
 import itertools
 import math
 import os
-import re
 import statistics as st
+from results_txt import f1_stats
 
 REPO = "/home/lunet/wsmr11/repos/evidential-cl"
 DELTA = 1.0  # smallest effect of interest, F1 points
@@ -36,10 +36,9 @@ ROWS = {
 
 def parse(path: str) -> dict[str, float]:
     out: dict[str, float] = {}
-    for line in open(path):
-        m = re.match(r"(Diagonal F1|Final F1|Backward):\s+(-?[\d.]+)", line)
-        if m:
-            out[m.group(1)] = float(m.group(2)) * 100
+    for key, value in f1_stats(open(path).read()).items():
+        if key in ('Diagonal F1', 'Final F1', 'Backward'):
+            out[key] = value * 100
     return out
 
 

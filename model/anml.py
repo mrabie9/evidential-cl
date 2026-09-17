@@ -30,7 +30,7 @@ class AnmlConfig:
     replay_batch_size: int = 20
     memories: int = 5120
     rln: int = 7
-    grad_clip_norm: Optional[float] = 2.0
+    grad_clip_norm: Optional[float] = 0.0
     use_old_task_memory: bool = False
 
     @staticmethod

@@ -9,11 +9,13 @@ import os
 import sys
 
 import torch
+import torch.nn as nn
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+from model import task_bn  # noqa: E402
 from model.hat import Net as HatNet  # noqa: E402
 
 
@@ -114,150 +116,59 @@ def test_hat_grad_flow_2channel():
     assert x.grad is not None
 
 
-def test_hat_forward_uses_live_bn_for_unfinalized_current_task():
-    """Unfinalized current-task validation uses accumulated live BN statistics."""
+def test_hat_forward_leaves_bn_state_untouched():
+    """HAT's forward no longer swaps BatchNorm state; task_bn owns that now."""
     args = _make_args()
     model = HatNet(n_inputs=1024, n_outputs=13, n_tasks=2, args=args)
     model.eval()
     model.current_task = 0
-    model._bn_initialized_tasks.add(0)
 
-    live_running_means = []
-    stale_stats = []
-    stale_affine = []
-    for batch_norm_module in model._bn_modules:
-        batch_norm_module.running_mean.fill_(5.0)
+    bn_modules = [m for m in model.modules() if isinstance(m, nn.BatchNorm1d)]
+    assert bn_modules
+    for index, batch_norm_module in enumerate(bn_modules):
+        batch_norm_module.running_mean.fill_(float(index) + 5.0)
         batch_norm_module.running_var.fill_(2.0)
         batch_norm_module.num_batches_tracked.fill_(10)
-        live_running_means.append(batch_norm_module.running_mean.detach().clone())
-        stale_stats.append(
-            (
-                torch.zeros_like(batch_norm_module.running_mean),
-                torch.ones_like(batch_norm_module.running_var),
-                0,
-            )
-        )
-        if batch_norm_module.affine:
-            stale_affine.append(
-                (
-                    batch_norm_module.weight.detach().clone(),
-                    batch_norm_module.bias.detach().clone(),
-                )
-            )
-        else:
-            stale_affine.append((None, None))
+    before = [m.running_mean.detach().clone() for m in bn_modules]
 
-    model._bn_task_stats[0] = stale_stats
-    model._bn_task_affine[0] = stale_affine
-    captured_running_means = []
+    x = torch.randn(2, 2, 512)
+    model(x, t=0)
+    model(x, t=1)
 
-    def fake_bridge_forward(task, x, s, return_masks=False):
-        """Capture the active BN state used by ``Net.forward``."""
-        del task, s, return_masks
-        captured_running_means.extend(
-            batch_norm_module.running_mean.detach().clone()
-            for batch_norm_module in model._bn_modules
-        )
-        return torch.zeros(x.size(0), model.n_outputs, device=x.device)
-
-    model.bridge.forward = fake_bridge_forward
-
-    with torch.no_grad():
-        logits = model(torch.randn(2, 2, 512), t=0)
-
-    assert logits.shape == (2, 13)
-    assert captured_running_means
-    for captured_running_mean, live_running_mean in zip(
-        captured_running_means, live_running_means
-    ):
-        assert torch.equal(captured_running_mean, live_running_mean)
+    for batch_norm_module, running_mean in zip(bn_modules, before):
+        assert torch.equal(batch_norm_module.running_mean, running_mean)
 
 
-def test_hat_forward_leaves_bn_unchanged_for_uninitialized_current_task():
-    """Per-task BN is disabled: forward does not reset running stats before bridge."""
+def test_hat_supports_task_specific_bn_install():
+    """task_bn converts HAT's hard-coded BatchNorm1d layers and keeps them working."""
     args = _make_args()
+    args.bn_mode = "task_specific"
+    args.loader = "task_incremental_loader"
+    args.model = "hat"
+    args.norm_type = "batchnorm"
+
     model = HatNet(n_inputs=1024, n_outputs=13, n_tasks=2, args=args)
-    assert model._use_task_bn_state is False
-    model.eval()
-    model.current_task = 0
+    layers = task_bn.install(model, args, num_tasks=2)
+    assert layers, "HAT backbone should expose convertible BatchNorm1d layers"
 
-    for batch_norm_module in model._bn_modules:
-        batch_norm_module.running_mean.fill_(5.0)
-        batch_norm_module.running_var.fill_(2.0)
-        batch_norm_module.num_batches_tracked.fill_(10)
+    x0 = torch.randn(4, 2, 512)
+    x1 = torch.randn(4, 2, 512) * 4.0 + 9.0
 
-    captured_running_means = []
-    captured_running_vars = []
+    model.train()
+    task_bn.set_active_task(model, 0)
+    for _ in range(3):
+        model(x0, t=0)
+    task0_mean = layers[0].task_running_mean[0].detach().clone()
 
-    def fake_bridge_forward(task, x, s, return_masks=False):
-        """Capture the BN state seen inside the backbone forward."""
-        del task, s, return_masks
-        captured_running_means.extend(
-            batch_norm_module.running_mean.detach().clone()
-            for batch_norm_module in model._bn_modules
-        )
-        captured_running_vars.extend(
-            batch_norm_module.running_var.detach().clone()
-            for batch_norm_module in model._bn_modules
-        )
-        return torch.zeros(x.size(0), model.n_outputs, device=x.device)
+    task_bn.set_active_task(model, 1)
+    for _ in range(3):
+        model(x1, t=1)
 
-    model.bridge.forward = fake_bridge_forward
-
-    with torch.no_grad():
-        logits = model(torch.randn(2, 2, 512), t=0)
-
-    assert logits.shape == (2, 13)
-    assert 0 not in model._bn_initialized_tasks
-    assert captured_running_means
-    for captured_running_mean, captured_running_var in zip(
-        captured_running_means, captured_running_vars
-    ):
-        assert torch.equal(
-            captured_running_mean, torch.full_like(captured_running_mean, 5.0)
-        )
-        assert torch.equal(
-            captured_running_var, torch.full_like(captured_running_var, 2.0)
-        )
-
-
-def test_hat_forward_does_not_initialize_bn_before_first_observe():
-    """Pre-observe forward leaves task BN initialization to observe()."""
-    args = _make_args()
-    model = HatNet(n_inputs=1024, n_outputs=13, n_tasks=2, args=args)
-    model.eval()
-
-    live_running_means = []
-    for batch_norm_module in model._bn_modules:
-        batch_norm_module.running_mean.fill_(5.0)
-        batch_norm_module.running_var.fill_(2.0)
-        batch_norm_module.num_batches_tracked.fill_(10)
-        live_running_means.append(batch_norm_module.running_mean.detach().clone())
-
-    captured_running_means = []
-
-    def fake_bridge_forward(task, x, s, return_masks=False):
-        """Capture the BN state used before task training starts."""
-        del task, s, return_masks
-        captured_running_means.extend(
-            batch_norm_module.running_mean.detach().clone()
-            for batch_norm_module in model._bn_modules
-        )
-        return torch.zeros(x.size(0), model.n_outputs, device=x.device)
-
-    model.bridge.forward = fake_bridge_forward
-
-    with torch.no_grad():
-        logits = model(torch.randn(2, 2, 512), t=0)
-
-    assert logits.shape == (2, 13)
-    assert model.current_task is None
-    assert 0 not in model._bn_initialized_tasks
-    assert captured_running_means
-    for captured_running_mean, live_running_mean in zip(
-        captured_running_means, live_running_means
-    ):
-        assert torch.equal(captured_running_mean, live_running_mean)
+    # Task 0's statistics survive training on task 1, and the two rows differ.
+    assert torch.equal(layers[0].task_running_mean[0], task0_mean)
+    assert not torch.allclose(
+        layers[0].task_running_mean[0], layers[0].task_running_mean[1]
+    )
 
 
 if __name__ == "__main__":
@@ -267,7 +178,6 @@ if __name__ == "__main__":
     test_hat_2channel_and_3channel_forward()
     test_hat_grad_flow_3channel()
     test_hat_grad_flow_2channel()
-    test_hat_forward_uses_live_bn_for_unfinalized_current_task()
-    test_hat_forward_leaves_bn_unchanged_for_uninitialized_current_task()
-    test_hat_forward_does_not_initialize_bn_before_first_observe()
+    test_hat_forward_leaves_bn_state_untouched()
+    test_hat_supports_task_specific_bn_install()
     print("All HAT input adapter tests passed.")

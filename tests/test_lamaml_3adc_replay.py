@@ -32,12 +32,7 @@ def _make_args(n_tasks=2, classes_per_task=None):
     o.dataset = "iq"
     o.arch = "resnet1d"
     o.input_channels = 2
-    # Detection / replay settings (disabled for these unit tests)
-    o.det_lambda = 1.0
     o.cls_lambda = 1.0
-    o.det_memories = 0
-    o.det_replay_batch = 0
-    o.use_detector_arch = False
     # Optim / meta settings
     o.inner_steps = 1
     o.memories = 16
@@ -56,7 +51,7 @@ def _make_args(n_tasks=2, classes_per_task=None):
 def _make_labels(batch_size: int, task_id: int, classes_per_task=6):
     """Build class labels for a given task (1D tensor)."""
     start = task_id * classes_per_task
-    cls = torch.arange(batch_size) % (classes_per_task - 1) + start  # avoid noise_label
+    cls = torch.arange(batch_size) % classes_per_task + start
     return cls
 
 

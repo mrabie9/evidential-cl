@@ -4,11 +4,12 @@
 This script reads ``task*.npz`` files from one or more ``metrics`` directories and
 extracts the zero-shot (pre-train) validation metrics written by ``main.py``:
 
-- ``zero_shot_rec_cls``
-- ``zero_shot_prec_cls``
-- ``zero_shot_det``
-- ``zero_shot_pfa``
-- ``zero_shot_f1_cls`` (renamed in output to ``total_f1_zs``)
+- ``zero_shot_macro_rec``
+- ``zero_shot_macro_prec``
+- ``zero_shot_macro_f1`` (also emitted as ``total_macro_f1_zs``)
+
+Runs written before the detection-metric removal spell these ``zero_shot_rec_cls``
+/ ``zero_shot_prec_cls`` / ``zero_shot_f1_cls``; those names are still read.
 
 By default, one row is emitted per task checkpoint (task 0, task 1, ...). This is
 the task-level series typically used to compute forward transfer (FWT).
@@ -44,6 +45,9 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 import plot_multi_algorithms as plot_multi  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from utils.metric_keys import extract_metric  # noqa: E402
 
 TaskMetrics = Dict[str, Any]
 
@@ -188,7 +192,7 @@ def _candidate_metrics_dirs_for_logged_output(
             "one-shot_CIL",
             "one-shot_TIL",
             "full-til_10epochs_w-zs",
-            "full-cil_10epochs"
+            "full-cil_10epochs",
         ):
             sync_base = (
                 _SCRIPT_DIR.parent
@@ -356,22 +360,22 @@ def _extract_task_scalar_rows(run: plot_multi.AlgoRun) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for task_index, task_metrics in enumerate(run.tasks):
         task_name = task_names[task_index] if task_index < len(task_names) else ""
-        rec_cls = _safe_float(task_metrics.get("zero_shot_rec_cls"))
-        prec_cls = _safe_float(task_metrics.get("zero_shot_prec_cls"))
-        total_f1_zs = _safe_float(task_metrics.get("zero_shot_f1_cls"))
-        f1_cls_from_rec_prec = _harmonic_mean_f1(prec_cls, rec_cls)
+        macro_rec = _safe_float(extract_metric(task_metrics, "zero_shot_macro_rec"))
+        macro_prec = _safe_float(extract_metric(task_metrics, "zero_shot_macro_prec"))
+        total_macro_f1_zs = _safe_float(
+            extract_metric(task_metrics, "zero_shot_macro_f1")
+        )
+        f1_from_rec_prec = _harmonic_mean_f1(macro_prec, macro_rec)
         rows.append(
             {
                 "algo": run.name,
                 "metrics_dir": str(run.metrics_dir),
                 "task_index": task_index,
                 "task_name": task_name,
-                "zero_shot_rec_cls": rec_cls,
-                "zero_shot_prec_cls": prec_cls,
-                "zero_shot_f1_cls": f1_cls_from_rec_prec,
-                "zero_shot_det": _safe_float(task_metrics.get("zero_shot_det")),
-                "zero_shot_pfa": _safe_float(task_metrics.get("zero_shot_pfa")),
-                "zero_shot_total_f1_zs": total_f1_zs,
+                "zero_shot_macro_rec": macro_rec,
+                "zero_shot_macro_prec": macro_prec,
+                "zero_shot_macro_f1": f1_from_rec_prec,
+                "zero_shot_total_macro_f1_zs": total_macro_f1_zs,
             }
         )
     return rows
@@ -397,26 +401,20 @@ def _extract_per_task_matrix_rows(
     rows: List[Dict[str, Any]] = []
     for checkpoint_task_index, task_metrics in enumerate(run.tasks):
         per_task_f1 = np.asarray(
-            task_metrics.get("zero_shot_per_task_f1_cls", []), dtype=float
+            extract_metric(task_metrics, "zero_shot_per_task_macro_f1", []), dtype=float
         ).reshape(-1)
         per_task_rec = np.asarray(
-            task_metrics.get("zero_shot_per_task_rec_cls", []), dtype=float
+            extract_metric(task_metrics, "zero_shot_per_task_macro_rec", []),
+            dtype=float,
         ).reshape(-1)
         per_task_prec = np.asarray(
-            task_metrics.get("zero_shot_per_task_prec_cls", []), dtype=float
-        ).reshape(-1)
-        per_task_det = np.asarray(
-            task_metrics.get("zero_shot_per_task_det", []), dtype=float
-        ).reshape(-1)
-        per_task_pfa = np.asarray(
-            task_metrics.get("zero_shot_per_task_pfa", []), dtype=float
+            extract_metric(task_metrics, "zero_shot_per_task_macro_prec", []),
+            dtype=float,
         ).reshape(-1)
         num_tasks_now = max(
             len(per_task_f1),
             len(per_task_rec),
             len(per_task_prec),
-            len(per_task_det),
-            len(per_task_pfa),
         )
         for evaluated_task_index in range(num_tasks_now):
             evaluated_task_name = (
@@ -431,29 +429,19 @@ def _extract_per_task_matrix_rows(
                     "checkpoint_task_index": checkpoint_task_index,
                     "evaluated_task_index": evaluated_task_index,
                     "evaluated_task_name": evaluated_task_name,
-                    "zero_shot_per_task_rec_cls": _safe_float(
+                    "zero_shot_per_task_macro_rec": _safe_float(
                         per_task_rec[evaluated_task_index]
                         if evaluated_task_index < len(per_task_rec)
                         else float("nan")
                     ),
-                    "zero_shot_per_task_prec_cls": _safe_float(
+                    "zero_shot_per_task_macro_prec": _safe_float(
                         per_task_prec[evaluated_task_index]
                         if evaluated_task_index < len(per_task_prec)
                         else float("nan")
                     ),
-                    "zero_shot_per_task_f1_cls": _safe_float(
+                    "zero_shot_per_task_macro_f1": _safe_float(
                         per_task_f1[evaluated_task_index]
                         if evaluated_task_index < len(per_task_f1)
-                        else float("nan")
-                    ),
-                    "zero_shot_per_task_det": _safe_float(
-                        per_task_det[evaluated_task_index]
-                        if evaluated_task_index < len(per_task_det)
-                        else float("nan")
-                    ),
-                    "zero_shot_per_task_pfa": _safe_float(
-                        per_task_pfa[evaluated_task_index]
-                        if evaluated_task_index < len(per_task_pfa)
                         else float("nan")
                     ),
                 }
@@ -583,8 +571,8 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Optional baseline JSON (e.g., zs_baselines.json). When provided, "
-            "prints baseline total_f1_zs and forward transfer "
-            "(zero_shot_total_f1_zs - baseline_total_f1_zs)."
+            "prints baseline total_macro_f1_zs and forward transfer "
+            "(zero_shot_total_macro_f1_zs - baseline_total_macro_f1_zs)."
         ),
     )
     parser.add_argument(
@@ -651,7 +639,7 @@ def _nan_to_none(value: Any) -> Any:
 def _build_baseline_lookup(
     baseline_rows: Sequence[Dict[str, Any]],
 ) -> Dict[tuple[str, int], float]:
-    """Build ``(algo, task) -> baseline total_f1_zs`` lookup map.
+    """Build ``(algo, task) -> baseline total_macro_f1_zs`` lookup map.
 
     Args:
         baseline_rows: Parsed baseline rows from JSON.
@@ -672,7 +660,9 @@ def _build_baseline_lookup(
             task_index = int(row.get("task"))
         except (TypeError, ValueError):
             continue
-        baseline_lookup[(algo_name, task_index)] = _safe_float(row.get("total_f1_zs"))
+        baseline_lookup[(algo_name, task_index)] = _safe_float(
+            row.get("total_macro_f1_zs", row.get("total_f1_zs"))
+        )
     return baseline_lookup
 
 
@@ -739,16 +729,16 @@ def main() -> None:
                 (str(row["algo"]).strip().lower(), int(row["task_index"])),
                 float("nan"),
             )
-            row["baseline_total_f1_zs"] = baseline_value
-            row["forward_transfer_total_f1_zs"] = (
-                _safe_float(row["zero_shot_total_f1_zs"]) - baseline_value
+            row["baseline_total_macro_f1_zs"] = baseline_value
+            row["forward_transfer_total_macro_f1_zs"] = (
+                _safe_float(row["zero_shot_total_macro_f1_zs"]) - baseline_value
                 if not math.isnan(baseline_value)
                 else float("nan")
             )
 
     header = (
-        f"{'algo':<12} {'task':>4} {'f1_cls':>10} {'rec_cls':>10} "
-        f"{'prec_cls':>10} {'det':>10} {'pfa':>10} {'total_f1_zs':>12}"
+        f"{'algo':<12} {'task':>4} {'macro_f1':>10} {'macro_rec':>10} "
+        f"{'macro_prec':>10} {'total_macro_f1_zs':>18}"
     )
     if include_baseline_columns:
         header += f" {'baseline':>10} {'fwt':>10}"
@@ -757,31 +747,34 @@ def main() -> None:
     for row in scalar_rows:
         line = (
             f"{row['algo']:<12} {row['task_index']:4d} "
-            f"{row['zero_shot_f1_cls']:10.6f} "
-            f"{row['zero_shot_rec_cls']:10.6f} {row['zero_shot_prec_cls']:10.6f} "
-            f"{row['zero_shot_det']:10.6f} {row['zero_shot_pfa']:10.6f} "
-            f"{row['zero_shot_total_f1_zs']:12.6f}"
+            f"{row['zero_shot_macro_f1']:10.6f} "
+            f"{row['zero_shot_macro_rec']:10.6f} "
+            f"{row['zero_shot_macro_prec']:10.6f} "
+            f"{row['zero_shot_total_macro_f1_zs']:18.6f}"
         )
         if include_baseline_columns:
             line += (
-                f" {row['baseline_total_f1_zs']:10.6f} "
-                f"{row['forward_transfer_total_f1_zs']:10.6f}"
+                f" {row['baseline_total_macro_f1_zs']:10.6f} "
+                f"{row['forward_transfer_total_macro_f1_zs']:10.6f}"
             )
         print(line)
     print(
-        "\nNote: f1_cls is recomputed from rec_cls/prec_cls as 2PR/(P+R). "
-        "total_f1_zs is the raw stored zero_shot_f1_cls from logs."
+        "\nNote: macro_f1 is recomputed from macro_rec/macro_prec as 2PR/(P+R). "
+        "total_macro_f1_zs is the raw stored zero-shot macro F1 from logs."
     )
     if include_baseline_columns:
         print(
-            "Forward transfer (fwt) is computed as total_f1_zs - baseline_total_f1_zs; "
+            "Forward transfer (fwt) is computed as "
+            "total_macro_f1_zs - baseline_total_macro_f1_zs; "
             "positive means validation is above baseline."
         )
         average_fwt_by_algo: Dict[str, List[float]] = {}
         for row in scalar_rows:
             algorithm_name = str(row["algo"])
             task_index = int(row["task_index"])
-            forward_transfer_value = _safe_float(row["forward_transfer_total_f1_zs"])
+            forward_transfer_value = _safe_float(
+                row["forward_transfer_total_macro_f1_zs"]
+            )
             if task_index < 1 or task_index > 9 or math.isnan(forward_transfer_value):
                 continue
             average_fwt_by_algo.setdefault(algorithm_name, []).append(

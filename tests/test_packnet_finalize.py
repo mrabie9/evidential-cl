@@ -33,7 +33,6 @@ def _tiny_args() -> object:
     args.classes_per_task = [2, 2]
     args.nc_per_task_list = ""
     args.nc_per_task = None
-    args.noise_label = None
     args.batch_size = 8
     args.inner_steps = 1
     args.lr = 0.01
@@ -41,7 +40,6 @@ def _tiny_args() -> object:
     args.post_prune_epochs = 0
     args.prune_perc = 0.5
     args.class_weighted_ce = False
-    args.use_detector_arch = False
     args.loader = "task_incremental_loader"
     return args
 

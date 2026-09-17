@@ -12,7 +12,8 @@ The table below lists the hyperparameters that are explicitly defined for each m
 | `er_ring` | `memory_strength` (1.0), `temperature` (2.0), `alpha_init` (0.001), `lr` (0.001), `n_memories` (2000), `n_memories` (0), `replay_batch_size` (20), `inner_steps` (5) | `model/er_ring.py` |
 | `eralg4` | `alpha_init` (0.001), `lr` (0.001), `opt_lr` (0.1), `learn_lr` (false), `inner_steps` (1), `memories` (5120), `replay_batch_size` (20), `second_order` (false), `cifar_batches` (3) | `model/eralg4.py` |
 | `ewc` | `inner_steps` (1), `lr` (0.03), `optimizer` (sgd), `momentum` (0.0), `weight_decay` (0.0), `lamb` (1.0), `clipgrad` (100.0) | `model/ewc.py` |
-| `gem` | `memory_strength` (0.0), `inner_steps` (1), `lr` (0.001), `n_memories` (0), `alpha_init` (0.001) | `model/gem.py` |
+| `ft` | inherits `iid2` (`inner_steps` (1), `lr` (0.001)); trains each task on its own data only | `model/ft.py` |
+| `gem` | `gamma` (0.0), `inner_steps` (1), `lr` (0.001), `n_memories` (0), `alpha_init` (0.001) | `model/gem.py` |
 | `hat` | `inner_steps` (1), `lr` (0.0001), `optimizer` (sgd), `gamma` (0.75), `smax` (50) | `model/hat.py` |
 | `icarl` | `memory_strength` (0.0), `n_memories` (0), `inner_steps` (1), `alpha_init` (0.001), `lr` (0.001), `n_epochs` (1) | `model/icarl.py` |
 | `iid2` | `inner_steps` (1), `lr` (0.001) | `model/iid2.py` |

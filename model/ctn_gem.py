@@ -14,10 +14,8 @@ import torch
 # from .resnet import ResNet18 as ResNet18Full
 from model.ctn_base import ContextNet18
 from model.gem import project2cone2
-from model.detection_replay import (
-    DetectionReplayMixin,
-    noise_label_from_args,
-    signal_mask_exclude_noise,
+from model.replay_utils import (
+    ReplayInputMixin,
     unpack_y_to_class_labels,
 )
 import torch.nn as nn
@@ -45,10 +43,7 @@ class CtnConfig:
     arch: str = "resnet1d"
     cuda: bool = True
     batch_size: int = 128
-    det_lambda: float = 1.0
     cls_lambda: float = 1.0
-    det_memories: int = 2000
-    det_replay_batch: int = 64
 
     @staticmethod
     def from_args(args: object) -> "CtnConfig":
@@ -77,7 +72,7 @@ class CtnConfig:
         return cfg
 
 
-class Net(DetectionReplayMixin, torch.nn.Module):
+class Net(ReplayInputMixin, torch.nn.Module):
 
     def __init__(self, n_inputs, n_outputs, n_tasks, args):
         super(Net, self).__init__()
@@ -124,13 +119,7 @@ class Net(DetectionReplayMixin, torch.nn.Module):
             self.net.parameters(), lr=self.outer_lr, momentum=0.9
         )
         self.class_weighted_ce = bool(getattr(args, "class_weighted_ce", True))
-        self.det_lambda = float(self.cfg.det_lambda)
         self.cls_lambda = float(self.cfg.cls_lambda)
-        self._init_det_replay(
-            self.cfg.det_memories,
-            self.cfg.det_replay_batch,
-            enabled=bool(getattr(args, "use_detector_arch", False)),
-        )
         self.classes_per_task = misc_utils.build_task_class_list(
             n_tasks,
             n_outputs,
@@ -142,7 +131,6 @@ class Net(DetectionReplayMixin, torch.nn.Module):
             self.nc_per_task = misc_utils.max_task_class_count(self.classes_per_task)
         else:
             self.nc_per_task = n_outputs
-        self.noise_label = noise_label_from_args(args)
         self.incremental_loader_name = getattr(args, "loader", None)
         # setup memories
         self.current_task = 0
@@ -276,7 +264,6 @@ class Net(DetectionReplayMixin, torch.nn.Module):
                 self.classes_per_task,
                 self.n_outputs,
                 cil_all_seen_upto_task=cil_all_seen_upto_task,
-                global_noise_label=self.noise_label,
                 fill_value=-10e10,
                 loader=self.incremental_loader_name,
             )
@@ -324,16 +311,6 @@ class Net(DetectionReplayMixin, torch.nn.Module):
         s_idx = torch.from_numpy(sample_indices_np).to(
             device=self.memx.device, dtype=torch.long
         )
-
-        if valid:
-            yy_global = self.valy[t_idx, s_idx]
-        else:
-            yy_global = self.memy[t_idx, s_idx]
-        signal_rows = signal_mask_exclude_noise(yy_global, self.noise_label)
-        if not signal_rows.any():
-            return None
-        t_idx = t_idx[signal_rows]
-        s_idx = s_idx[signal_rows]
 
         offsets = torch.tensor(
             [self.compute_offsets(int(task_index)) for task_index in t_idx.tolist()],
@@ -384,13 +361,10 @@ class Net(DetectionReplayMixin, torch.nn.Module):
         if filled == 0:
             return None
         mem_y = self.memy[past_task, :filled]
-        signal_rows = signal_mask_exclude_noise(mem_y, self.noise_label)
-        if not signal_rows.any():
-            return None
         offset1, offset2 = self.compute_offsets(past_task)
-        mem_x = self.memx[past_task, :filled][signal_rows]
+        mem_x = self.memx[past_task, :filled]
         logits = self.forward(mem_x, past_task)[:, offset1:offset2]
-        targets = (mem_y[signal_rows] - offset1).long()
+        targets = (mem_y - offset1).long()
         loss = classification_cross_entropy(
             logits, targets, class_weighted_ce=self.class_weighted_ce
         )
@@ -428,41 +402,6 @@ class Net(DetectionReplayMixin, torch.nn.Module):
         return self._unflatten_grads(g_col.view(-1).to(g_vec.device), base_params)
 
     def observe(self, x, y, t):
-        # y_cls, y_det = self._unpack_labels(
-        #     y,
-        #     noise_label=noise_label,
-        #     use_detector_arch=bool(getattr(self, "det_enabled", False)),
-        # )
-        # if y_det is not None and self.det_memories > 0:
-        #     self._update_det_memory(x, y_det)
-        # x_det = x
-        # signal_mask = (y_det == 1) & (y_cls >= 0)
-        # if not signal_mask.any():
-        #     if not getattr(self, "det_enabled", True):
-        #         return 0.0, 0.0
-        #     det_logits = self.net.forward_det_agnostic(x_det)
-        #     det_loss = self.det_loss(det_logits, y_det.float())
-        #     det_replay = self._sample_det_memory()
-        #     if det_replay is not None:
-        #         mem_x, mem_y = det_replay
-        #         mem_det_logits = self.net.forward_det_agnostic(mem_x)
-        #         mem_loss = self.det_loss(mem_det_logits, mem_y.float())
-        #         det_loss = 0.5 * (det_loss + mem_loss)
-        #     self.zero_grad()
-        #     grads = torch.autograd.grad(
-        #         det_loss,
-        #         self.net.base_param(),
-        #         create_graph=False,
-        #         allow_unused=True,
-        #     )
-        #     for param, grad in zip(self.net.base_param(), grads):
-        #         if grad is None:
-        #             continue
-        #         with torch.no_grad():
-        #             param.add_(grad, alpha=-self.inner_lr)
-        #     return float(det_loss.item()), 0.0
-        # x = x[signal_mask]
-        # y = y_cls[signal_mask]
         raw_x_train = x
         x_train = self._canonicalize_input(raw_x_train, detach=False)
         x_for_storage = self._input_for_replay(x)
@@ -542,32 +481,6 @@ class Net(DetectionReplayMixin, torch.nn.Module):
                 )
             self.task_mem_ptr[t] = 0 if endcnt == task_replay_capacity else endcnt
 
-        # if getattr(self, "det_enabled", True):
-        #     det_logits = self.net.forward_det_agnostic(x_det)
-        #     det_loss = self.det_loss(det_logits, y_det.float())
-        #     det_replay = self._sample_det_memory()
-        #     if det_replay is not None:
-        #         mem_x, mem_y = det_replay
-        #         mem_det_logits = self.net.forward_det_agnostic(mem_x)
-        #         mem_loss = self.det_loss(mem_det_logits, mem_y.float())
-        #         det_loss = 0.5 * (det_loss + mem_loss)
-        #     det_loss_value = det_loss.detach()
-        #     det_loss = self.det_lambda * det_loss
-        #     det_grads = torch.autograd.grad(
-        #         det_loss,
-        #         self.net.base_param(),
-        #         create_graph=False,
-        #         allow_unused=True,
-        #     )
-        #     for param, grad in zip(self.net.base_param(), det_grads):
-        #         if grad is None:
-        #             continue
-        #         with torch.no_grad():
-        #             param.add_(grad, alpha=-self.inner_lr)
-        # else:
-        if True:
-            det_loss_value = torch.zeros((), device=x_train.device, dtype=torch.float32)
-
         # Slicing (e.g. `raw_x_train = raw_x_train[1:]`) creates a non-leaf view.
         # After inner-loop autograd calls free graphs, reuse of that view can hit
         # "backward through the graph a second time". Re-leaf once per observe.
@@ -591,12 +504,8 @@ class Net(DetectionReplayMixin, torch.nn.Module):
                 )
             pred = self.forward(x_train, t, cil_all_seen_upto_task=t)
             logits = pred
-            signal_mask_for_metric = signal_mask_exclude_noise(y_work, self.noise_label)
-            if signal_mask_for_metric.any():
-                preds = torch.argmax(logits[signal_mask_for_metric], dim=1)
-                cls_tr_rec.append(macro_recall(preds, targets[signal_mask_for_metric]))
-            else:
-                cls_tr_rec.append(0.0)
+            preds = torch.argmax(logits, dim=1)
+            cls_tr_rec.append(macro_recall(preds, targets))
 
             loss1 = classification_cross_entropy(
                 logits,
@@ -621,14 +530,9 @@ class Net(DetectionReplayMixin, torch.nn.Module):
                         loss3 = self.reg * self.kl(
                             F.log_softmax(replay_pred / self.temp, dim=1), feat
                         )
-                loss = (
-                    self.cls_lambda * loss1
-                    + self.det_lambda * det_loss_value
-                    + loss2
-                    + loss3
-                )
+                loss = self.cls_lambda * loss1 + loss2 + loss3
             else:
-                loss = self.cls_lambda * loss1 + self.det_lambda * det_loss_value
+                loss = self.cls_lambda * loss1
 
             base_params = list(self.net.base_param())
             grads = torch.autograd.grad(

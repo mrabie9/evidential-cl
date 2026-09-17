@@ -34,25 +34,6 @@ def test_til_loader_ignores_cil_arg() -> None:
     assert torch.all(masked[:, 5:] <= -1e8)
 
 
-def test_til_loader_preserves_global_noise_outside_task_block() -> None:
-    """Shared IQ noise logit stays active under TIL when outside the task slice."""
-    logits = torch.zeros(1, 12)
-    logits[0, 2] = 1.0
-    logits[0, 11] = 3.0
-    classes_per_task = [6, 6]
-    masked = misc_utils.apply_task_incremental_logit_mask(
-        logits,
-        task_index=0,
-        nc_per_task=classes_per_task,
-        n_outputs=12,
-        cil_all_seen_upto_task=1,
-        global_noise_label=11,
-        loader="task_incremental_loader",
-    )
-    assert masked[0, 11].item() == 3.0
-    assert masked[0, 6:11].max().item() <= -1e8
-
-
 def test_cil_loader_uses_cumulative_mask() -> None:
     logits = torch.arange(24, dtype=torch.float32).view(1, 24)
     classes_per_task = [6, 6, 6, 6]

@@ -25,10 +25,10 @@ import argparse
 import glob
 import math
 import os
-import re
 from itertools import product
 
 from scipy import stats
+from results_txt import f1_stats
 
 LOG = "/home/lunet/wsmr11/repos/evidential-cl/logs"
 ABL = f"{LOG}/ablations/til"
@@ -65,15 +65,9 @@ FAMILIES = {
 
 
 def parse_results(seeddir):
-    f1 = bwt = None
-    for line in open(os.path.join(seeddir, "results.txt"), errors="ignore"):
-        m = re.search(r"Final F1:\s*([-0-9.]+)", line)
-        if m:
-            f1 = float(m.group(1))
-        m = re.search(r"Backward:\s*([-0-9.]+)", line)
-        if m:
-            bwt = float(m.group(1))
-    return f1, bwt
+    text = open(os.path.join(seeddir, "results.txt"), errors="ignore").read()
+    f1_values = f1_stats(text)
+    return f1_values.get("Final F1"), f1_values.get("Backward")
 
 
 def arm_pool(relpath):

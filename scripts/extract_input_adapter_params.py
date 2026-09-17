@@ -63,11 +63,14 @@ def get_combined_weight_bias(
 ) -> tuple[
     torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None
 ]:
-    """Extract (weight_2x3, bias_2) for 3D path and (weight_4d_2x3, bias_4d_2) for 4D path if present.
+    """Extract (weight_2x3, bias_2) for 3D path and (weight_4d, bias_4d_2) for 4D path if present.
 
     AdcIqAdapter has:
     - For 3D input (B, 3, L): proj_3ch Conv1d(3, 2, 1) -> weight (2, 3, 1), bias (2,)
-    - For 4D input (B, 3, 2, L): weight (2, 3), bias (2,)
+    - For 4D input (B, 3, 2, L): weight (3,), shared across the I and Q
+      channels, bias (2,). Older checkpoints saved before this weight was
+      unified across channels have weight shape (2, 3) instead; both are
+      recognized here.
     Returns (weight_3d, bias_3d, weight_4d, bias_4d). Any can be None if not found.
     """
     weight_3d: torch.Tensor | None = None
@@ -87,9 +90,10 @@ def get_combined_weight_bias(
         elif (
             k.endswith(".weight")
             and "proj_3ch" not in k
-            and v.dim() == 2
-            and v.shape[0] == 2
-            and v.shape[1] == 3
+            and (
+                (v.dim() == 1 and v.shape[0] == 3)
+                or (v.dim() == 2 and v.shape[0] == 2 and v.shape[1] == 3)
+            )
         ):
             weight_4d = v.clone()
         elif k.endswith(".bias") and "proj_3ch" not in k and v.numel() == 2:
@@ -101,10 +105,27 @@ def get_combined_weight_bias(
 def format_linear_combination(
     weight: torch.Tensor, bias: torch.Tensor, channel_names: list[str]
 ) -> list[str]:
-    """Describe each output channel as a linear combination of input channels."""
+    """Describe each output channel as a linear combination of input channels.
+
+    ``weight`` of shape (in_channels,) is a single combination shared by both
+    IQ output channels (the current 4D-path format); shape
+    (out_channels, in_channels) gives each output channel its own combination
+    (the 3D-path format, and older 4D checkpoints).
+    """
     weight = weight.detach().float()
     bias = bias.detach().float()
     lines = []
+    if weight.dim() == 1:
+        terms = [
+            f"{weight[j].item():+.4f} * {channel_names[j]}"
+            for j in range(weight.shape[0])
+        ]
+        expr = " ".join(terms)
+        for i in range(bias.shape[0]):
+            lines.append(
+                f"  out[{i}] (IQ[{i}]), shared weights: {expr} {bias[i].item():+.4f}"
+            )
+        return lines
     for i in range(weight.shape[0]):
         terms = [
             f"{weight[i, j].item():+.4f} * {channel_names[j]}"
@@ -116,18 +137,26 @@ def format_linear_combination(
 
 
 def normalize_weight_rows(weight: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-    """Normalize rows so each output channel's coefficients sum to 1.
+    """Normalize weight so each output channel's coefficients sum to 1.
 
     Args:
-        weight: Tensor of shape (out_channels, in_channels).
+        weight: Tensor of shape (out_channels, in_channels), or (in_channels,)
+            for a combination shared across output channels.
         eps: Threshold for treating a row-sum as zero.
 
     Returns:
         Row-normalized tensor with the same shape.
     """
+    if weight.dim() == 1:
+        weight_sum = weight.sum()
+        zero_sum = weight_sum.abs() <= eps
+        denom = torch.where(zero_sum, torch.ones_like(weight_sum), weight_sum)
+        normalized = weight / denom
+        uniform = torch.full_like(weight, 1.0 / weight.size(0))
+        return torch.where(zero_sum, uniform, normalized)
     if weight.dim() != 2:
         raise ValueError(
-            f"Expected rank-2 weight tensor, got shape {tuple(weight.shape)}"
+            f"Expected rank-1 or rank-2 weight tensor, got shape {tuple(weight.shape)}"
         )
 
     row_sums = weight.sum(dim=1, keepdim=True)
@@ -191,8 +220,11 @@ def print_adapter_params(
         print()
 
     if weight_4d is not None and bias_4d is not None:
-        print("4D path (B, 3, 2, L) -> (B, 2, L) via einsum + weight (2,3) + bias:")
-        print("Weight matrix (2 x 3):")
+        shape_note = "(3,), shared across IQ" if weight_4d.dim() == 1 else "(2, 3)"
+        print(
+            f"4D path (B, 3, 2, L) -> (B, 2, L) via einsum + weight {shape_note} + bias:"
+        )
+        print(f"Weight {tuple(weight_4d.shape)}:")
         print(weight_4d.numpy())
         print("Bias (2,):", bias_4d.numpy())
         print("Linear combination:")
@@ -227,7 +259,7 @@ def evaluate_adapter_training_status(
     """Heuristically determine whether input adapter parameters were updated.
 
     The 4D path parameters have deterministic defaults:
-    - weight_4d starts at all ones with shape (2, 3)
+    - weight_4d starts at all ones, shape (3,) (or (2, 3) in older checkpoints)
     - bias_4d starts at all zeros with shape (2,)
 
     We mark the adapter as "trained" when either deterministic default changes.

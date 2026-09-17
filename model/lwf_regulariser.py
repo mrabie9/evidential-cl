@@ -30,7 +30,7 @@ class LwfDistillationMixin:
     """Adds an optional LwF logit-distillation term to an anchor-based learner.
 
     The host must expose ``net`` (a ``ResNet1D``), ``classes_per_task``,
-    ``n_outputs``, ``noise_label`` and ``_device()``.  Three hooks wire it up:
+    ``n_outputs`` and ``_device()``.  Three hooks wire it up:
     ``_init_lwf_distillation`` in ``__init__``, ``_lwf_distillation_loss`` in
     the training step, and ``_snapshot_lwf_teacher`` at each task boundary.
     """
@@ -61,22 +61,15 @@ class LwfDistillationMixin:
 
     # ------------------------------------------------------------------
     def _previous_class_indices(self, t: int, device: torch.device) -> torch.Tensor:
-        """Output columns of classes from *completed* tasks ``< t`` (plus noise).
+        """Output columns of classes from *completed* tasks ``< t``.
 
         The cumulative prior-class span is ``[0, offset1)`` in both TIL and CIL,
-        where ``offset1`` is the first column of the current task.  The global
-        noise label, if any, is always included: it recurs in every task, so the
-        teacher's opinion about it is worth preserving throughout.  Returns an
+        where ``offset1`` is the first column of the current task.  Returns an
         empty tensor on the first task.
         """
         offset1, _ = misc_utils.compute_offsets(t, self.classes_per_task)
         offset1 = min(self.n_outputs, offset1)
         indices = list(range(0, offset1))
-        if self.noise_label is not None:
-            noise = int(self.noise_label)
-            if 0 <= noise < self.n_outputs and noise not in indices:
-                indices.append(noise)
-        indices = sorted(set(indices))
         return torch.tensor(indices, dtype=torch.long, device=device)
 
     # ------------------------------------------------------------------
@@ -120,7 +113,7 @@ class LwfDistillationMixin:
             # distillation pass updates them. Those buffers are never read in
             # this mode, so the numerics match `model.lwf` exactly; the teacher
             # simply stays genuinely frozen.
-            teacher_logits = self.teacher.forward_heads(x, bn_training=True)[1]
+            teacher_logits = self.teacher(x, bn_training=True)
             teacher_probs = torch.softmax(
                 teacher_logits.index_select(1, previous) / self.lwf_temperature,
                 dim=1,

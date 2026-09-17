@@ -24,7 +24,7 @@ Usage:
         --metrics-dir logs/cmaml/run-a/0/metrics,logs/hat/run-b/0/metrics
 
     python scripts/collect_bwt_from_metrics.py \\
-        --logs-root logs --run-index 0 --val-metric total_f1 \\
+        --logs-root logs --run-index 0 --val-metric macro_f1 \\
         --algo ewc,lamaml
 """
 
@@ -44,6 +44,9 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 import plot_multi_algorithms as plot_multi  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from utils.metric_keys import first_present_key  # noqa: E402
 
 TaskMetrics = Dict[str, Any]
 
@@ -280,25 +283,33 @@ def resolve_val_metric_key(
 
     Args:
         tasks: Loaded per-task metric dicts.
-        val_metric_choice: ``total_f1`` or ``cls_recall``.
+        val_metric_choice: ``macro_f1`` or ``macro_rec``.
 
     Returns:
-        Tuple of (npz key, human label).
+        Tuple of (npz key, human label). Pre-removal key spellings are resolved
+        via :func:`utils.metric_keys.first_present_key`.
 
     Usage:
-        >>> resolve_val_metric_key([{"val_f1": np.array([1.0])}], "total_f1")
-        ('val_f1', 'Total F1')
+        >>> resolve_val_metric_key([{"val_macro_f1": np.array([1.0])}], "macro_f1")
+        ('val_macro_f1', 'Macro F1')
     """
-    if val_metric_choice == "cls_recall":
-        return "val_acc", "Cls recall"
-    has_f1 = any("val_f1" in task for task in tasks)
-    if has_f1:
-        return "val_f1", "Total F1"
+    recall_key = next(
+        (k for task in tasks if (k := first_present_key(task, ["val_macro_rec"]))),
+        "val_macro_rec",
+    )
+    if val_metric_choice == "macro_rec":
+        return recall_key, "Macro recall"
+    f1_key = next(
+        (k for task in tasks if (k := first_present_key(task, ["val_macro_f1"]))),
+        None,
+    )
+    if f1_key is not None:
+        return f1_key, "Macro F1"
     print(
-        "[WARN] val-metric=total_f1 but no 'val_f1'; using 'val_acc' (cls recall).",
+        "[WARN] val-metric=macro_f1 but no macro-F1 key; using macro recall.",
         file=sys.stderr,
     )
-    return "val_acc", "Cls recall"
+    return recall_key, "Macro recall"
 
 
 def final_average_forgetting_and_bwt(
@@ -415,9 +426,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--val-metric",
         type=str,
-        choices=("total_f1", "cls_recall"),
-        default="total_f1",
-        help="Validation signal for forgetting (default: total_f1).",
+        choices=("macro_f1", "macro_rec"),
+        default="macro_f1",
+        help="Validation signal for forgetting (default: macro_f1).",
     )
     parser.add_argument(
         "--csv",

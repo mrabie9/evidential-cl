@@ -5,25 +5,28 @@ import datetime
 import argparse
 import atexit
 import json
+import math
 import time
 import os
 import sys
 from contextlib import nullcontext
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
 from tqdm import tqdm
 
 import numpy as np
 import torch
 from torch.autograd import Variable
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
 import parser as file_parser
-from metrics.metrics import confusion_matrix
+from metrics.metrics import append_metric_block, confusion_matrix
+from model import task_bn
 from utils import misc_utils
 from utils.training_metrics import (
-    macro_f1_including_noise,
-    macro_precision_signal_only,
+    macro_f1,
+    macro_precision,
     macro_recall,
 )
 from utils.training_forward import (
@@ -178,36 +181,22 @@ def enable_output_tee(log_file_path: str, append: bool = False) -> None:
     _OUTPUT_TEE_INITIALIZED = True
 
 
-def _split_labels(y):
-    """Extract and return class labels from a batch label object.
-
-    Supports multiple label formats:
-    - `(y_cls, det_targets)` tuples/lists: returns `y_cls`
-    - dict-like labels with `y_cls` or `y`: returns `y_cls`
-    - 2D arrays/tensors shaped `[N, 2]`: returns the first column (class label)
-    - otherwise: returns `y` as-is
-    """
-    if isinstance(y, dict):
-        return y.get("y_cls", y.get("y"))
-    if isinstance(y, (tuple, list)) and len(y) == 2:
-        return y[0]
-    if isinstance(y, np.ndarray) and y.ndim == 2 and y.shape[1] == 2:
-        return y[:, 0]
-    if torch.is_tensor(y) and y.dim() == 2 and y.size(1) == 2:
-        return y[:, 0]
-    return y
-
-
 def _split_eval_output(output):
-    """Return (cls_rec, cls_prec, cls_f1, det, fa). Missing values are None."""
-    if isinstance(output, (tuple, list)):
-        if len(output) == 5:
-            return output[0], output[1], output[2], output[3], output[4]
-        if len(output) == 3:
-            return output[0], None, None, output[1], output[2]
-        if len(output) == 2:
-            return output[0], None, None, output[1], None
-    return output, None, None, None, None
+    """Return ``(macro_rec, macro_prec, macro_f1)``; missing values are ``None``.
+
+    Args:
+        output: Return value of :func:`eval_tasks` / :func:`eval_class_tasks`,
+            or a bare per-task recall sequence.
+
+    Returns:
+        Three-tuple of per-task metric sequences.
+
+    Usage:
+        rec, prec, f1 = _split_eval_output(eval_tasks(model, tasks, args))
+    """
+    if isinstance(output, (tuple, list)) and len(output) == 3:
+        return output[0], output[1], output[2]
+    return output, None, None
 
 
 def _scalar_metric_at_task_index(metrics: object, task_index: int) -> float:
@@ -277,101 +266,6 @@ def _per_task_metric_array(metrics: object, num_tasks: int) -> np.ndarray:
     return row
 
 
-def _get_det_logits(model, xb, t):
-    if hasattr(model, "forward_heads"):
-        det_logits, _ = model.forward_heads(xb)
-        return det_logits
-    if hasattr(model, "net") and hasattr(model.net, "forward_heads"):
-        det_logits, _ = model.net.forward_heads(xb)
-        return det_logits
-    if (
-        hasattr(model, "net")
-        and hasattr(model.net, "forward_features")
-        and hasattr(model.net, "forward_detection")
-    ):
-        feats = model.net.forward_features(xb)
-        return model.net.forward_detection(feats)
-    return None
-
-
-def _false_alarm_rate(preds: torch.Tensor, targets: torch.Tensor) -> float:
-    neg_mask = targets == 0
-    if not neg_mask.any():
-        print(
-            "Warning: No negative samples in _false_alarm_rate calculation, returning 0.0"
-        )
-        return 0.0
-    neg_targets = targets[neg_mask]  # true noise label
-    neg_preds = preds[neg_mask]  # predicted noise label
-    fp = (neg_preds == 1).sum().item()  # predicted noise but actually signal
-    tn = (neg_targets == 0).sum().item() - fp  # predicted noise and actually noise
-    denom = fp + tn
-    return float(fp / denom) if denom > 0 else -1
-
-
-def _noise_label_for_task(
-    args, task_idx: int, class_counts: List[int] | None = None
-) -> int | None:
-    if class_counts is None:
-        class_counts = getattr(args, "classes_per_task", None)
-    if class_counts is None:
-        return None
-    _, offset2 = misc_utils.compute_offsets(task_idx, class_counts)
-    return offset2 - 1  # Assume noise label is highest in task
-
-
-def _noise_label_max_for_task(task: object) -> int | None:
-    """Compute noise label as the maximum class label value in a task.
-
-    This is the "largest label in each task" rule used for detection metrics.
-    """
-    task_labels = _extract_task_labels(task)
-    if task_labels is not None:
-        y_cls = _split_labels(task_labels)
-        y_cls_np = _labels_to_numpy(y_cls).reshape(-1)
-        if y_cls_np.size == 0:
-            return None
-        return int(np.max(y_cls_np))
-
-    max_label: int | None = None
-    for batch in task:  # type: ignore[assignment]
-        if isinstance(batch, (list, tuple)) and len(batch) >= 2:
-            _, y_batch = batch[:2]
-        else:
-            continue
-        y_cls = _split_labels(y_batch)
-        y_cls_tensor = y_cls if torch.is_tensor(y_cls) else torch.as_tensor(y_cls)
-        if y_cls_tensor.numel() == 0:
-            continue
-        batch_max = int(y_cls_tensor.reshape(-1).max().item())
-        max_label = batch_max if max_label is None else max(max_label, batch_max)
-    return max_label
-
-
-def _noise_label_for_metrics(args: object, task: object) -> int | None:
-    """Resolve the noise class id for masking classification / detection metrics.
-
-    IQ class-incremental loaders set ``args.noise_label`` once to a **global**
-    index shared by every task. Eval and train-side metric masking must use that
-    value. Falling back to the per-split maximum label is incorrect for CIL when
-    the split omits noise or when the last signal class equals that maximum.
-
-    When ``args.noise_label`` is unset, we keep the legacy behavior of using the
-    largest label observed in the task's dataloader (older TIL setups).
-
-    Args:
-        args: Parsed experiment arguments (may carry ``noise_label``).
-        task: Per-task dataloader or a ``(x, y, t)`` task tuple for evaluation.
-
-    Returns:
-        Noise class index in **global** label space, or ``None`` if unknown.
-    """
-    raw = getattr(args, "noise_label", None)
-    if raw is not None:
-        return int(raw)
-    return _noise_label_max_for_task(task)
-
-
 def _labels_to_numpy(labels: object) -> np.ndarray:
     """Return labels as a NumPy array regardless of source container type."""
     if torch.is_tensor(labels):
@@ -406,8 +300,7 @@ def _infer_class_counts_from_tasks(tasks: List[object]) -> List[int] | None:
         task_labels = _extract_task_labels(task)
         if task_labels is None:
             return None
-        y_cls = _split_labels(task_labels)
-        y_cls_array = np.asarray(y_cls).reshape(-1)
+        y_cls_array = np.asarray(task_labels).reshape(-1)
         inferred_counts.append(int(np.unique(y_cls_array).size))
     return inferred_counts
 
@@ -416,7 +309,6 @@ def _maybe_print_eval_prediction_debug(
     task_index: int,
     all_predictions: List[torch.Tensor],
     all_targets: List[torch.Tensor],
-    noise_label: int | None,
 ) -> None:
     """Print a compact eval prediction summary when debug mode is enabled.
 
@@ -424,10 +316,9 @@ def _maybe_print_eval_prediction_debug(
         task_index: Zero-based task id used in logging.
         all_predictions: Predicted class-id tensors accumulated across batches.
         all_targets: Ground-truth class-id tensors accumulated across batches.
-        noise_label: Optional class id reserved for noise in the current task.
 
     Usage:
-        _maybe_print_eval_prediction_debug(task_index, preds, targets, noise_label)
+        _maybe_print_eval_prediction_debug(task_index, preds, targets)
     """
     debug_enabled = os.getenv("LA_MAML_EVAL_DEBUG", "").strip().lower() in {
         "1",
@@ -458,17 +349,9 @@ def _maybe_print_eval_prediction_debug(
         )
         per_class_recall_parts.append(f"{int(class_id)}:{class_recall:.3f}")
 
-    noise_prediction_rate = float("nan")
-    if noise_label is not None:
-        noise_prediction_rate = float(
-            (predictions == int(noise_label)).float().mean().item()
-        )
-
     print(
-        "[eval-debug] task={} noise_label={} noise_pred_rate={:.4f} pred_hist={} target_hist={} per_class_recall={}".format(
+        "[eval-debug] task={} pred_hist={} target_hist={} per_class_recall={}".format(
             task_index,
-            noise_label,
-            noise_prediction_rate,
             prediction_histogram.tolist(),
             target_histogram.tolist(),
             ",".join(per_class_recall_parts),
@@ -484,11 +367,8 @@ def _maybe_print_train_metric_debug(
     metric_cls_recall: float,
     metric_precision: float,
     metric_f1: float,
-    metric_det_recall: float,
-    metric_det_false_alarm: float,
     predictions: torch.Tensor,
     labels_for_metrics: torch.Tensor,
-    noise_label_for_metrics: int | None,
 ) -> None:
     """Print per-batch train metric tensors when debug mode is enabled.
 
@@ -498,16 +378,13 @@ def _maybe_print_train_metric_debug(
         batch_index: Zero-based batch index.
         observe_cls_recall: Recall returned by ``model.observe``.
         metric_cls_recall: Recall recomputed in training loop.
-        metric_precision: Signal-only precision in training loop.
-        metric_f1: Macro F1 including noise class.
-        metric_det_recall: Detection recall computed in training loop.
-        metric_det_false_alarm: Detection false-alarm rate computed in training loop.
+        metric_precision: Macro precision recomputed in training loop.
+        metric_f1: Macro F1 recomputed in training loop.
         predictions: Argmax class predictions used for train metrics.
         labels_for_metrics: Class labels used for train metrics (already task-local).
-        noise_label_for_metrics: Optional task-local noise label.
 
     Usage:
-        _maybe_print_train_metric_debug(..., pb, y_cls_for_metric, noise_label)
+        _maybe_print_train_metric_debug(..., pb, y_cls_for_metric)
     """
     debug_enabled = os.getenv("LA_MAML_TRAIN_DEBUG", "").strip().lower() in {
         "1",
@@ -536,21 +413,8 @@ def _maybe_print_train_metric_debug(
     prediction_histogram = torch.bincount(predictions_cpu, minlength=max_class_id + 1)
     label_histogram = torch.bincount(labels_cpu, minlength=max_class_id + 1)
 
-    if noise_label_for_metrics is None:
-        signal_mask = torch.ones_like(labels_cpu, dtype=torch.bool)
-    else:
-        signal_mask = labels_cpu != int(noise_label_for_metrics)
-    signal_count = int(signal_mask.sum().item())
-    signal_prediction_unique = predictions_cpu[signal_mask].unique(sorted=True).tolist()
-    signal_label_unique = labels_cpu[signal_mask].unique(sorted=True).tolist()
-    noise_prediction_rate = (
-        float((predictions_cpu == int(noise_label_for_metrics)).float().mean().item())
-        if noise_label_for_metrics is not None
-        else float("nan")
-    )
-
     print(
-        "[train-debug] task={} ep={} batch={} observe_rec={:.4f} metric_rec={:.4f} prec={:.4f} f1={:.4f} det_rec={:.4f} det_fa={:.4f} noise_label={} noise_pred_rate={:.4f} signal_n={} uniq_pred_signal={} uniq_y_signal={} pred_hist={} y_hist={}".format(
+        "[train-debug] task={} ep={} batch={} observe_rec={:.4f} metric_rec={:.4f} prec={:.4f} f1={:.4f} n={} uniq_pred={} uniq_y={} pred_hist={} y_hist={}".format(
             task_index,
             epoch_index + 1,
             batch_index + 1,
@@ -558,109 +422,51 @@ def _maybe_print_train_metric_debug(
             float(metric_cls_recall),
             float(metric_precision),
             float(metric_f1),
-            float(metric_det_recall),
-            float(metric_det_false_alarm),
-            noise_label_for_metrics,
-            noise_prediction_rate,
-            signal_count,
-            signal_prediction_unique,
-            signal_label_unique,
+            int(labels_cpu.numel()),
+            predictions_cpu.unique(sorted=True).tolist(),
+            labels_cpu.unique(sorted=True).tolist(),
             prediction_histogram.tolist(),
             label_histogram.tolist(),
         )
     )
 
 
-def _maybe_print_eval_detection_alignment_debug(
-    task_index: int,
-    batch_index: int,
-    yb_cls_for_metrics: torch.Tensor,
-    predictions: torch.Tensor,
-    noise_label_for_metrics: int | None,
-) -> None:
-    """Print one-line eval detection alignment diagnostics when enabled.
+def _evaluate_one_loader(
+    model, loader, task_index, args, class_counts, cil_mask_upto_task=None
+):
+    """Score one dataloader, returning ``(macro_rec, macro_prec, macro_f1)``.
+
+    Metrics are computed per batch and averaged over batches, which is the
+    convention the whole repo's numbers are on; changing it would invalidate
+    every stored result.
+
+    Runs under ``torch.no_grad()``: the metric loop never backpropagates, but it
+    used to build an autograd graph for every evaluation batch anyway. No model
+    needs gradients in ``forward`` (every ``backward``/``autograd.grad`` call
+    sits in a training path), so this is numerically identical and only changes
+    peak memory and speed.
 
     Args:
-        task_index: Zero-based task id for the current eval loop.
-        batch_index: Zero-based batch index inside the eval task loader.
-        yb_cls_for_metrics: Task-local labels used by eval metrics.
-        predictions: Class predictions used to derive detection decisions.
-        noise_label_for_metrics: Task-local noise label or ``None``.
+        model: Continual-learning module (already in ``eval()`` mode).
+        loader: Dataloader yielding ``(x, y)`` or ``(x, y, t)`` batches.
+        task_index: Task id used for head/BN selection and label offsets.
+        args: Experiment arguments.
+        class_counts: Per-task class counts, or ``None`` to fall back to args.
+        cil_mask_upto_task: CIL logit-space bound; defaults to ``task_index``.
 
-    Usage:
-        _maybe_print_eval_detection_alignment_debug(t, i, y, pb, noise_label)
+    Returns:
+        Tuple of three floats.
     """
-    debug_enabled = os.getenv("LA_MAML_EVAL_DET_DEBUG", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-    if not debug_enabled:
-        return
-    if batch_index != 0:
-        return
-
-    labels_cpu = yb_cls_for_metrics.detach().cpu().long()
-    predictions_cpu = predictions.detach().cpu().long()
-    if labels_cpu.numel() == 0 or predictions_cpu.numel() == 0:
-        return
-
-    if noise_label_for_metrics is None:
-        det_targets = torch.ones_like(labels_cpu, dtype=torch.long)
-        det_predictions = torch.ones_like(predictions_cpu, dtype=torch.long)
-        noise_prediction_rate = float("nan")
-    else:
-        det_targets = (labels_cpu != int(noise_label_for_metrics)).long()
-        det_predictions = (predictions_cpu != int(noise_label_for_metrics)).long()
-        noise_prediction_rate = float(
-            (predictions_cpu == int(noise_label_for_metrics)).float().mean().item()
-        )
-
-    print(
-        "[eval-det-debug] task={} batch={} noise_label={} uniq_y={} uniq_pred={} noise_pred_rate={:.4f} det_target_signal_rate={:.4f} det_pred_signal_rate={:.4f}".format(
-            task_index,
-            batch_index + 1,
-            noise_label_for_metrics,
-            labels_cpu.unique(sorted=True).tolist(),
-            predictions_cpu.unique(sorted=True).tolist(),
-            noise_prediction_rate,
-            float(det_targets.float().mean().item()),
-            float(det_predictions.float().mean().item()),
-        )
-    )
-
-
-def eval_tasks(model, tasks, args, specific_task=None, eval_epistemic=False):
-    model.eval()
     device = torch.device(
         "cuda" if getattr(args, "cuda", False) and torch.cuda.is_available() else "cpu"
     )
-    results = []
-    prec_results = []
-    f1_results = []
-    class_counts = _infer_class_counts_from_tasks(tasks)
-    if class_counts is None:
-        class_counts = getattr(args, "classes_per_task", None)
-
-    if specific_task is not None:
-        tasks = [tasks[specific_task]]
-
-    det_results = []
-    det_fa_results = []
-    det_metrics_active = False
-    for task_position, task in enumerate(tasks):
-        t = task_position
-        recalls = []
-        precisions = []
-        f1s = []
-        det_recalls = []
-        det_false_alarms = []
-        eval_debug_predictions: List[torch.Tensor] = []
-        eval_debug_targets: List[torch.Tensor] = []
-        noise_label = _noise_label_for_metrics(args, task)
-        task_noise_label_for_metrics = noise_label
-        for batch_index, batch in enumerate(task):
+    recalls = []
+    precisions = []
+    f1s = []
+    eval_debug_predictions: List[torch.Tensor] = []
+    eval_debug_targets: List[torch.Tensor] = []
+    with torch.no_grad():
+        for batch in loader:
             if isinstance(batch, (list, tuple)) and len(batch) == 3:
                 xb, yb, _ = batch
             else:
@@ -668,117 +474,123 @@ def eval_tasks(model, tasks, args, specific_task=None, eval_epistemic=False):
             xb = xb.to(device)
             if getattr(args, "arch", "").lower() == "linear":
                 xb = xb.view(xb.size(0), -1)
-            yb_cls = _split_labels(yb)
-            if not torch.is_tensor(yb_cls):
-                yb_cls = torch.as_tensor(yb_cls)
+            if not torch.is_tensor(yb):
+                yb = torch.as_tensor(yb)
 
-            logits = model_forward_for_metric_loop(model, xb, t, args)
+            logits = model_forward_for_metric_loop(
+                model, xb, task_index, args, cil_mask_upto_task=cil_mask_upto_task
+            )
             pb = torch.argmax(logits, dim=1).cpu()
-            yb_cls_cpu = yb_cls.detach().cpu()
-            yb_cls_for_metrics = yb_cls_cpu
-            noise_label_for_metrics = noise_label
-            # Task-incremental learners (UCL and any model exposing ``split``) emit
-            # task-local logits; shift global labels the same way as the training
-            # metric loop in ``life_experience`` (``model.compute_offsets``).
+            yb_cls_for_metrics = yb.detach().cpu()
+            # Task-incremental learners (UCL and any model exposing ``split``)
+            # emit task-local logits; shift global labels the same way as the
+            # training metric loop in ``life_experience``
+            # (``model.compute_offsets``).
             if getattr(model, "split", False):
                 compute_offsets_fn = getattr(model, "compute_offsets", None)
                 if callable(compute_offsets_fn):
-                    offset1, _ = compute_offsets_fn(t)
+                    offset1, _ = compute_offsets_fn(task_index)
                 else:
                     offset1, _ = misc_utils.compute_offsets(
-                        t,
+                        task_index,
                         class_counts if class_counts is not None else args.nc_per_task,
                     )
-                if getattr(args, "use_detector_arch", False):
-                    yb_cls_for_metrics = yb_cls_cpu.clone()
-                    if noise_label_for_metrics is not None:
-                        signal_mask = yb_cls_for_metrics != noise_label_for_metrics
-                        if signal_mask.any():
-                            yb_cls_for_metrics[signal_mask] = (
-                                yb_cls_for_metrics[signal_mask] - offset1
-                            )
-                else:
-                    yb_cls_for_metrics = yb_cls_cpu - offset1
-                    if noise_label_for_metrics is not None:
-                        noise_label_for_metrics = noise_label_for_metrics - offset1
-            task_noise_label_for_metrics = noise_label_for_metrics
+                yb_cls_for_metrics = yb_cls_for_metrics - offset1
 
             eval_debug_predictions.append(pb)
             eval_debug_targets.append(yb_cls_for_metrics)
-            _maybe_print_eval_detection_alignment_debug(
-                task_index=t,
-                batch_index=batch_index,
-                yb_cls_for_metrics=yb_cls_for_metrics,
-                predictions=pb,
-                noise_label_for_metrics=noise_label_for_metrics,
-            )
-            # Record total F1 score for all classes including noise
-            if not getattr(args, "use_detector_arch", False):
-                f1s.append(macro_f1_including_noise(pb, yb_cls_for_metrics))
-            else:
-                print("[WARNING] F1 not supported for detection architecture.")
-                f1s.append(0.0)
 
-            if noise_label_for_metrics is not None:
-                cls_mask = yb_cls_for_metrics != noise_label_for_metrics
-                if cls_mask.any():
-                    recalls.append(
-                        macro_recall(pb[cls_mask], yb_cls_for_metrics[cls_mask])
-                    )
-                    precisions.append(
-                        macro_precision_signal_only(
-                            pb[cls_mask],
-                            yb_cls_for_metrics[cls_mask],
-                            noise_label_for_metrics,
-                        )
-                    )
-            else:
-                recalls.append(macro_recall(pb, yb_cls_for_metrics))
-                precisions.append(
-                    macro_precision_signal_only(
-                        pb, yb_cls_for_metrics, noise_label_for_metrics
-                    )
-                )
+            recalls.append(macro_recall(pb, yb_cls_for_metrics))
+            precisions.append(macro_precision(pb, yb_cls_for_metrics))
+            f1s.append(macro_f1(pb, yb_cls_for_metrics))
 
-            if noise_label_for_metrics is not None:
-                det_targets = (yb_cls_for_metrics != noise_label_for_metrics).long()
-                det_logits = None
-                if det_logits is not None:
-                    det_pred = (det_logits >= 0).long().cpu()
-                else:
-                    det_pred = (pb != noise_label_for_metrics).long()
-                det_recalls.append(macro_recall(det_pred, det_targets))
-                det_false_alarms.append(_false_alarm_rate(det_pred, det_targets))
+    _maybe_print_eval_prediction_debug(
+        task_index=task_index,
+        all_predictions=eval_debug_predictions,
+        all_targets=eval_debug_targets,
+    )
 
-        results.append(sum(recalls) / len(recalls) if recalls else 0.0)
-        prec_results.append(sum(precisions) / len(precisions) if precisions else 0.0)
-        f1_results.append(sum(f1s) / len(f1s) if f1s else 0.0)
-        if det_recalls:
-            det_results.append(sum(det_recalls) / len(det_recalls))
-            det_fa_results.append(sum(det_false_alarms) / len(det_false_alarms))
-            det_metrics_active = True
-        else:
-            det_results.append(0.0)
-            det_fa_results.append(0.0)
+    return (
+        sum(recalls) / len(recalls) if recalls else 0.0,
+        sum(precisions) / len(precisions) if precisions else 0.0,
+        sum(f1s) / len(f1s) if f1s else 0.0,
+    )
 
-        _maybe_print_eval_prediction_debug(
-            task_index=t,
-            all_predictions=eval_debug_predictions,
-            all_targets=eval_debug_targets,
-            noise_label=task_noise_label_for_metrics,
+
+def eval_tasks(
+    model,
+    tasks,
+    args,
+    specific_task=None,
+    eval_epistemic=False,
+    cil_mask_upto_task=None,
+):
+    """Evaluate per-task macro recall, precision and F1 over signal classes.
+
+    Args:
+        model: Continual-learning module to evaluate.
+        tasks: Sequence of per-task dataloaders or ``(x, y, t)`` tuples.
+        args: Experiment arguments (``cuda``, ``arch``, ``loader``, ...).
+        specific_task: Evaluate only this task id when not ``None``.
+        eval_epistemic: Accepted for call-site compatibility; unused.
+        cil_mask_upto_task: CIL logit-space bound shared by every entry; see
+            :func:`utils.training_forward.model_forward_for_metric_loop`.
+            ``None`` keeps each entry masked to its own index.
+
+    Returns:
+        Tuple of three per-task lists: macro recall, macro precision, macro F1.
+
+    Usage:
+        rec, prec, f1 = eval_tasks(model, test_task_loaders, args)
+    """
+    model.eval()
+    results = []
+    prec_results = []
+    f1_results = []
+    class_counts = _infer_class_counts_from_tasks(tasks)
+    if class_counts is None:
+        class_counts = getattr(args, "classes_per_task", None)
+
+    # ``specific_task`` selects a single task, but the model must still be
+    # queried with that task's *true* id (head selection / label offsets),
+    # not the position 0 it now occupies in the trimmed list.
+    if specific_task is not None:
+        task_ids = [int(specific_task)]
+        tasks = [tasks[specific_task]]
+    else:
+        task_ids = list(range(len(tasks)))
+
+    for task_position, task in enumerate(tasks):
+        rec, prec, f1 = _evaluate_one_loader(
+            model,
+            task,
+            task_ids[task_position],
+            args,
+            class_counts,
+            cil_mask_upto_task=cil_mask_upto_task,
         )
+        results.append(rec)
+        prec_results.append(prec)
+        f1_results.append(f1)
 
-    if det_metrics_active:
-        return results, prec_results, f1_results, det_results, det_fa_results
-    return results, prec_results, f1_results, None, None
+    return results, prec_results, f1_results
 
 
 def eval_class_tasks(model, tasks, args, **kwargs):
     """Evaluate class-incremental runs with the same metrics as :func:`eval_tasks`.
 
-    The previous implementation returned only coarse per-task accuracy and
-    ``None`` for precision, F1, and detection, which made zero-shot / val
-    log lines show ``nan`` for those fields.
+    Args:
+        model: Continual-learning module to evaluate.
+        tasks: Sequence of per-task dataloaders.
+        args: Experiment arguments.
+        **kwargs: ``specific_task`` / ``eval_epistemic`` / ``cil_mask_upto_task``
+            passthrough.
+
+    Returns:
+        Tuple of three per-task lists: macro recall, macro precision, macro F1.
+
+    Usage:
+        rec, prec, f1 = eval_class_tasks(model, test_task_loaders, args)
     """
 
     return eval_tasks(
@@ -787,7 +599,158 @@ def eval_class_tasks(model, tasks, args, **kwargs):
         args,
         specific_task=kwargs.get("specific_task"),
         eval_epistemic=kwargs.get("eval_epistemic", False),
+        cil_mask_upto_task=kwargs.get("cil_mask_upto_task"),
     )
+
+
+def _global_label_to_task(class_counts, n_labels):
+    """Map each global class label to the task that owns it."""
+    counts = [int(c) for c in class_counts] if class_counts is not None else []
+    mapping = torch.zeros(
+        max(int(n_labels), sum(counts) if counts else 0), dtype=torch.long
+    )
+    start = 0
+    for task_index, count in enumerate(counts):
+        stop = min(start + count, mapping.numel())
+        if start < stop:
+            mapping[start:stop] = task_index
+        start += count
+    return mapping
+
+
+def eval_cil_pooled(model, union_loader, current_task, args):
+    """One pass over the pooled tasks ``0..current_task`` test set.
+
+    Returns both CIL numbers from the *same* forward passes:
+
+    * the **headline** -- macro rec/prec/F1 over every class seen so far, which
+      must be measured on mixed batches because
+      :func:`utils.training_metrics.macro_f1` macro-averages over the labels
+      present in each batch;
+    * the **per-task columns** -- the same predictions sliced by the task that
+      owns each sample's true label.
+
+    Scoring the columns from task-pure loaders instead looks equivalent but is
+    not, whenever ``--eval_bn_stats batch`` is in play: BatchNorm then
+    normalises with the current batch's statistics, so a task-pure batch and a
+    mixed batch yield *different predictions for the same sample*. Models whose
+    training batches mix tasks (iid2's cumulative replay, and every replay
+    method) are then scored under a distribution they never trained on, and the
+    columns measure that mismatch on top of forgetting -- for iid2 it dragged
+    mean per-task recall from 0.68 to 0.28. Slicing one pooled pass keeps the
+    columns and the headline on identical forward passes, and costs one pass
+    instead of ``current_task + 2``.
+
+    Args:
+        model: Continual-learning module to evaluate.
+        union_loader: Shuffled loader over the pooled tasks ``0..current_task``.
+        current_task: Task just trained; also the CIL logit-space bound.
+        args: Experiment arguments.
+
+    Returns:
+        ``((col_rec, col_prec, col_f1), (rec, prec, f1))`` -- per-task lists of
+        length ``current_task + 1``, then the three headline floats.
+    """
+    model.eval()
+    device = torch.device(
+        "cuda" if getattr(args, "cuda", False) and torch.cuda.is_available() else "cpu"
+    )
+    task_index = int(current_task)
+    class_counts = getattr(args, "classes_per_task", None)
+
+    recalls = []
+    precisions = []
+    f1s = []
+    pooled_preds = []
+    pooled_metric_targets = []
+    pooled_raw_targets = []
+    with torch.no_grad():
+        for batch in union_loader:
+            if isinstance(batch, (list, tuple)) and len(batch) == 3:
+                xb, yb, _ = batch
+            else:
+                xb, yb = batch
+            xb = xb.to(device)
+            if getattr(args, "arch", "").lower() == "linear":
+                xb = xb.view(xb.size(0), -1)
+            if not torch.is_tensor(yb):
+                yb = torch.as_tensor(yb)
+
+            logits = model_forward_for_metric_loop(
+                model, xb, task_index, args, cil_mask_upto_task=task_index
+            )
+            pb = torch.argmax(logits, dim=1).cpu()
+            raw_targets = yb.detach().cpu()
+            metric_targets = raw_targets
+            # UCL (``split``) emits task-local logits. A pooled batch spans many
+            # tasks, so a single offset is already ill-defined here; keep the
+            # pre-existing behaviour rather than change it silently.
+            if getattr(model, "split", False):
+                compute_offsets_fn = getattr(model, "compute_offsets", None)
+                if callable(compute_offsets_fn):
+                    offset1, _ = compute_offsets_fn(task_index)
+                else:
+                    offset1, _ = misc_utils.compute_offsets(
+                        task_index,
+                        class_counts if class_counts is not None else args.nc_per_task,
+                    )
+                metric_targets = metric_targets - offset1
+
+            recalls.append(macro_recall(pb, metric_targets))
+            precisions.append(macro_precision(pb, metric_targets))
+            f1s.append(macro_f1(pb, metric_targets))
+
+            pooled_preds.append(pb)
+            pooled_metric_targets.append(metric_targets)
+            pooled_raw_targets.append(raw_targets)
+
+    headline = (
+        sum(recalls) / len(recalls) if recalls else 0.0,
+        sum(precisions) / len(precisions) if precisions else 0.0,
+        sum(f1s) / len(f1s) if f1s else 0.0,
+    )
+
+    col_rec = []
+    col_prec = []
+    col_f1 = []
+    if pooled_preds:
+        preds = torch.cat(pooled_preds)
+        metric_targets = torch.cat(pooled_metric_targets)
+        raw_targets = torch.cat(pooled_raw_targets)
+        label_task = _global_label_to_task(
+            class_counts, int(raw_targets.max().item()) + 1
+        )
+        owning_task = label_task[raw_targets.clamp(min=0)]
+        for t in range(task_index + 1):
+            selected = owning_task == t
+            if bool(selected.any()):
+                col_rec.append(macro_recall(preds[selected], metric_targets[selected]))
+                col_prec.append(
+                    macro_precision(preds[selected], metric_targets[selected])
+                )
+                col_f1.append(macro_f1(preds[selected], metric_targets[selected]))
+            else:
+                col_rec.append(0.0)
+                col_prec.append(0.0)
+                col_f1.append(0.0)
+
+    return (col_rec, col_prec, col_f1), headline
+
+
+def _evaluate_validation(
+    model, test_task_loaders, cil_union_loader, current_task, args, cil_mode
+):
+    """Per-task validation columns, plus the CIL headline when in CIL mode.
+
+    CIL slices one pooled pass (see :func:`eval_cil_pooled`); TIL scores each
+    task's own loader, where task-pure batches match how TIL models train.
+
+    Returns:
+        ``((rec, prec, f1), headline)`` with ``headline`` ``None`` under TIL.
+    """
+    if cil_mode and cil_union_loader is not None:
+        return eval_cil_pooled(model, cil_union_loader, current_task, args)
+    return eval_tasks(model, test_task_loaders, args), None
 
 
 def _save_task_checkpoint(
@@ -988,22 +951,50 @@ def _load_checkpoint_into_model(
         )
 
 
+def _cumulative_train_loader(
+    seen_train_datasets: List[Dataset], task_train_loader: DataLoader
+) -> DataLoader:
+    """Return a shuffled loader over this task's training set and all earlier ones.
+
+    Args:
+        seen_train_datasets: Training datasets of earlier tasks; the current
+            task's dataset is appended in place.
+        task_train_loader: The loader ``new_task()`` built for the current task;
+            its batch size and worker count are reused.
+
+    Returns:
+        A loader over the union of every task seen so far. It is shuffled
+        because the concatenation is otherwise ordered task by task.
+
+    Usage:
+        train_loader = _cumulative_train_loader(seen, train_loader)
+    """
+    seen_train_datasets.append(task_train_loader.dataset)
+    print(
+        "Maximal replay: training on {} task(s), {} samples.".format(
+            len(seen_train_datasets), sum(len(d) for d in seen_train_datasets)
+        )
+    )
+    return DataLoader(
+        ConcatDataset(seen_train_datasets),
+        batch_size=task_train_loader.batch_size,
+        shuffle=True,
+        num_workers=task_train_loader.num_workers,
+    )
+
+
 def life_experience(model, inc_loader, args):
     result_val_a = []
     result_test_a = []
     result_val_prec = []
     result_val_f1 = []
-    result_test_f1 = []
-    result_val_det_a = []
-    result_test_det_a = []
-    result_val_det_fa = []
-    result_test_det_fa = []
 
     result_val_t = []
     result_test_t = []
 
     last_tr_cls_rec = last_tr_cls_prec = last_tr_cls_f1 = None
-    last_tr_det = last_tr_fa = None
+    # (rec, prec, f1) from each task's final training epoch, in training order.
+    final_epoch_tr_metrics: List[Tuple[float, float, float]] = []
     base_n_epochs = int(args.n_epochs)
     force_global_n_epochs_legacy = bool(LEGACY_USE_GLOBAL_N_EPOCHS)
     task_epoch_schedule = (
@@ -1019,9 +1010,17 @@ def life_experience(model, inc_loader, args):
     # that task's training set), which grew host memory as new tasks began
     # training without ever being read. Keep only the per-task local below.
     test_task_loaders = []
-    evaluator = eval_tasks
-    if args.loader == "class_incremental_loader":
-        evaluator = eval_class_tasks
+    # Maximal-replay models (``cumulative_replay``, e.g. iid2) are the exception:
+    # they train task t on tasks 0..t, so every task's training set is retained.
+    cumulative_replay = bool(getattr(model, "cumulative_replay", False))
+    seen_train_datasets = []
+    # Validation routing lives in ``_evaluate_validation``: CIL slices one pooled
+    # pass, TIL scores each task's own loader.
+    cil_mode = args.loader == "class_incremental_loader"
+    # CIL headline per task: macro rec/prec/f1 on the pooled tasks 0..t test set.
+    cil_union_rec: list[float] = []
+    cil_union_prec: list[float] = []
+    cil_union_f1: list[float] = []
 
     interactive_terminal = sys.stdout.isatty()
     amp_dtype = (
@@ -1029,9 +1028,12 @@ def life_experience(model, inc_loader, args):
         if getattr(args, "amp_dtype", "bfloat16") == "bfloat16"
         else torch.float16
     )
-    use_amp = bool(getattr(args, "amp", False) and args.cuda)
+    use_amp = bool(
+        getattr(args, "amp", False) and args.cuda and not getattr(args, "no-amp", False)
+    )
     if getattr(args, "model", "") == "eucr":
         use_amp = False
+    print("use amp:", use_amp)
     resume_from_task = int(getattr(args, "resume_from_task", 0) or 0)
     log_state(
         args.state_logging,
@@ -1068,8 +1070,20 @@ def life_experience(model, inc_loader, args):
         result_acc_val = []
         result_acc_tr = []
         task_info, train_loader, _, test_loader = inc_loader.new_task()
-        test_task_loaders.append(test_loader)
         current_task = task_info["task"]
+        # Under the CIL loader ``new_task`` hands back the *pooled* tasks 0..t
+        # test set. Keeping that as column t made every column a nested prefix,
+        # so the per-task retention the BWT/forgetting/FWT machinery expects was
+        # never measured (and the mean over columns counted early tasks up to
+        # n_tasks times). Columns are the per-task splits; the pooled loader is
+        # scored separately as the CIL headline.
+        cil_union_loader = test_loader if cil_mode else None
+        if cil_mode:
+            test_task_loaders.append(inc_loader.get_tasks("test")[current_task])
+        else:
+            test_task_loaders.append(test_loader)
+        if cumulative_replay:
+            train_loader = _cumulative_train_loader(seen_train_datasets, train_loader)
 
         # When resuming an interrupted experiment, advance the loader for tasks
         # already trained (so their loaders exist for evaluating retention) but
@@ -1091,51 +1105,42 @@ def life_experience(model, inc_loader, args):
 
         task_n_epochs = task_epoch_schedule.get(current_task, base_n_epochs)
         args.n_epochs = task_n_epochs
-        noise_label_for_task = _noise_label_for_metrics(args, train_loader)
 
         log_state(
             args.state_logging,
             "Task {}: zero-shot validation (pre-train)".format(current_task),
         )
-        zero_shot_raw = evaluator(model, test_task_loaders, args)
-        zs_rec, zs_prec, zs_f1, zs_det, zs_pfa = _split_eval_output(zero_shot_raw)
+        zero_shot_raw, _ = _evaluate_validation(
+            model, test_task_loaders, cil_union_loader, current_task, args, cil_mode
+        )
+        zs_rec, zs_prec, zs_f1 = _split_eval_output(zero_shot_raw)
         num_tasks_now = len(test_task_loaders)
         current_task_idx = task_info["task"]
         zero_shot_rec_cls = _scalar_metric_at_task_index(zs_rec, current_task_idx)
         zero_shot_prec_cls = _scalar_metric_at_task_index(zs_prec, current_task_idx)
         zero_shot_f1_cls = _scalar_metric_at_task_index(zs_f1, current_task_idx)
-        zero_shot_det = _scalar_metric_at_task_index(zs_det, current_task_idx)
-        zero_shot_pfa = _scalar_metric_at_task_index(zs_pfa, current_task_idx)
         zero_shot_total_f1 = _mean_metric_across_tasks(zs_f1)
         zero_shot_per_task_rec_cls = _per_task_metric_array(zs_rec, num_tasks_now)
         zero_shot_per_task_prec_cls = _per_task_metric_array(zs_prec, num_tasks_now)
         zero_shot_per_task_f1_cls = _per_task_metric_array(zs_f1, num_tasks_now)
-        zero_shot_per_task_det = _per_task_metric_array(zs_det, num_tasks_now)
-        zero_shot_per_task_pfa = _per_task_metric_array(zs_pfa, num_tasks_now)
         print(
-            "---- Zero-shot (pre-train) task {}: rec_cls {:.4f} | prec_cls {:.4f} | f1_cls {:.4f} | det {:.4f} | pfa {:.4f} | total_f1 {:.4f} ----".format(
+            "---- Zero-shot (pre-train) task {}: macro_rec {:.4f} | macro_prec {:.4f} | macro_f1 {:.4f} | total_f1 {:.4f} ----".format(
                 current_task,
                 zero_shot_rec_cls,
                 zero_shot_prec_cls,
                 zero_shot_f1_cls,
-                zero_shot_det,
-                zero_shot_pfa,
                 zero_shot_total_f1,
             )
         )
 
-        # Per-epoch training metrics for this task (classification + detection).
+        # Per-epoch training metrics for this task.
         per_epoch_train_cls_rec = []
         per_epoch_train_cls_prec = []
-        per_epoch_train_det_rec = []
-        per_epoch_train_det_pfa = []
         per_epoch_train_f1 = []
 
-        # Per-evaluation validation metrics for this task (classification + detection).
+        # Per-evaluation validation metrics for this task.
         per_epoch_val_cls_rec = []
         per_epoch_val_cls_prec = []
-        per_epoch_val_det_rec = []
-        per_epoch_val_det_pfa = []
         per_epoch_val_f1 = []
 
         log_state(
@@ -1150,8 +1155,6 @@ def life_experience(model, inc_loader, args):
             epoch_train_accs = []
             epoch_precisions = []
             epoch_f1s = []
-            epoch_det_recalls = []
-            epoch_det_fas = []
             epoch_eval_mode_recalls = []
             epoch_start_time = time.time()
             epoch_eval_time = 0.0
@@ -1166,36 +1169,13 @@ def life_experience(model, inc_loader, args):
             for i, (x, y) in enumerate(prog_bar):
 
                 v_x = x
-                y_cls = _split_labels(y)
-                if not torch.is_tensor(y_cls):
-                    y_cls = torch.as_tensor(y_cls)
-
-                # Hybrid mode: keep passing detector targets into `model.observe`
-                # when the dataloader provides them, but only use class labels
-                # for metric computation.
-                if getattr(args, "use_detector_arch", False):
-                    if isinstance(y, (tuple, list)) and len(y) == 2:
-                        cls_part, det_part = y[0], y[1]
-                        if not torch.is_tensor(cls_part):
-                            cls_part = torch.as_tensor(cls_part)
-                        if not torch.is_tensor(det_part):
-                            det_part = torch.as_tensor(det_part)
-                        v_y = (cls_part, det_part)
-                    elif torch.is_tensor(y) and y.dim() == 2 and y.size(1) == 2:
-                        v_y = (y[:, 0], y[:, 1])
-                    elif isinstance(y, np.ndarray) and y.ndim == 2 and y.shape[1] == 2:
-                        v_y = (y[:, 0], y[:, 1])
-                    else:
-                        v_y = y_cls
-                else:
-                    v_y = y_cls
+                y_cls = y if torch.is_tensor(y) else torch.as_tensor(y)
+                v_y = y_cls
                 if args.cuda:
                     v_x = v_x.cuda()
-                    if isinstance(v_y, (tuple, list)) and len(v_y) == 2:
-                        v_y = (v_y[0].cuda(), v_y[1].cuda())
-                    else:
-                        v_y = v_y.cuda()
+                    v_y = v_y.cuda()
                 model.train()
+                task_bn.set_active_task(model, task_info["task"])
                 amp_context = (
                     torch.autocast(device_type="cuda", dtype=amp_dtype)
                     if use_amp
@@ -1207,56 +1187,20 @@ def life_experience(model, inc_loader, args):
                     )
                 loss, cls_tr_rec, metric_logits = unpack_observe_result(observe_result)
                 observe_cls_tr_rec = float(cls_tr_rec)
-                # debug_noise_label = _noise_label_max_for_task(train_loader)
-                # model.eval()
-                # with torch.no_grad():
-                #     debug_logits = (
-                #         model.forward_training(v_x, task_info["task"])
-                #         if args.model != "anml"
-                #         else model(v_x, fast_weights=None)
-                #     )
-                #     debug_preds = torch.argmax(debug_logits, dim=1).cpu()
-                #     debug_y_cls = _split_labels(v_y)
-                #     debug_y_cls_cpu = (
-                #         debug_y_cls.detach().cpu()
-                #         if torch.is_tensor(debug_y_cls)
-                #         else torch.as_tensor(debug_y_cls)
-                #     )
-                #     debug_mask = (
-                #         debug_y_cls_cpu != debug_noise_label
-                #         if debug_noise_label is not None
-                #         else torch.ones_like(debug_y_cls_cpu, dtype=torch.bool)
-                #     )
-                #     debug_eval_recall = (
-                #         macro_recall(debug_preds[debug_mask], debug_y_cls_cpu[debug_mask])
-                #         if debug_mask.any()
-                #         else 0.0
-                #     )
-                # model.train()
-                # logits = model(x, task_i) if args.model != 'anml' else model(x, task_i, fast_weights=None)
-                # pb = torch.argmax(logits, dim=1)
-                # correct += (pb == y).sum().item()
-                # cls_tr_rec = correct / x.size(0)
                 result_acc_tr.append(cls_tr_rec)
                 result_epoch_loss.append(loss)
                 epoch_losses.append(loss)
                 epoch_train_accs.append(cls_tr_rec)
 
-                # Batch-level precision (signal only) and F1 (all classes incl. noise) for progress bar.
-                # Prefer observe() predictions when available to avoid a second stochastic forward.
-                noise_label = noise_label_for_task
-                y_cls_for_metric = (
-                    y_cls.cpu() if torch.is_tensor(y_cls) else torch.as_tensor(y_cls)
-                )
-                noise_label_for_metric = noise_label
+                # Batch-level macro metrics for the progress bar. Prefer observe()
+                # predictions when available to avoid a second stochastic forward.
+                y_cls_for_metric = y_cls.cpu()
 
                 # For split (task-incremental) models, forward returns task-local logits so pb is in [0, C_t-1].
-                # Convert labels to task-local so Train Acc / Prec / F1 match.
+                # Convert labels to task-local so Train Rec / Prec / F1 match.
                 if getattr(model, "split", False):
                     offset1, _ = model.compute_offsets(task_info["task"])
                     y_cls_for_metric = y_cls_for_metric - offset1
-                    if noise_label_for_metric is not None:
-                        noise_label_for_metric = noise_label_for_metric - offset1
 
                 if metric_logits is not None:
                     pb = torch.argmax(metric_logits, dim=1).cpu()
@@ -1268,42 +1212,16 @@ def life_experience(model, inc_loader, args):
                         )
                         pb = torch.argmax(logits, dim=1).cpu()
                     model.train()
-                det_logits = None
 
-                prec = macro_precision_signal_only(
-                    pb, y_cls_for_metric, noise_label_for_metric
-                )
-                f1 = macro_f1_including_noise(pb, y_cls_for_metric)
-
-                if noise_label_for_metric is not None:
-                    cls_mask = y_cls_for_metric != noise_label_for_metric
-                    if cls_mask.any():
-                        cls_tr_rec = macro_recall(
-                            pb[cls_mask], y_cls_for_metric[cls_mask]
-                        )
-                    else:
-                        cls_tr_rec = 0.0
-                else:
-                    cls_tr_rec = macro_recall(pb, y_cls_for_metric)
-
-                det_rec = 0.0
-                det_fa = 0.0
-                if noise_label_for_metric is not None:
-                    det_targets = (y_cls_for_metric != noise_label_for_metric).long()
-                    if det_logits is not None:
-                        det_pred = (det_logits >= 0).long().cpu()
-                    else:
-                        det_pred = (pb != noise_label_for_metric).long()
-                    det_rec = macro_recall(det_pred, det_targets)
-                    det_fa = _false_alarm_rate(det_pred, det_targets)
+                prec = macro_precision(pb, y_cls_for_metric)
+                f1 = macro_f1(pb, y_cls_for_metric)
+                cls_tr_rec = macro_recall(pb, y_cls_for_metric)
 
                 result_acc_tr[-1] = cls_tr_rec
                 epoch_train_accs[-1] = cls_tr_rec
 
                 epoch_precisions.append(prec)
                 epoch_f1s.append(f1)
-                epoch_det_recalls.append(det_rec)
-                epoch_det_fas.append(det_fa)
                 _maybe_print_train_metric_debug(
                     task_index=task_info["task"],
                     epoch_index=ep,
@@ -1312,15 +1230,12 @@ def life_experience(model, inc_loader, args):
                     metric_cls_recall=cls_tr_rec,
                     metric_precision=prec,
                     metric_f1=f1,
-                    metric_det_recall=det_rec,
-                    metric_det_false_alarm=det_fa,
                     predictions=pb,
                     labels_for_metrics=y_cls_for_metric,
-                    noise_label_for_metrics=noise_label_for_metric,
                 )
 
                 prog_bar.set_description(
-                    "T{}| Ep: {}/{}| Loss: {}| Rec: {}| Prec: {}| F1: {}| DetRec: {}| DetFA: {}".format(
+                    "T{}| Ep: {}/{}| Loss: {}| Rec: {}| Prec: {}| F1: {}".format(
                         task_info["task"],
                         ep + 1,
                         task_n_epochs,
@@ -1328,8 +1243,6 @@ def life_experience(model, inc_loader, args):
                         round(cls_tr_rec, 2),
                         round(prec, 2),
                         round(f1, 2),
-                        round(det_rec, 2),
-                        round(det_fa, 2),
                     )
                 )
 
@@ -1349,10 +1262,15 @@ def life_experience(model, inc_loader, args):
                         current_task, ep + 1, task_n_epochs
                     ),
                 )
-                val_acc = evaluator(model, test_task_loaders, args)
-                val_acc, val_prec, val_f1, val_det_acc, val_det_fa = _split_eval_output(
-                    val_acc
+                val_acc, _ = _evaluate_validation(
+                    model,
+                    test_task_loaders,
+                    cil_union_loader,
+                    current_task,
+                    args,
+                    cil_mode,
                 )
+                val_acc, val_prec, val_f1 = _split_eval_output(val_acc)
                 epoch_eval_time += time.time() - eval_start
                 result_acc_val.append(val_acc)
                 result_val_a.append(val_acc)
@@ -1360,31 +1278,8 @@ def life_experience(model, inc_loader, args):
                     result_val_prec.append(val_prec)
                 if val_f1 is not None:
                     result_val_f1.append(val_f1)
-                if val_det_acc is not None:
-                    result_val_det_a.append(val_det_acc)
-                    if isinstance(val_det_acc, (list, tuple)):
-                        last_tr_det = (
-                            sum(val_det_acc) / len(val_det_acc) if val_det_acc else None
-                        )
-                    else:
-                        last_tr_det = float(val_det_acc)
-                if val_det_fa is not None:
-                    result_val_det_fa.append(val_det_fa)
-                    if isinstance(val_det_fa, (list, tuple)):
-                        last_tr_fa = (
-                            sum(val_det_fa) / len(val_det_fa) if val_det_fa else None
-                        )
-                    else:
-                        last_tr_fa = float(val_det_fa)
                 result_val_t.append(task_info["task"])
-                if val_det_acc is not None:
-                    print(
-                        "---- Eval at Epoch {}: cls {} | det_recall {} | det_fa {} ----".format(
-                            ep, val_acc, val_det_acc, val_det_fa
-                        )
-                    )
-                else:
-                    print("---- Eval at Epoch {}: {} ----".format(ep, val_acc))
+                print("---- Eval at Epoch {}: {} ----".format(ep, val_acc))
 
                 # Store per-evaluation validation metrics for this task (current epoch).
                 # Index into the evaluator outputs with the current task id where possible.
@@ -1422,34 +1317,6 @@ def life_experience(model, inc_loader, args):
                 else:
                     per_epoch_val_f1.append(float("nan"))
 
-                if val_det_acc is not None:
-                    if isinstance(
-                        val_det_acc, (list, tuple)
-                    ) and current_task_idx < len(val_det_acc):
-                        per_epoch_val_det_rec.append(
-                            float(val_det_acc[current_task_idx])
-                        )
-                    elif not isinstance(val_det_acc, (list, tuple)):
-                        per_epoch_val_det_rec.append(float(val_det_acc))
-                    else:
-                        per_epoch_val_det_rec.append(float("nan"))
-                else:
-                    per_epoch_val_det_rec.append(float("nan"))
-
-                if val_det_fa is not None:
-                    if isinstance(val_det_fa, (list, tuple)) and current_task_idx < len(
-                        val_det_fa
-                    ):
-                        per_epoch_val_det_pfa.append(
-                            float(val_det_fa[current_task_idx])
-                        )
-                    elif not isinstance(val_det_fa, (list, tuple)):
-                        per_epoch_val_det_pfa.append(float(val_det_fa))
-                    else:
-                        per_epoch_val_det_pfa.append(float("nan"))
-                else:
-                    per_epoch_val_det_pfa.append(float("nan"))
-
             epoch_duration = time.time() - epoch_start_time
             epoch_train_time = max(epoch_duration - epoch_eval_time, 0.0)
             avg_loss = (
@@ -1470,16 +1337,6 @@ def life_experience(model, inc_loader, args):
             avg_f1 = (
                 float(sum(epoch_f1s) / len(epoch_f1s)) if epoch_f1s else float("nan")
             )
-            avg_det_rec = (
-                float(sum(epoch_det_recalls) / len(epoch_det_recalls))
-                if epoch_det_recalls
-                else float("nan")
-            )
-            avg_det_fa = (
-                float(sum(epoch_det_fas) / len(epoch_det_fas))
-                if epoch_det_fas
-                else float("nan")
-            )
 
             # Track the last training metrics we saw (for summary logging).
             last_tr_cls_rec = avg_cls_tr_rec
@@ -1489,13 +1346,11 @@ def life_experience(model, inc_loader, args):
             # Persist per-epoch training metrics for this task.
             per_epoch_train_cls_rec.append(avg_cls_tr_rec)
             per_epoch_train_cls_prec.append(avg_prec)
-            per_epoch_train_det_rec.append(avg_det_rec)
-            per_epoch_train_det_pfa.append(avg_det_fa)
             per_epoch_train_f1.append(avg_f1)
 
             if not interactive_terminal:
                 print(
-                    "T{} Ep {}/{} | L {:.4f} | Train Acc {:.2f} | Prec {:.2f} | F1 {:.2f} | Det Rec {:.2f} | Det FA {:.2f} | Epoch Time {:.2f}s (Eval {:.2f}s, Train {:.2f}s)".format(
+                    "T{} Ep {}/{} | L {:.4f} | Rec {:.2f} | Prec {:.2f} | F1 {:.2f} | Epoch Time {:.2f}s (Eval {:.2f}s, Train {:.2f}s)".format(
                         task_info["task"],
                         ep + 1,
                         task_n_epochs,
@@ -1503,8 +1358,6 @@ def life_experience(model, inc_loader, args):
                         avg_cls_tr_rec,
                         avg_prec,
                         avg_f1,
-                        avg_det_rec,
-                        avg_det_fa,
                         epoch_duration,
                         epoch_eval_time,
                         epoch_train_time,
@@ -1512,14 +1365,12 @@ def life_experience(model, inc_loader, args):
                 )
                 log_state(
                     args.state_logging,
-                    "T{} Ep {}/{} complete: Prec {:.4f} F1 {:.4f} DetRec {:.4f} DetFA {:.4f} | {:.2f}s total ({:.2f}s eval/{:.2f}s train)".format(
+                    "T{} Ep {}/{} complete: Prec {:.4f} F1 {:.4f} | {:.2f}s total ({:.2f}s eval/{:.2f}s train)".format(
                         current_task,
                         ep + 1,
                         task_n_epochs,
                         avg_prec,
                         avg_f1,
-                        avg_det_rec,
-                        avg_det_fa,
                         epoch_duration,
                         epoch_eval_time,
                         epoch_train_time,
@@ -1539,6 +1390,12 @@ def life_experience(model, inc_loader, args):
                         avg_eval_recall,
                     )
                 )
+        if last_tr_cls_rec is not None:
+            final_epoch_tr_metrics.append(
+                (last_tr_cls_rec, last_tr_cls_prec, last_tr_cls_f1)
+            )
+            last_tr_cls_rec = last_tr_cls_prec = last_tr_cls_f1 = None
+
         finalize_fn = getattr(model, "finalize_task_after_training", None)
         if callable(finalize_fn):
             finalize_fn(train_loader)
@@ -1546,18 +1403,28 @@ def life_experience(model, inc_loader, args):
             args.state_logging,
             "Task {}: running final validation.".format(current_task),
         )
-        val_acc = evaluator(model, test_task_loaders, args)
-        val_acc, val_prec, val_f1, val_det_acc, val_det_fa = _split_eval_output(val_acc)
+        val_acc, val_headline = _evaluate_validation(
+            model, test_task_loaders, cil_union_loader, current_task, args, cil_mode
+        )
+        val_acc, val_prec, val_f1 = _split_eval_output(val_acc)
         result_val_a.append(val_acc)
         if val_prec is not None:
             result_val_prec.append(val_prec)
         if val_f1 is not None:
             result_val_f1.append(val_f1)
-        if val_det_acc is not None:
-            result_val_det_a.append(val_det_acc)
-        if val_det_fa is not None:
-            result_val_det_fa.append(val_det_fa)
         result_val_t.append(task_info["task"])
+
+        if val_headline is not None:
+            union_rec, union_prec, union_f1 = val_headline
+            cil_union_rec.append(union_rec)
+            cil_union_prec.append(union_prec)
+            cil_union_f1.append(union_f1)
+            print(
+                "---- CIL all-seen-classes (tasks 0..{}): macro_rec {:.4f} | "
+                "macro_prec {:.4f} | macro_f1 {:.4f} ----".format(
+                    current_task, union_rec, union_prec, union_f1
+                )
+            )
 
         losses = np.array(result_epoch_loss)
         result_acc_tr = np.array(
@@ -1586,61 +1453,53 @@ def life_experience(model, inc_loader, args):
         os.makedirs(logs_dir, exist_ok=True)
         save_payload = {
             "losses": losses,
-            "cls_tr_rec": result_acc_tr,
-            "val_acc": result_acc_val,
+            "tr_macro_rec": result_acc_tr,
+            "val_macro_rec": result_acc_val,
             "n_epochs": np.int64(task_n_epochs),
-            "zero_shot_rec_cls": np.float64(zero_shot_rec_cls),
-            "zero_shot_prec_cls": np.float64(zero_shot_prec_cls),
-            "zero_shot_f1_cls": np.float64(zero_shot_f1_cls),
-            "zero_shot_det": np.float64(zero_shot_det),
-            "zero_shot_pfa": np.float64(zero_shot_pfa),
-            "zero_shot_total_f1": np.float64(zero_shot_total_f1),
-            "zero_shot_per_task_rec_cls": zero_shot_per_task_rec_cls,
-            "zero_shot_per_task_prec_cls": zero_shot_per_task_prec_cls,
-            "zero_shot_per_task_f1_cls": zero_shot_per_task_f1_cls,
-            "zero_shot_per_task_det": zero_shot_per_task_det,
-            "zero_shot_per_task_pfa": zero_shot_per_task_pfa,
+            "zero_shot_macro_rec": np.float64(zero_shot_rec_cls),
+            "zero_shot_macro_prec": np.float64(zero_shot_prec_cls),
+            "zero_shot_macro_f1": np.float64(zero_shot_f1_cls),
+            "zero_shot_total_macro_f1": np.float64(zero_shot_total_f1),
+            "zero_shot_per_task_macro_rec": zero_shot_per_task_rec_cls,
+            "zero_shot_per_task_macro_prec": zero_shot_per_task_prec_cls,
+            "zero_shot_per_task_macro_f1": zero_shot_per_task_f1_cls,
         }
         if result_val_f1_flat is not None:
-            save_payload["val_f1"] = result_val_f1_flat
+            save_payload["val_macro_f1"] = result_val_f1_flat
+        if cil_mode and cil_union_f1:
+            # One entry per task completed so far: the CIL score over every class
+            # seen up to that task. Element -1 is this task's headline; the whole
+            # vector is the decay curve to plot.
+            save_payload["cil_union_macro_rec"] = np.asarray(cil_union_rec, dtype=float)
+            save_payload["cil_union_macro_prec"] = np.asarray(
+                cil_union_prec, dtype=float
+            )
+            save_payload["cil_union_macro_f1"] = np.asarray(cil_union_f1, dtype=float)
         # Optional: per-epoch training metrics for this task.
         if per_epoch_train_cls_rec:
-            save_payload["train_cls_rec"] = np.asarray(
+            save_payload["train_macro_rec"] = np.asarray(
                 per_epoch_train_cls_rec, dtype=float
             )
         if per_epoch_train_cls_prec:
-            save_payload["train_cls_prec"] = np.asarray(
+            save_payload["train_macro_prec"] = np.asarray(
                 per_epoch_train_cls_prec, dtype=float
             )
-        if per_epoch_train_det_rec:
-            save_payload["train_det_rec"] = np.asarray(
-                per_epoch_train_det_rec, dtype=float
-            )
-        if per_epoch_train_det_pfa:
-            save_payload["train_det_pfa"] = np.asarray(
-                per_epoch_train_det_pfa, dtype=float
-            )
         if per_epoch_train_f1:
-            save_payload["train_f1"] = np.asarray(per_epoch_train_f1, dtype=float)
+            save_payload["train_macro_f1"] = np.asarray(per_epoch_train_f1, dtype=float)
 
         # Optional: per-evaluation validation metrics for this task (one entry per eval/epoch).
         if per_epoch_val_cls_rec:
-            save_payload["val_cls_rec"] = np.asarray(per_epoch_val_cls_rec, dtype=float)
+            save_payload["val_macro_rec_per_epoch"] = np.asarray(
+                per_epoch_val_cls_rec, dtype=float
+            )
         if per_epoch_val_cls_prec:
-            save_payload["val_cls_prec"] = np.asarray(
+            save_payload["val_macro_prec_per_epoch"] = np.asarray(
                 per_epoch_val_cls_prec, dtype=float
             )
-        if per_epoch_val_det_rec:
-            save_payload["val_det_rec"] = np.asarray(per_epoch_val_det_rec, dtype=float)
-        if per_epoch_val_det_pfa:
-            save_payload["val_det_pfa"] = np.asarray(per_epoch_val_det_pfa, dtype=float)
         if per_epoch_val_f1:
-            save_payload["val_f1_per_epoch"] = np.asarray(per_epoch_val_f1, dtype=float)
-
-        if result_val_det_a:
-            save_payload["val_det_acc"] = np.array(result_val_det_a[-1])
-        if result_val_det_fa:
-            save_payload["val_det_fa"] = np.array(result_val_det_fa[-1])
+            save_payload["val_macro_f1_per_epoch"] = np.asarray(
+                per_epoch_val_f1, dtype=float
+            )
 
         # Persist per-task metrics and a human-readable task order file.
         np.savez(os.path.join(logs_dir, "task" + str(task_i) + ".npz"), **save_payload)
@@ -1654,17 +1513,11 @@ def life_experience(model, inc_loader, args):
             f_task_order.write(str(task_name) + "\n")
 
         if args.calc_test_accuracy:
-            test_acc = evaluator(model, test_task_loaders, args)
-            test_acc, test_prec, test_f1, test_det_acc, test_det_fa = (
-                _split_eval_output(test_acc)
+            test_acc, _ = _evaluate_validation(
+                model, test_task_loaders, cil_union_loader, current_task, args, cil_mode
             )
+            test_acc, test_prec, test_f1 = _split_eval_output(test_acc)
             result_test_a.append(test_acc)
-            if test_f1 is not None:
-                result_test_f1.append(test_f1)
-            if test_det_acc is not None:
-                result_test_det_a.append(test_det_acc)
-            if test_det_fa is not None:
-                result_test_det_fa.append(test_det_fa)
             result_test_t.append(task_info["task"])
 
         if getattr(args, "save_checkpoints", True):
@@ -1688,20 +1541,10 @@ def life_experience(model, inc_loader, args):
             sum(result_val_a[-1]) / len(result_val_a[-1]), result_val_a[-1]
         )
     )
-    if result_val_det_a:
-        print(
-            "Final Detection Results:- \n Total Detection: {} \n Individual Detection: {}".format(
-                sum(result_val_det_a[-1]) / len(result_val_det_a[-1]),
-                result_val_det_a[-1],
-            )
-        )
-    if result_val_det_fa:
-        print(
-            "Final Detection False Alarm:- \n Total False Alarm: {} \n Individual False Alarm: {}".format(
-                sum(result_val_det_fa[-1]) / len(result_val_det_fa[-1]),
-                result_val_det_fa[-1],
-            )
-        )
+
+    def _nan_mean(values):
+        finite = [float(v) for v in values if v is not None and not math.isnan(v)]
+        return sum(finite) / len(finite) if finite else None
 
     def _mean(x):
         if x is None or (isinstance(x, (list, tuple)) and len(x) == 0):
@@ -1710,56 +1553,57 @@ def life_experience(model, inc_loader, args):
             return sum(float(v) for v in x) / len(x)
         return float(x)
 
-    # Headline classification F1 (cls_f1) values, stashed on args so main() can
-    # record them for the cross-seed sweep summary. Both default to None.
-    args.final_val_cls_f1 = None
-    args.final_tr_cls_f1 = None
-    args.final_val_det = None
-    args.final_val_fa = None
+    # Headline macro metrics after the last task, returned so main() can
+    # record them for the cross-seed sweep summary. Missing values stay None.
+    headline = {
+        "val_macro_rec": None,
+        "val_macro_prec": None,
+        "val_macro_f1": None,
+        "tr_macro_rec": None,
+        "tr_macro_prec": None,
+        "tr_macro_f1": None,
+    }
 
-    if (
-        last_tr_cls_rec is not None
-        or last_tr_cls_prec is not None
-        or last_tr_cls_f1 is not None
-    ):
-        tr_rec = float(last_tr_cls_rec) if last_tr_cls_rec is not None else None
-        tr_prec = float(last_tr_cls_prec) if last_tr_cls_prec is not None else None
-        tr_f1 = float(last_tr_cls_f1) if last_tr_cls_f1 is not None else None
-        args.final_tr_cls_f1 = tr_f1
-        tr_det = last_tr_det
-        tr_fa = last_tr_fa
+    if final_epoch_tr_metrics:
+        # CIL scores training in the global class space, so the last task's
+        # final epoch already speaks for the run. TIL scores each task in its
+        # own label space, so average every task's final epoch instead.
+        tr_rows = final_epoch_tr_metrics[-1:] if cil_mode else final_epoch_tr_metrics
+        tr_rec, tr_prec, tr_f1 = (
+            _nan_mean([row[col] for row in tr_rows]) for col in range(3)
+        )
+        headline["tr_macro_rec"] = tr_rec
+        headline["tr_macro_prec"] = tr_prec
+        headline["tr_macro_f1"] = tr_f1
         parts = []
         if tr_rec is not None:
-            parts.append("cls_rec={:.4f}".format(tr_rec))
+            parts.append("macro_rec={:.4f}".format(tr_rec))
         if tr_prec is not None:
-            parts.append("cls_prec={:.4f}".format(tr_prec))
+            parts.append("macro_prec={:.4f}".format(tr_prec))
         if tr_f1 is not None:
-            parts.append("cls_f1={:.4f}".format(tr_f1))
-        if tr_det is not None:
-            parts.append("det={:.4f}".format(tr_det))
-        if tr_fa is not None:
-            parts.append("fa={:.4f}".format(tr_fa))
+            parts.append("macro_f1={:.4f}".format(tr_f1))
         if parts:
             print("SUMMARY_TR " + " ".join(parts))
 
     if result_val_a:
-        te_rec = _mean(result_val_a[-1])
-        te_prec = _mean(result_val_prec[-1]) if result_val_prec else None
-        te_f1 = _mean(result_val_f1[-1]) if result_val_f1 else None
-        args.final_val_cls_f1 = te_f1
-        te_det = _mean(result_val_det_a[-1]) if result_val_det_a else None
-        te_fa = _mean(result_val_det_fa[-1]) if result_val_det_fa else None
-        args.final_val_det = te_det
-        args.final_val_fa = te_fa
-        parts = ["cls_rec={:.4f}".format(te_rec)]
+        if cil_mode and cil_union_f1:
+            # CIL headline is the score over every class seen after the last
+            # task, not the mean of the per-task columns.
+            te_rec = cil_union_rec[-1]
+            te_prec = cil_union_prec[-1]
+            te_f1 = cil_union_f1[-1]
+        else:
+            te_rec = _mean(result_val_a[-1])
+            te_prec = _mean(result_val_prec[-1]) if result_val_prec else None
+            te_f1 = _mean(result_val_f1[-1]) if result_val_f1 else None
+        headline["val_macro_rec"] = float(te_rec)
+        headline["val_macro_prec"] = float(te_prec) if te_prec is not None else None
+        headline["val_macro_f1"] = float(te_f1) if te_f1 is not None else None
+        parts = ["macro_rec={:.4f}".format(te_rec)]
         if te_prec is not None:
-            parts.append("cls_prec={:.4f}".format(te_prec))
+            parts.append("macro_prec={:.4f}".format(te_prec))
         if te_f1 is not None:
-            parts.append("cls_f1={:.4f}".format(te_f1))
-        if te_det is not None:
-            parts.append("det={:.4f}".format(te_det))
-        if te_fa is not None:
-            parts.append("fa={:.4f}".format(te_fa))
+            parts.append("macro_f1={:.4f}".format(te_f1))
         print("SUMMARY_TE " + " ".join(parts))
 
     if args.calc_test_accuracy:
@@ -1769,20 +1613,6 @@ def life_experience(model, inc_loader, args):
                 sum(result_test_a[-1]) / len(result_test_a[-1]), result_test_a[-1]
             )
         )
-        if result_test_det_a:
-            print(
-                "Final Detection Results:- \n Total Detection: {} \n Individual Detection: {}".format(
-                    sum(result_test_det_a[-1]) / len(result_test_det_a[-1]),
-                    result_test_det_a[-1],
-                )
-            )
-        if result_test_det_fa:
-            print(
-                "Final Detection False Alarm:- \n Total False Alarm: {} \n Individual False Alarm: {}".format(
-                    sum(result_test_det_fa[-1]) / len(result_test_det_fa[-1]),
-                    result_test_det_fa[-1],
-                )
-            )
 
     time_end = time.time()
     time_spent = time_end - time_start
@@ -1838,84 +1668,266 @@ def life_experience(model, inc_loader, args):
     return (
         torch.Tensor(result_val_t),
         _pad_results(result_val_a),
+        _pad_results(result_val_prec),
+        _pad_results(result_val_f1),
         torch.Tensor(result_test_t),
         _pad_results(result_test_a),
-        _pad_results(result_val_det_a),
-        _pad_results(result_val_det_fa),
-        _pad_results(result_test_det_a),
-        _pad_results(result_test_det_fa),
-        _pad_results(result_val_f1),
-        _pad_results(result_test_f1),
         time_spent,
+        headline,
     )
 
 
 def estimate_memory_buffer_size_bytes(model: torch.nn.Module) -> int:
     """Estimate total bytes used by replay/memory buffers in a model.
 
-    This scans all modules for tensor attributes whose names suggest they are
-    part of a replay or memory buffer (for example, attributes containing
-    ``\"mem\"``) while excluding tensors already counted as parameters and
-    avoiding double-counting shared storages.
+    Uses the same categorisation and walk as
+    :func:`summarise_persistent_state_bytes` (``replay`` category), including
+    exemplars stored as NumPy arrays inside reservoir lists such as ER's
+    ``M`` / ``M_new``.
 
     Args:
         model: Torch module whose memory/replay buffers will be inspected.
 
     Returns:
-        Total number of bytes occupied by the matching tensors.
+        Total number of bytes occupied by replay buffers.
 
     Usage:
         buffer_bytes = estimate_memory_buffer_size_bytes(model)
     """
-    parameter_data_ids = {id(parameter.data) for parameter in model.parameters()}
-    seen_tensor_ids: set[int] = set()
-    total_bytes = 0
+    return summarise_persistent_state_bytes(model)["replay"]
+
+
+# Attribute names whose value is a full snapshot of the live network (an
+# ``nn.Module``). Their parameters/buffers are persistent regularization state,
+# not part of the deployable model, even though PyTorch registers them as
+# submodules so they would otherwise inflate the trainable-parameter count
+# (e.g. LWF's distillation ``teacher``, UCL's previous-task ``model_old``).
+SNAPSHOT_MODULE_ATTRIBUTE_NAMES = frozenset(
+    {"teacher", "model_old", "old_model", "old_net", "prev_model", "prev_net"}
+)
+
+# Ordered persistent-state categories reported by
+# :func:`summarise_persistent_state_bytes`.
+PERSISTENT_STATE_CATEGORIES = (
+    "model_params",
+    "replay",
+    "regularization",
+    "arch_mask",
+    "other",
+)
+
+
+def _persistent_storage_byte_size(value: torch.Tensor | np.ndarray) -> int:
+    """Return the size in bytes of a tensor or NumPy array backing store.
+
+    Args:
+        value: A :class:`torch.Tensor` or :class:`numpy.ndarray`.
+
+    Returns:
+        Number of bytes occupied by the array storage.
+    """
+    if torch.is_tensor(value):
+        return value.numel() * value.element_size()
+    return int(value.nbytes)
+
+
+def _persistent_storage_pointer(value: torch.Tensor | np.ndarray) -> int:
+    """Return a stable data pointer for deduplicating persistent storage.
+
+    Args:
+        value: A :class:`torch.Tensor` or :class:`numpy.ndarray`.
+
+    Returns:
+        Integer address of the underlying data buffer.
+    """
+    if torch.is_tensor(value):
+        return value.data_ptr()
+    return int(value.__array_interface__["data"][0])
+
+
+def _iter_state_tensors(value: object):
+    """Yield every tensor or NumPy array reachable inside a nested container.
+
+    Args:
+        value: A tensor, ndarray, or a list/tuple/set/dict that may contain
+            them at any depth (for example ER reservoir entries in ``M``).
+
+    Yields:
+        Each :class:`torch.Tensor` or :class:`numpy.ndarray` found by walking
+        the container.
+    """
+    if torch.is_tensor(value):
+        yield value
+    elif isinstance(value, np.ndarray):
+        yield value
+    elif isinstance(value, np.generic):
+        yield np.asarray(value)
+    elif isinstance(value, dict):
+        for inner_value in value.values():
+            yield from _iter_state_tensors(inner_value)
+    elif isinstance(value, (list, tuple, set)):
+        for inner_value in value:
+            yield from _iter_state_tensors(inner_value)
+
+
+def _categorize_state_attribute(attribute_name: str) -> str:
+    """Classify a non-parameter persistent tensor by its attribute name.
+
+    Args:
+        attribute_name: Name of the module attribute or registered buffer that
+            holds the tensor (e.g. ``"memory_data"``, ``"fisher"``,
+            ``"weight_owner"``).
+
+    Returns:
+        One of ``"replay"``, ``"regularization"``, ``"arch_mask"`` or
+        ``"other"``.
+
+    Usage:
+        >>> _categorize_state_attribute("memory_labs")
+        'replay'
+        >>> _categorize_state_attribute("conv_weight_si_omega")
+        'regularization'
+    """
+    if attribute_name in ("M", "M_new"):
+        return "replay"
+    lowered_name = attribute_name.lower()
+    replay_keywords = ("mem", "exemplar", "replay")
+    if any(keyword in lowered_name for keyword in replay_keywords):
+        return "replay"
+    regularization_keywords = (
+        "fisher",
+        "omega",
+        "importance",
+        "star",
+        "si_prev",
+        "si_p_old",
+        "si_w",
+    )
+    if any(keyword in lowered_name for keyword in regularization_keywords):
+        return "regularization"
+    architecture_keywords = ("owner", "frozen", "mask")
+    if any(keyword in lowered_name for keyword in architecture_keywords):
+        return "arch_mask"
+    return "other"
+
+
+def summarise_persistent_state_bytes(model: torch.nn.Module) -> dict[str, int]:
+    """Break a model's persistent storage footprint down by category, in bytes.
+
+    This walks every module and accounts for all persistent tensor and NumPy
+    state, including replay/exemplar buffers stored in Python lists or dicts
+    (for example ``eralg4``'s ``M``), regularization state (Fisher information,
+    Synaptic Intelligence buffers, weight snapshots), and architecture masks
+    (e.g. PackNet ``*_owner`` / ``*_frozen`` buffers). Snapshot submodules such
+    as a distillation teacher are attributed to ``regularization`` rather than
+    ``model_params``.
+
+    Each underlying storage is counted once (deduplicated by data pointer) and
+    optimizer state is not inspected.
+
+    Args:
+        model: Model to inspect, ideally at the end of training when replay and
+            regularization buffers are populated.
+
+    Returns:
+        Mapping from each category in :data:`PERSISTENT_STATE_CATEGORIES` to the
+        number of bytes it occupies (always includes every key, possibly zero).
+
+    Usage:
+        breakdown = summarise_persistent_state_bytes(model)
+        total_gb = sum(breakdown.values()) / (1024**3)
+    """
+    parameter_storage_pointers = {
+        parameter.data_ptr() for parameter in model.parameters()
+    }
+
+    snapshot_module_ids: set[int] = set()
+    for attribute_name in SNAPSHOT_MODULE_ATTRIBUTE_NAMES:
+        snapshot_candidate = getattr(model, attribute_name, None)
+        if isinstance(snapshot_candidate, torch.nn.Module):
+            for snapshot_submodule in snapshot_candidate.modules():
+                snapshot_module_ids.add(id(snapshot_submodule))
+
+    category_bytes: dict[str, int] = {
+        category: 0 for category in PERSISTENT_STATE_CATEGORIES
+    }
+    seen_storage_pointers: set[int] = set()
 
     for module in model.modules():
-        for attribute_name, value in vars(module).items():
-            if not torch.is_tensor(value):
-                continue
-            if "mem" not in attribute_name.lower():
-                continue
-            tensor_data = value
-            tensor_id = id(tensor_data)
-            if tensor_id in seen_tensor_ids or tensor_id in parameter_data_ids:
-                continue
-            seen_tensor_ids.add(tensor_id)
-            total_bytes += tensor_data.numel() * tensor_data.element_size()
+        module_is_snapshot = id(module) in snapshot_module_ids
 
-    return total_bytes
+        for parameter in module.parameters(recurse=False):
+            storage_pointer = parameter.data_ptr()
+            if storage_pointer in seen_storage_pointers:
+                continue
+            seen_storage_pointers.add(storage_pointer)
+            parameter_bytes = parameter.numel() * parameter.element_size()
+            target_category = "regularization" if module_is_snapshot else "model_params"
+            category_bytes[target_category] += parameter_bytes
+
+        named_state_arrays: list[tuple[str, torch.Tensor | np.ndarray]] = []
+        for attribute_name, attribute_value in module.__dict__.items():
+            if attribute_name in ("_parameters", "_buffers", "_modules"):
+                continue
+            for state_array in _iter_state_tensors(attribute_value):
+                named_state_arrays.append((attribute_name, state_array))
+        for buffer_name, buffer_tensor in module._buffers.items():
+            if buffer_tensor is not None:
+                named_state_arrays.append((buffer_name, buffer_tensor))
+
+        for attribute_name, state_array in named_state_arrays:
+            storage_pointer = _persistent_storage_pointer(state_array)
+            if storage_pointer in parameter_storage_pointers:
+                continue
+            if storage_pointer in seen_storage_pointers:
+                continue
+            seen_storage_pointers.add(storage_pointer)
+            array_bytes = _persistent_storage_byte_size(state_array)
+            if module_is_snapshot:
+                category_bytes["regularization"] += array_bytes
+            else:
+                category_bytes[
+                    _categorize_state_attribute(attribute_name)
+                ] += array_bytes
+
+    return category_bytes
 
 
 def save_results(
     args,
     result_val_t,
     result_val_a,
+    result_val_prec,
+    result_val_f1,
     result_test_t,
     result_test_a,
     model,
     spent_time,
-    result_val_f1=None,
-    result_test_f1=None,
+    headline=None,
 ):
+    """Write results.txt / results.pt for one seed.
+
+    results.txt holds the recall task matrix (written by ``confusion_matrix``,
+    kept first so older parsers still find the zero-shot row and ``Backward:``),
+    then the precision and F1 matrices, then a per-metric summary table.
+
+    ``final`` is the mean of the last matrix row, so ``bwt = final - diagonal``
+    exactly. When ``headline`` is given, the headline macro metrics are recorded
+    beside it (summary table ``headline`` column and the one-liner). Under CIL
+    the headline is scored over every seen class at once and differs from the
+    row mean, which weights classes unequally when tasks differ in size; under
+    TIL it equals the row mean.
+
+    Args:
+        headline: Dict from :func:`life_experience` with ``val_macro_rec``,
+            ``val_macro_prec`` and ``val_macro_f1``.
+
+    Returns:
+        ``(val_stats, test_stats, val_bwt)`` where ``val_bwt`` maps ``rec``,
+        ``prec`` and ``f1`` to the mean validation BWT (None if unavailable).
+    """
     fname = os.path.join(args.log_dir, "results")
     log_state(args.state_logging, "Saving results to {}".format(fname))
-
-    def _pick_metric_matrix(acc_matrix, f1_matrix, ref_t):
-        """Prefer the per-task F1 matrix for the confusion matrix when available.
-
-        Falls back to the accuracy/recall matrix if no F1 values were recorded
-        (e.g. evaluators that do not return F1) or if the F1 matrix row count
-        does not line up with the per-eval task ids in ``ref_t``.
-        """
-        if (
-            f1_matrix is not None
-            and torch.is_tensor(f1_matrix)
-            and f1_matrix.numel() > 0
-            and f1_matrix.size(0) == torch.as_tensor(ref_t).numel()
-        ):
-            return f1_matrix, "F1"
-        return acc_matrix, "Accuracy"
 
     size_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
     size_gb = size_bytes / (1024**3)
@@ -1924,17 +1936,29 @@ def save_results(
     print("Model size: {:.4f} GB".format(size_gb))
     print("Memory buffer size: {:.4f} GB".format(buffer_gb))
 
-    # save confusion matrix and print one line of stats. Prefer per-task F1
-    # over recall/accuracy in the seed-level results.txt when F1 is available.
-    val_matrix, val_metric_name = _pick_metric_matrix(
-        result_val_a, result_val_f1, result_val_t
+    state_breakdown_bytes = summarise_persistent_state_bytes(model)
+    state_breakdown_gb = {
+        category: byte_count / (1024**3)
+        for category, byte_count in state_breakdown_bytes.items()
+    }
+    total_state_gb = sum(state_breakdown_gb.values())
+    state_breakdown_text = " ".join(
+        "{}={:.4f}".format(category, state_breakdown_gb[category])
+        for category in PERSISTENT_STATE_CATEGORIES
     )
+    print(
+        "Persistent state sizes (GB): {} total={:.4f}".format(
+            state_breakdown_text, total_state_gb
+        )
+    )
+
+    headline_scores = {
+        key: (headline or {}).get("val_macro_" + key) for key in ("rec", "prec", "f1")
+    }
+
+    # save confusion matrix and print one line of stats
     val_stats = confusion_matrix(
-        result_val_t,
-        val_matrix,
-        args.log_dir,
-        "results.txt",
-        metric_name=val_metric_name,
+        result_val_t, result_val_a, args.log_dir, "results.txt"
     )
 
     one_liner = str(vars(args)) + " # val: "
@@ -1942,18 +1966,82 @@ def save_results(
 
     test_stats = 0
     if args.calc_test_accuracy:
-        test_matrix, test_metric_name = _pick_metric_matrix(
-            result_test_a, result_test_f1, result_test_t
-        )
         test_stats = confusion_matrix(
-            result_test_t,
-            test_matrix,
-            args.log_dir,
-            "results.txt",
-            metric_name=test_metric_name,
+            result_test_t, result_test_a, args.log_dir, "results.txt"
         )
         one_liner += " # test: " + " ".join(["%.3f" % stat for stat in test_stats])
+
+    # Append precision and F1 task matrices plus a per-metric summary table.
+    results_path = os.path.join(args.log_dir, "results.txt")
+    metric_stats = {
+        "rec": {
+            "diag": float(val_stats[0]),
+            "final": float(val_stats[1]),
+            "bwt": float(val_stats[2]),
+            "fwt": float(val_stats[3]),
+        },
+        "prec": append_metric_block(
+            results_path, "Precision", result_val_t, result_val_prec
+        ),
+        "f1": append_metric_block(results_path, "F1", result_val_t, result_val_f1),
+    }
+    try:
+        with open(results_path, "a", encoding="utf-8") as results_file:
+            print("", file=results_file)
+            print("Summary (validation):", file=results_file)
+            print(
+                "{:<10} {:>8} {:>8} {:>8} {:>8} {:>8}".format(
+                    "metric", "diagonal", "final", "bwt", "fwt", "headline"
+                ),
+                file=results_file,
+            )
+            for key, label in (("rec", "recall"), ("prec", "precision"), ("f1", "f1")):
+                stats = metric_stats[key]
+                if stats is None:
+                    continue
+                headline_value = headline_scores[key]
+                print(
+                    "{:<10} {:>8.4f} {:>8.4f} {:>8.4f} {:>8.4f} {:>8}".format(
+                        label,
+                        stats["diag"],
+                        stats["final"],
+                        stats["bwt"],
+                        stats["fwt"],
+                        (
+                            "n/a"
+                            if headline_value is None
+                            else "{:.4f}".format(headline_value)
+                        ),
+                    ),
+                    file=results_file,
+                )
+            print(
+                "final = mean of the last row (bwt = final - diagonal); "
+                "headline = macro score over every seen class.",
+                file=results_file,
+            )
+    except OSError:
+        pass
+
+    val_bwt = {
+        key: (stats["bwt"] if stats is not None else None)
+        for key, stats in metric_stats.items()
+    }
+    one_liner += " # bwt: " + " ".join(
+        "{}={}".format(key, "n/a" if value is None else "{:.4f}".format(value))
+        for key, value in val_bwt.items()
+    )
+
+    if any(value is not None for value in headline_scores.values()):
+        one_liner += " # headline: " + " ".join(
+            "{}={}".format(key, "n/a" if value is None else "{:.4f}".format(value))
+            for key, value in headline_scores.items()
+        )
+
     one_liner += " # sizes: model_gb={:.4f} mem_gb={:.4f}".format(size_gb, buffer_gb)
+    one_liner += " # state_gb: {} total={:.4f}".format(
+        state_breakdown_text, total_state_gb
+    )
 
     print(fname + ": " + one_liner + " # " + str(spent_time))
 
@@ -1984,7 +2072,7 @@ def save_results(
         fname + ".pt",
         pickle_protocol=4,
     )
-    return val_stats, test_stats
+    return val_stats, test_stats, val_bwt
 
 
 def _default_main_config_chain() -> List[str]:
@@ -2009,35 +2097,42 @@ def _parse_seed_list(raw: str) -> List[int]:
     return seeds
 
 
-# Classification F1 fields recorded per seed, paired with display labels.
-SWEEP_F1_FIELDS = [
-    ("val_cls_f1", "Validation cls_f1"),
-    ("tr_cls_f1", "Training cls_f1"),
+# Final macro metrics recorded per seed, paired with display labels.
+SWEEP_FINAL_FIELDS = [
+    ("val_macro_rec", "Validation macro_rec"),
+    ("val_macro_prec", "Validation macro_prec"),
+    ("val_macro_f1", "Validation macro_f1"),
+    ("tr_macro_rec", "Training macro_rec"),
+    ("tr_macro_prec", "Training macro_prec"),
+    ("tr_macro_f1", "Training macro_f1"),
 ]
 
-# Detection fields (detection recall ``det`` and false-alarm rate ``fa``)
-# recorded per seed, paired with display labels.
-SWEEP_DET_FIELDS = [
-    ("val_det", "Validation det"),
-    ("val_fa", "Validation fa"),
+# Per-metric validation backward transfer recorded per seed.
+SWEEP_BWT_FIELDS = [
+    ("val_bwt_rec", "Validation BWT rec"),
+    ("val_bwt_prec", "Validation BWT prec"),
+    ("val_bwt_f1", "Validation BWT f1"),
 ]
 
 
-def _write_seed_metrics(args, spent_time):
+def _write_seed_metrics(args, spent_time, headline, val_bwt):
     """Write a small machine-readable metrics file into the seed's log dir.
 
-    Records the headline classification F1 (cls_f1) values stashed on ``args``
-    by life_experience. The multi-seed launcher reads these back to build the
+    Records the headline macro recall/precision/F1 returned by
+    ``life_experience`` and the per-metric validation BWT returned by
+    ``save_results``. The multi-seed launcher reads these back to build the
     cross-seed summary.
     """
     payload = {
         "seed": args.seed,
-        "val_cls_f1": getattr(args, "final_val_cls_f1", None),
-        "tr_cls_f1": getattr(args, "final_tr_cls_f1", None),
-        "val_det": getattr(args, "final_val_det", None),
-        "val_fa": getattr(args, "final_val_fa", None),
-        "runtime_seconds": float(spent_time),
+        "task_order_seed": getattr(args, "task_order_seed", None),
+        "task_order_seed_source": getattr(args, "task_order_seed_source", None),
     }
+    for field, _label in SWEEP_FINAL_FIELDS:
+        payload[field] = headline.get(field)
+    for key in ("rec", "prec", "f1"):
+        payload["val_bwt_" + key] = val_bwt.get(key)
+    payload["runtime_seconds"] = float(spent_time)
     path = os.path.join(args.log_dir, "seed_metrics.json")
     try:
         with open(path, "w", encoding="utf-8") as f:
@@ -2047,10 +2142,11 @@ def _write_seed_metrics(args, spent_time):
 
 
 def _write_sweep_summary(experiment_root, seeds):
-    """Aggregate per-seed cls_f1 into a cross-seed results.txt summary.
+    """Aggregate per-seed metrics into a cross-seed results.txt summary.
 
-    Reads each seed's seed_metrics.json and writes mean +/- std of the
-    classification F1 (and runtime) to ``<experiment_root>/results.txt``.
+    Reads each seed's seed_metrics.json and writes mean +/- std of the final
+    macro recall/precision/F1, their validation BWT, and the runtime to
+    ``<experiment_root>/results.txt``.
     """
     per_seed = []
     for seed in seeds:
@@ -2075,33 +2171,27 @@ def _write_sweep_summary(experiment_root, seeds):
         else:
             std = 0.0
         per_seed_str = ", ".join("{:.4f}".format(x) for x in vals)
-        return "  {:<20} (n={}): {:.4f} +/- {:.4f}   [{}]".format(
+        return "  {:<22} (n={}): {:.4f} +/- {:.4f}   [{}]".format(
             label, len(vals), mean, std, per_seed_str
         )
 
     lines = [
-        "Seed-sweep summary (classification F1)",
+        "Seed-sweep summary (classification metrics)",
         "Seeds: {}".format(", ".join(str(s) for s in seeds)),
         "Runs:  {}".format(len(seeds)),
-        "",
-        "cls_f1 mean +/- std:",
     ]
 
-    for field, label in SWEEP_F1_FIELDS:
-        line = _summary_line(field, label)
-        if line is not None:
-            lines.append(line)
-    lines.append("")
-
-    det_lines = [
-        line
-        for field, label in SWEEP_DET_FIELDS
-        if (line := _summary_line(field, label)) is not None
-    ]
-    if det_lines:
-        lines.append("detection (det / fa) mean +/- std:")
-        lines.extend(det_lines)
+    for title, fields in (
+        ("Final macro metrics mean +/- std:", SWEEP_FINAL_FIELDS),
+        ("Backward transfer (BWT) mean +/- std:", SWEEP_BWT_FIELDS),
+    ):
         lines.append("")
+        lines.append(title)
+        for field, label in fields:
+            line = _summary_line(field, label)
+            if line is not None:
+                lines.append(line)
+    lines.append("")
 
     runtimes = [
         m.get("runtime_seconds")
@@ -2125,6 +2215,133 @@ def _write_sweep_summary(experiment_root, seeds):
         print("[seed-sweep] wrote cross-seed summary to {}".format(out))
     except OSError:
         pass
+
+
+def _parse_seed_gpu_ids(raw: str) -> List[str]:
+    """Parse a comma-separated GPU id string like "0,1,2" into a list of strings.
+
+    Empty or whitespace-only input yields an empty list, signalling that
+    ``CUDA_VISIBLE_DEVICES`` should be left untouched for child processes.
+    """
+    ids: List[str] = []
+    for token in (raw or "").split(","):
+        token = token.strip()
+        if token:
+            ids.append(token)
+    return ids
+
+
+def _run_seeds_sequential(executable, script, base_argv, seeds, shared_timestamp):
+    """Run each seed one after another, aborting the sweep on the first failure.
+
+    Args:
+        executable: Path to the Python interpreter (``sys.executable``).
+        script: Path to this script (``sys.argv[0]``).
+        base_argv: Argv (without seed/timestamp flags) shared by every child.
+        seeds: Ordered list of integer seeds to run.
+        shared_timestamp: Timestamp shared by all children so they group under
+            one experiment directory.
+    """
+    import subprocess
+
+    for index, seed in enumerate(seeds):
+        child_argv = _build_seed_child_argv(base_argv, seed, shared_timestamp)
+        print(
+            "[seed-sweep] launching seed {} ({} of {})".format(
+                seed, index + 1, len(seeds)
+            )
+        )
+        code = subprocess.call([executable, script, *child_argv])
+        if code != 0:
+            raise SystemExit(
+                "[seed-sweep] seed {} failed with exit code {}; "
+                "aborting remaining seeds.".format(seed, code)
+            )
+
+
+def _run_seeds_parallel(
+    executable, script, base_argv, seeds, shared_timestamp, max_parallel, gpu_ids
+):
+    """Run seeds concurrently, up to ``max_parallel`` child processes at a time.
+
+    Each worker is optionally pinned to a GPU by round-robin assignment of
+    ``gpu_ids`` via ``CUDA_VISIBLE_DEVICES``. All seeds are attempted; if any
+    child exits non-zero the sweep raises ``SystemExit`` after the rest finish.
+
+    Args:
+        executable: Path to the Python interpreter (``sys.executable``).
+        script: Path to this script (``sys.argv[0]``).
+        base_argv: Argv (without seed/timestamp flags) shared by every child.
+        seeds: Ordered list of integer seeds to run.
+        shared_timestamp: Timestamp shared by all children so they group under
+            one experiment directory.
+        max_parallel: Maximum number of concurrent child processes.
+        gpu_ids: GPU ids to distribute workers across, or empty to leave
+            ``CUDA_VISIBLE_DEVICES`` untouched.
+    """
+    import subprocess
+
+    pending = list(enumerate(seeds))
+    running = {}  # subprocess.Popen -> seed
+    failures = []
+    worker_slot = 0
+
+    while pending or running:
+        while pending and len(running) < max_parallel:
+            index, seed = pending.pop(0)
+            child_argv = _build_seed_child_argv(base_argv, seed, shared_timestamp)
+            env = os.environ.copy()
+            if gpu_ids:
+                env["CUDA_VISIBLE_DEVICES"] = gpu_ids[worker_slot % len(gpu_ids)]
+                worker_slot += 1
+            print(
+                "[seed-sweep] launching seed {} ({} of {}){}".format(
+                    seed,
+                    index + 1,
+                    len(seeds),
+                    " on GPU {}".format(env["CUDA_VISIBLE_DEVICES"]) if gpu_ids else "",
+                )
+            )
+            process = subprocess.Popen([executable, script, *child_argv], env=env)
+            running[process] = seed
+
+        finished = None
+        while finished is None:
+            for process in list(running):
+                code = process.poll()
+                if code is not None:
+                    finished = process
+                    break
+            if finished is None:
+                time.sleep(1.0)
+
+        seed = running.pop(finished)
+        if finished.returncode != 0:
+            failures.append((seed, finished.returncode))
+            print(
+                "[seed-sweep] seed {} failed with exit code {}.".format(
+                    seed, finished.returncode
+                )
+            )
+
+    if failures:
+        detail = ", ".join(
+            "seed {} (exit {})".format(seed, code) for seed, code in failures
+        )
+        raise SystemExit(
+            "[seed-sweep] {} seed(s) failed: {}".format(len(failures), detail)
+        )
+
+
+def _build_seed_child_argv(base_argv, seed, shared_timestamp):
+    """Append the per-seed single-run flags to the shared base argv."""
+    return base_argv + [
+        "--single-seed",
+        "--seed",
+        str(seed),
+        "--timestamp",
+        shared_timestamp,
+    ]
 
 
 def _strip_argv_flags(argv: List[str], flags: set) -> List[str]:
@@ -2206,44 +2423,50 @@ def main():
                 "--resume targets a single experiment directory; pass "
                 "--single-seed or a single --seeds value when resuming."
             )
-
-        import subprocess
-
         shared_timestamp = misc_utils.get_date_time()
         # Reconstruct the shared experiment directory (parent of the per-seed
         # dirs) using the same layout as misc_utils.log_dir().
         sweep_config_name = Path(config_chain[-1]).stem if config_chain else None
         dir_name = sweep_config_name if sweep_config_name else args.model
         experiment_root = os.path.join(
-            args.log_dir, dir_name, "{}-{}".format(args.expt_name, shared_timestamp)
+            args.log_dir, dir_name, "{}_{}".format(shared_timestamp, args.expt_name)
         )
         base_argv = _strip_argv_flags(
-            sys.argv[1:], {"--seeds", "--seed", "--single-seed", "--timestamp"}
+            sys.argv[1:],
+            {"--seeds", "--seed", "--single-seed", "--timestamp", "--parallel-seeds"},
         )
-        for idx, seed in enumerate(seeds):
-            child_argv = base_argv + [
-                "--single-seed",
-                "--seed",
-                str(seed),
-                "--timestamp",
-                shared_timestamp,
-            ]
+        max_parallel = max(1, int(getattr(args, "parallel_seeds", 1) or 1))
+        if max_parallel > 1:
+            gpu_ids = _parse_seed_gpu_ids(getattr(args, "seed_gpu_ids", "") or "")
             print(
-                "[seed-sweep] launching seed {} ({} of {})".format(
-                    seed, idx + 1, len(seeds)
+                "[seed-sweep] running {} seeds with up to {} in parallel{}".format(
+                    len(seeds),
+                    min(max_parallel, len(seeds)),
+                    " across GPUs {}".format(",".join(gpu_ids)) if gpu_ids else "",
                 )
             )
-            code = subprocess.call([sys.executable, sys.argv[0], *child_argv])
-            if code != 0:
-                raise SystemExit(
-                    "[seed-sweep] seed {} failed with exit code {}; "
-                    "aborting remaining seeds.".format(seed, code)
-                )
+            _run_seeds_parallel(
+                sys.executable,
+                sys.argv[0],
+                base_argv,
+                seeds,
+                shared_timestamp,
+                max_parallel,
+                gpu_ids,
+            )
+        else:
+            _run_seeds_sequential(
+                sys.executable, sys.argv[0], base_argv, seeds, shared_timestamp
+            )
         _write_sweep_summary(experiment_root, seeds)
         raise SystemExit(0)
 
     # Single-seed run: ensure args.seed reflects the resolved seed.
     args.seed = seeds[0]
+
+    # Task presentation order follows the training seed unless --task-order-seed
+    # pins it. Resolved here so log_dir() records both the value and its origin.
+    misc_utils.resolve_task_order_seed(args)
 
     # Scale learning rate based on batch size (reference batch size = 128).
     # This applies uniformly across all models that rely on args.lr.
@@ -2309,6 +2532,7 @@ def main():
     Loader = importlib.import_module("dataloaders." + args.loader)
     loader = Loader.IncrementalLoader(args, seed=args.seed)
     n_inputs, n_outputs, n_tasks = loader.get_dataset_info()
+    args.n_tasks = n_tasks
     args.get_samples_per_task = getattr(loader, "get_samples_per_task", None)
     args.classes_per_task = getattr(loader, "classes_per_task", None)
     print("Classes per task:", args.classes_per_task)
@@ -2338,6 +2562,10 @@ def main():
     # load model
     Model = importlib.import_module("model." + args.model)
     model = Model.Net(n_inputs, n_outputs, n_tasks, args)
+    # Per-task BatchNorm running statistics for task-incremental runs. Must run
+    # before ``.cuda()`` and after the model built its optimizer (the converted
+    # layers reuse the existing affine Parameters, so param groups stay valid).
+    task_bn.install(model, args, n_tasks)
     # print(model)
     if args.cuda:
         try:
@@ -2361,59 +2589,38 @@ def main():
             ),
         )
 
-    # run model on loader
-    if args.model == "iid2":
-        # `iid2` is handled by the single-round entrypoint; delegate so we
-        # never depend on `main_multi_task.py`.
-        #
-        # We preserve CLI compatibility by forwarding the original argv.
-        import subprocess
+    # run model on loader (iid2 included: it is the maximal-replay upper bound)
+    log_state(args.state_logging, "Invoking continual life experience flow")
+    (
+        result_val_t,
+        result_val_a,
+        result_val_prec,
+        result_val_f1,
+        result_test_t,
+        result_test_a,
+        spent_time,
+        headline,
+    ) = life_experience(model, loader, args)
 
-        log_state(
-            args.state_logging,
-            "Delegating iid2 to main_single_round.py (no main_multi_task).",
-        )
-        exit_code = subprocess.call(
-            [sys.executable, "main_single_round.py"] + sys.argv[1:]
-        )
-        raise SystemExit(exit_code)
-    else:
-        # for all the CL baselines
-        log_state(args.state_logging, "Invoking continual life experience flow")
-        (
-            result_val_t,
-            result_val_a,
-            result_test_t,
-            result_test_a,
-            _,
-            _,
-            _,
-            _,
-            result_val_f1,
-            result_test_f1,
-            spent_time,
-        ) = life_experience(model, loader, args)
+    spent_time_hours = spent_time / 3600.0
 
-        spent_time_hours = spent_time / 3600.0
-
-        # save results in files or print on terminal
-        save_results(
-            args,
-            result_val_t,
-            result_val_a,
-            result_test_t,
-            result_test_a,
-            model,
-            spent_time,
-            result_val_f1=result_val_f1,
-            result_test_f1=result_test_f1,
-        )
-        # Emit a machine-readable per-seed cls_f1 file for the sweep summary.
-        _write_seed_metrics(args, spent_time)
-        log_state(
-            args.state_logging,
-            "Results saved; total runtime {:.2f}h".format(spent_time_hours),
-        )
+    # save results in files or print on terminal
+    _, _, val_bwt = save_results(
+        args,
+        result_val_t,
+        result_val_a,
+        result_val_prec,
+        result_val_f1,
+        result_test_t,
+        result_test_a,
+        model,
+        spent_time,
+        headline=headline,
+    )
+    log_state(
+        args.state_logging,
+        "Results saved; total runtime {:.2f}h".format(spent_time_hours),
+    )
 
     # Print and append total runtime for this experiment.
     print("Total runtime: {:.2f} hours".format(spent_time / 3600.0))
@@ -2424,6 +2631,9 @@ def main():
     except OSError:
         # If results.txt cannot be written, fail silently to avoid breaking experiments.
         pass
+
+    # Emit a machine-readable per-seed metrics file for the sweep summary.
+    _write_seed_metrics(args, spent_time, headline, val_bwt)
 
 
 if __name__ == "__main__":

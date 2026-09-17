@@ -17,12 +17,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from torch.nn.modules.batchnorm import _BatchNorm
-from model.detection_replay import (
-    noise_label_from_args,
-    signal_mask_exclude_noise,
-    unpack_y_to_class_labels,
-)
+from model.replay_utils import unpack_y_to_class_labels
 from utils.training_metrics import macro_recall
 from utils import misc_utils
 from utils.class_weighted_loss import classification_cross_entropy
@@ -64,7 +59,7 @@ class HatConfig:
     lr: float = 1e-4
     gamma: float = 0.75
     smax: float = 50
-    grad_clip_norm: float = 10.0
+    grad_clip_norm: float = 0.0
     anneal_schedule: str = "linear"  # "linear" or "geometric" (original paper)
 
     cuda: bool = True
@@ -536,7 +531,6 @@ class Net(nn.Module):
         self.bridge = HatBackbone(n_inputs, n_tasks, n_outputs, self.cfg, args)
 
         self.class_weighted_ce = bool(getattr(args, "class_weighted_ce", True))
-        self.noise_label: int | None = noise_label_from_args(args)
         self.incremental_loader_name = getattr(args, "loader", None)
 
         params: Iterable[nn.Parameter] = self.bridge.parameters()
@@ -568,19 +562,10 @@ class Net(nn.Module):
             self.num_batches = None
         self.batch_idx = 0
         self._finalized_tasks: set[int] = set()
-        # Per-task BN snapshotting disabled: single running BN state across tasks
-        # (matches UCL and avoids relying on in-memory snapshots for re-eval).
-        self._use_task_bn_state: bool = False
-        self._bn_modules: List[_BatchNorm] = [
-            m for m in self.bridge.model.modules() if isinstance(m, _BatchNorm)
-        ]
-        self._bn_task_stats: Dict[int, List[Tuple[torch.Tensor, torch.Tensor, int]]] = (
-            {}
-        )
-        self._bn_task_affine: Dict[
-            int, List[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]]
-        ] = {}
-        self._bn_initialized_tasks: set[int] = set()
+        # Per-task BatchNorm running statistics are handled centrally by
+        # :mod:`model.task_bn`, installed from ``main`` once the model is built.
+        # Unlike the in-memory snapshots this replaces, those buffers are part of
+        # ``state_dict`` and so survive into the per-task checkpoints.
 
     # ------------------------------------------------------------------
     def _device(self) -> torch.device:
@@ -627,138 +612,6 @@ class Net(nn.Module):
         if samples <= 0:
             return None
         return max(int(math.ceil(samples / self.batch_size)), 1)
-
-    # ------------------------------------------------------------------
-    def _reset_bn_stats(self) -> None:
-        """Reset BatchNorm running statistics for a fresh task.
-
-        BatchNorm affine parameters are intentionally left untouched so a new
-        task starts from the current shared representation while collecting its
-        own running statistics.
-        """
-        if not self._use_task_bn_state:
-            return
-        for batch_norm_module in self._bn_modules:
-            batch_norm_module.running_mean.zero_()
-            batch_norm_module.running_var.fill_(1.0)
-            batch_norm_module.num_batches_tracked.zero_()
-
-    def _snapshot_bn_stats(self, task: int) -> None:
-        """Store BatchNorm running statistics and affine parameters for a task.
-
-        Args:
-            task: The completed task index whose BatchNorm state should be
-                restored during later evaluation.
-        """
-        if not self._use_task_bn_state:
-            return
-        stats: List[Tuple[torch.Tensor, torch.Tensor, int]] = []
-        affine: List[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]] = []
-        for batch_norm_module in self._bn_modules:
-            stats.append(
-                (
-                    batch_norm_module.running_mean.detach().clone(),
-                    batch_norm_module.running_var.detach().clone(),
-                    int(batch_norm_module.num_batches_tracked.item()),
-                )
-            )
-            if batch_norm_module.affine:
-                affine.append(
-                    (
-                        batch_norm_module.weight.detach().clone(),
-                        batch_norm_module.bias.detach().clone(),
-                    )
-                )
-            else:
-                affine.append((None, None))
-        self._bn_task_stats[task] = stats
-        self._bn_task_affine[task] = affine
-
-    def _capture_bn_state(
-        self,
-    ) -> Tuple[
-        List[Tuple[torch.Tensor, torch.Tensor, int]],
-        List[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]],
-    ]:
-        """Capture the currently active BatchNorm state.
-
-        Returns:
-            Running-stat and affine snapshots that can be restored after a
-            temporary task-specific evaluation forward.
-        """
-        stats: List[Tuple[torch.Tensor, torch.Tensor, int]] = []
-        affine: List[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]] = []
-        for batch_norm_module in self._bn_modules:
-            stats.append(
-                (
-                    batch_norm_module.running_mean.detach().clone(),
-                    batch_norm_module.running_var.detach().clone(),
-                    int(batch_norm_module.num_batches_tracked.item()),
-                )
-            )
-            if batch_norm_module.affine:
-                affine.append(
-                    (
-                        batch_norm_module.weight.detach().clone(),
-                        batch_norm_module.bias.detach().clone(),
-                    )
-                )
-            else:
-                affine.append((None, None))
-        return stats, affine
-
-    def _apply_bn_state(
-        self,
-        stats: List[Tuple[torch.Tensor, torch.Tensor, int]],
-        affine: List[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]],
-    ) -> None:
-        """Apply a previously captured BatchNorm state.
-
-        Args:
-            stats: Running-stat snapshots from :meth:`_capture_bn_state`.
-            affine: Affine parameter snapshots from :meth:`_capture_bn_state`.
-        """
-        for batch_norm_module, (running_mean, running_var, num_batches) in zip(
-            self._bn_modules, stats
-        ):
-            batch_norm_module.running_mean.data.copy_(running_mean)
-            batch_norm_module.running_var.data.copy_(running_var)
-            batch_norm_module.num_batches_tracked.data.fill_(num_batches)
-        for batch_norm_module, (weight, bias) in zip(self._bn_modules, affine):
-            if weight is not None and batch_norm_module.affine:
-                batch_norm_module.weight.data.copy_(weight)
-                batch_norm_module.bias.data.copy_(bias)
-
-    def _restore_bn_stats(self, task: int) -> None:
-        """Restore saved BatchNorm state for a task, or reset for unseen tasks.
-
-        Args:
-            task: Task index whose BatchNorm state should become active.
-        """
-        if not self._bn_modules:
-            return
-        if not self._use_task_bn_state:
-            return
-
-        stats = self._bn_task_stats.get(task)
-        affine = self._bn_task_affine.get(task)
-        if stats is None:
-            self._reset_bn_stats()
-            self._bn_initialized_tasks.add(task)
-            return
-
-        for batch_norm_module, (running_mean, running_var, num_batches) in zip(
-            self._bn_modules, stats
-        ):
-            batch_norm_module.running_mean.data.copy_(running_mean)
-            batch_norm_module.running_var.data.copy_(running_var)
-            batch_norm_module.num_batches_tracked.data.fill_(num_batches)
-        if affine is not None:
-            for batch_norm_module, (weight, bias) in zip(self._bn_modules, affine):
-                if weight is not None and batch_norm_module.affine:
-                    batch_norm_module.weight.data.copy_(weight)
-                    batch_norm_module.bias.data.copy_(bias)
-        self._bn_initialized_tasks.add(task)
 
     def _log_final_mask_stats(self, task: int, masks: List[torch.Tensor]) -> None:
         """Print compact end-of-task mask saturation diagnostics.
@@ -818,7 +671,7 @@ class Net(nn.Module):
         *,
         completed_task_index: int | None = None,
     ) -> None:
-        """Snapshot task-specific BatchNorm state and finalize HAT masks.
+        """Finalize HAT masks for the completed task.
 
         Args:
             train_loader: Unused hook argument accepted for compatibility with
@@ -832,34 +685,16 @@ class Net(nn.Module):
         )
         if task is None:
             raise RuntimeError("finalize_task_after_training requires a current task.")
-        if self._use_task_bn_state:
-            self._snapshot_bn_stats(task)
         self._finalise_task(task)
 
     # ------------------------------------------------------------------
     def forward(
         self, x: torch.Tensor, t: int, s: Optional[float] = None
     ) -> torch.Tensor:
-        previous_bn_state = None
-        if self._use_task_bn_state and self._bn_modules:
-            previous_bn_state = self._capture_bn_state()
-        try:
-            if self._use_task_bn_state:
-                if self.current_task is None:
-                    if t in self._finalized_tasks:
-                        self._restore_bn_stats(t)
-                elif t in self._finalized_tasks or self.current_task != t:
-                    self._restore_bn_stats(t)
-                elif t not in self._bn_initialized_tasks:
-                    self._reset_bn_stats()
-                    self._bn_initialized_tasks.add(t)
-            device = x.device if x.is_cuda else self._device()
-            logits = self.bridge.forward(
-                self._task_tensor(t, device), x, s or self.smax, return_masks=False
-            )
-        finally:
-            if previous_bn_state is not None:
-                self._apply_bn_state(*previous_bn_state)
+        device = x.device if x.is_cuda else self._device()
+        logits = self.bridge.forward(
+            self._task_tensor(t, device), x, s or self.smax, return_masks=False
+        )
         offset1, offset2 = misc_utils.compute_offsets(t, self.classes_per_task)
         masked = logits.clone()
         if offset1 > 0:
@@ -885,16 +720,10 @@ class Net(nn.Module):
 
         if self.current_task is None:
             self.current_task = t
-            if self._use_task_bn_state:
-                self._restore_bn_stats(t)
         elif t != self.current_task:
             if self.current_task not in self._finalized_tasks:
-                if self._use_task_bn_state:
-                    self._snapshot_bn_stats(self.current_task)
                 self._finalise_task(self.current_task)
             self.current_task = t
-            if self._use_task_bn_state:
-                self._restore_bn_stats(t)
 
         device = x.device if x.is_cuda else self._device()
         batch_idx, total_batches = self._update_epoch_counters(t)
@@ -921,23 +750,18 @@ class Net(nn.Module):
             # for mask in masks:
             #     print(mask.mean(), mask.min())
             y_cls = unpack_y_to_class_labels(y)
-            signal_mask = signal_mask_exclude_noise(y_cls, self.noise_label)
             logits_for_loss = misc_utils.apply_task_incremental_logit_mask(
                 logits,
                 t,
                 self.classes_per_task,
                 self.n_outputs,
                 cil_all_seen_upto_task=t,
-                global_noise_label=self.noise_label,
                 loader=self.incremental_loader_name,
             )
             targets = y_cls.long()
             loss, _ = self._criterion(logits_for_loss, targets, masks)
-            if signal_mask.any():
-                preds = torch.argmax(logits_for_loss[signal_mask], dim=1)
-                cls_tr_rec = macro_recall(preds, targets[signal_mask])
-            else:
-                cls_tr_rec = 0.0
+            preds = torch.argmax(logits_for_loss, dim=1)
+            cls_tr_rec = macro_recall(preds, targets)
             loss.backward()
 
             if self.mask_back:

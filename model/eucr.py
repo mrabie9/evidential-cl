@@ -24,9 +24,7 @@ import torch
 import torch.nn as nn
 
 from model import eucr_consolidation as cons
-from model.detection_replay import (
-    noise_label_from_args,
-    signal_mask_exclude_noise,
+from model.replay_utils import (
     unpack_y_to_class_labels,
 )
 from model.eucr_backbone import EucrResNet1D
@@ -93,7 +91,6 @@ class Net(nn.Module):
             classes_per_task=getattr(args, "classes_per_task", None),
         )
         self.nc_per_task = misc_utils.max_task_class_count(self.classes_per_task)
-        self.noise_label = noise_label_from_args(args)
         self.incremental_loader_name = getattr(args, "loader", None)
 
         probe_stages = _parse_probe_stages(getattr(args, "probe_stages", "1,2,3,4"))
@@ -196,7 +193,6 @@ class Net(nn.Module):
             self.classes_per_task,
             self.n_outputs,
             cil_all_seen_upto_task=cil_all_seen_upto_task,
-            global_noise_label=self.noise_label,
             loader=self.incremental_loader_name,
         )
 
@@ -278,12 +274,8 @@ class Net(nn.Module):
             with torch.no_grad():
                 masked = self._mask(head_eu.detach(), t, cil_all_seen_upto_task=t)
                 metric_logits = masked
-                signal_mask = signal_mask_exclude_noise(y_cls, self.noise_label)
-                if signal_mask.any():
-                    preds = torch.argmax(masked[signal_mask], dim=1)
-                    cls_tr_rec = macro_recall(preds, y_cls[signal_mask])
-                else:
-                    cls_tr_rec = 0.0
+                preds = torch.argmax(masked, dim=1)
+                cls_tr_rec = macro_recall(preds, y_cls)
             loss_value = float(loss.item())
 
         return loss_value, float(cls_tr_rec), metric_logits

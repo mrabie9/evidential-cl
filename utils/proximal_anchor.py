@@ -271,19 +271,20 @@ def log_importance_summary(
     )
 
 
-def resolve_anchor_mode(args: object, default: str = "loss") -> str:
+def resolve_anchor_mode(args: object, default: str = "proximal") -> str:
     """Read ``anchor_mode`` off an ``args`` namespace, tolerating absence/None.
 
     Args:
         args: Parsed experiment arguments, or any object.
-        default: Mode to use when the attribute is missing or ``None``.
+        default: Mode to use when the attribute is missing or ``None``. Matches
+            the ``--anchor_mode`` parser default.
 
     Returns:
         A validated mode string.
 
     Usage:
         >>> resolve_anchor_mode(args)
-        'loss'
+        'proximal'
     """
     value: Optional[object] = getattr(args, "anchor_mode", None)
     if value is None:

@@ -13,12 +13,12 @@ repo's own rule is that paired effects here need n=9 before they are reported.
 
 import glob
 import os
-import re
 import sys
 from itertools import product
 
 import numpy as np
 from scipy import stats
+from results_txt import f1_stats
 
 REPO = "/home/lunet/wsmr11/repos/evidential-cl"
 BASE_DIR = os.path.join(REPO, "logs", "ablations", "cil", "res-er", "E0")
@@ -42,8 +42,8 @@ def _forward_zs(sd):
 def parse_seed(sd):
     txt = open(os.path.join(sd, "results.txt")).read()
     return (
-        float(re.search(r"Final F1:\s*([-\d.]+)", txt).group(1)),
-        float(re.search(r"Backward:\s*([-\d.]+)", txt).group(1)),
+        f1_stats(txt)["Final F1"],
+        f1_stats(txt)["Backward"],
         _forward_zs(sd),
     )
 

@@ -28,13 +28,30 @@ def task_changes(result_t):
     return n_tasks, changes
 
 
-def confusion_matrix(result_t, result_a, log_dir, fname=None, metric_name="Accuracy"):
+def transfer_stats(result_t, result_a):
+    """Reduce a per-round score matrix to one row per task and derive transfer stats.
+
+    The eval log has one row per evaluation round, so a task can own several
+    rows. Only the last row of each task is kept, giving a T x T matrix whose
+    row ``t`` holds the score on every task right after training task ``t``.
+
+    Args:
+        result_t: 1D tensor of task ids, one entry per evaluation round.
+        result_a: 2D tensor (rounds x tasks) of per-task scores.
+
+    Returns:
+        Tuple ``(baseline, reduced, diag, final, bwt, fwt)``: the first-round
+        row, the T x T matrix, and per-task tensors for the diagonal, the last
+        row, backward transfer (last row minus diagonal) and forward transfer.
+
+    Usage:
+        baseline, reduced, diag, final, bwt, fwt = transfer_stats(val_t, val_a)
+    """
     nt, changes = task_changes(result_t)
-    fname = os.path.join(log_dir, fname)
 
     baseline = result_a[0]
     changes = torch.LongTensor(changes + [result_a.size(0)]) - 1
-    result = result_a[(torch.LongTensor(changes))]
+    result = result_a[changes]
 
     # acc[t] equals result[t,t]
     acc = result.diag()
@@ -47,8 +64,59 @@ def confusion_matrix(result_t, result_a, log_dir, fname=None, metric_name="Accur
     for t in range(1, nt):
         fwt[t] = result[t - 1, t] - baseline[t]
 
+    return baseline, result, acc, fin, bwt, fwt
+
+
+def append_metric_block(path, title, result_t, result_a):
+    """Append one metric's task matrix and transfer stats to ``results.txt``.
+
+    Args:
+        path: File to append to.
+        title: Metric name used in the header and stat labels, e.g. ``"F1"``.
+        result_t: 1D tensor of task ids, one entry per evaluation round.
+        result_a: 2D tensor (rounds x tasks) of per-task scores for this metric.
+
+    Returns:
+        Dict with float ``diag``, ``final``, ``bwt`` and ``fwt`` means, or
+        ``None`` when the matrix is empty or does not line up with ``result_t``.
+
+    Usage:
+        stats = append_metric_block(results_path, "F1", val_t, val_f1)
+    """
+    if result_a.numel() == 0 or result_a.size(0) != result_t.numel():
+        return None
+    baseline, result, acc, fin, bwt, fwt = transfer_stats(result_t, result_a)
+    stats = {
+        "diag": float(acc.mean()),
+        "final": float(fin.mean()),
+        "bwt": float(bwt.mean()),
+        "fwt": float(fwt.mean()),
+    }
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            print("", file=f)
+            print(
+                "{} (per-task macro, rows = after training task t):".format(title),
+                file=f,
+            )
+            print(" ".join(["%.4f" % r for r in baseline]), file=f)
+            print("|", file=f)
+            for row in range(result.size(0)):
+                print(" ".join(["%.4f" % r for r in result[row]]), file=f)
+            print("Diagonal %s: %.4f" % (title, stats["diag"]), file=f)
+            print("Final %s: %.4f" % (title, stats["final"]), file=f)
+            print("Backward %s: %.4f" % (title, stats["bwt"]), file=f)
+            print("Forward %s: %.4f" % (title, stats["fwt"]), file=f)
+    except OSError:
+        pass
+    return stats
+
+
+def confusion_matrix(result_t, result_a, log_dir, fname=None, metric_name="Accuracy"):
+    baseline, result, acc, fin, bwt, fwt = transfer_stats(result_t, result_a)
+
     if fname is not None:
-        f = open(fname, "w")
+        f = open(os.path.join(log_dir, fname), "w")
 
         print(" ".join(["%.4f" % r for r in baseline]), file=f)
         print("|", file=f)

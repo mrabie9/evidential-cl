@@ -14,17 +14,25 @@ if ROOT not in sys.path:
 from main import _split_eval_output
 
 
-def test_five_tuple_from_eval_class_tasks_yields_list_as_cls_only() -> None:
-    """``eval_class_tasks`` returns the same shape as ``eval_tasks`` (5-tuple)."""
-    cls_list, prec, f1, det, fa = _split_eval_output(
-        ([0.18, 0.2045], None, None, None, None)
+def test_three_tuple_from_eval_tasks_is_unpacked_in_order() -> None:
+    """``eval_tasks`` / ``eval_class_tasks`` both return a fixed 3-tuple."""
+    macro_rec, macro_prec, macro_f1 = _split_eval_output(
+        ([0.18, 0.2045], [0.31, 0.33], [0.22, 0.26])
     )
-    assert cls_list == [0.18, 0.2045]
-    assert prec is None and f1 is None and det is None and fa is None
+    assert macro_rec == [0.18, 0.2045]
+    assert macro_prec == [0.31, 0.33]
+    assert macro_f1 == [0.22, 0.26]
 
 
-def test_len_two_list_still_misinterpreted_documented() -> None:
-    """Bare length-2 list is ambiguous; callers must wrap as 5-tuple."""
-    cls_or_scalar, _, _, det_guess, _ = _split_eval_output([0.18, 0.20])
-    assert cls_or_scalar == 0.18
-    assert det_guess == 0.20
+def test_three_tuple_tolerates_missing_precision_and_f1() -> None:
+    """Evaluators may report recall only; the other two come back as ``None``."""
+    macro_rec, macro_prec, macro_f1 = _split_eval_output(([0.18, 0.2045], None, None))
+    assert macro_rec == [0.18, 0.2045]
+    assert macro_prec is None and macro_f1 is None
+
+
+def test_bare_per_task_list_is_treated_as_recall_only() -> None:
+    """A bare list is per-task recall, never a packed metric tuple."""
+    macro_rec, macro_prec, macro_f1 = _split_eval_output([0.18, 0.20])
+    assert macro_rec == [0.18, 0.20]
+    assert macro_prec is None and macro_f1 is None

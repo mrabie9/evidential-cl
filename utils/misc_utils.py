@@ -168,7 +168,6 @@ def apply_task_incremental_logit_mask(
     n_outputs: int,
     *,
     cil_all_seen_upto_task: int | None = None,
-    global_noise_label: int | None = None,
     fill_value: float = -1e9,
     loader: str | None = None,
 ) -> torch.Tensor:
@@ -177,12 +176,9 @@ def apply_task_incremental_logit_mask(
     **Task-incremental (TIL) inference:** only the logit block for ``task_index``
     is left active; past and future classes are masked.
 
-    **CIL evaluation (``cil_all_seen_upto_task`` set):** all **signal** classes
-    introduced in tasks ``0..cil_all_seen_upto_task`` (inclusive) stay active;
-    only *future* signal logits are masked. If ``global_noise_label`` is set
-    (shared IQ noise class), that index stays **unmasked** so the head can
-    predict noise jointly with seen classes; otherwise a naive mask
-    ``[:, offset2:]`` would zero the noise logit and break detection metrics.
+    **CIL evaluation (``cil_all_seen_upto_task`` set):** all classes introduced
+    in tasks ``0..cil_all_seen_upto_task`` (inclusive) stay active; only future
+    logits are masked.
 
     If ``loader`` is ``"task_incremental_loader"`` (or any value other than
     ``"class_incremental_loader"``), ``cil_all_seen_upto_task`` is ignored and
@@ -197,9 +193,6 @@ def apply_task_incremental_logit_mask(
         n_outputs: Logit width (truncate mask at this index).
         cil_all_seen_upto_task: If not ``None`` (after ``loader`` resolution),
             cumulative CIL mask through this task index (inclusive).
-        global_noise_label: Optional global noise class index (not counted in
-            ``nc_per_task`` / ``compute_offsets``). When set, future-signal mask
-            is ``[offset2:noise)`` and ``(noise:]`` instead of ``[offset2:]``.
         fill_value: Mask fill value (large negative logit).
         loader: Optional ``args.loader`` string; when set and not the CIL loader,
             forces TIL masking regardless of ``cil_all_seen_upto_task``.
@@ -221,14 +214,7 @@ def apply_task_incremental_logit_mask(
     )
     if effective_cil is not None:
         _, offset2 = compute_offsets(effective_cil, nc_per_task)
-        if global_noise_label is not None and 0 <= int(global_noise_label) < n_outputs:
-            gnoise = int(global_noise_label)
-            if offset2 < gnoise:
-                masked[:, offset2:gnoise].fill_(fill_value)
-            tail = gnoise + 1
-            if tail < n_outputs:
-                masked[:, tail:].fill_(fill_value)
-        elif offset2 < n_outputs:
+        if offset2 < n_outputs:
             masked[:, offset2:].fill_(fill_value)
         return masked
     offset1, offset2 = compute_offsets(task_index, nc_per_task)
@@ -236,10 +222,65 @@ def apply_task_incremental_logit_mask(
         masked[:, :offset1].fill_(fill_value)
     if offset2 < n_outputs:
         masked[:, offset2:].fill_(fill_value)
-    if global_noise_label is not None:
-        gnoise = int(global_noise_label)
-        if 0 <= gnoise < n_outputs and (gnoise < offset1 or gnoise >= offset2):
-            masked[:, gnoise] = logits[:, gnoise]
+    return masked
+
+
+def mask_replay_logits(
+    logits: torch.Tensor,
+    sample_tasks: torch.Tensor,
+    current_task: int,
+    nc_per_task,
+    n_outputs: int,
+    *,
+    loader: str | None,
+    fill_value: float = -1e9,
+) -> torch.Tensor:
+    """Training-time logit mask for a batch whose rows may come from past tasks.
+
+    **CIL:** every row, replayed or not, sees all classes of tasks
+    ``0..current_task``. Bounding a replayed row by its *own* task instead
+    never pushes it away from classes introduced later, while current-task
+    rows are pushed away from every old class; the model then learns to
+    predict only the newest task (old-task CIL recall ~0).
+
+    **TIL:** each row sees only its own task's class block.
+
+    Args:
+        logits: Unmasked logits ``(batch, n_classes)``.
+        sample_tasks: Task id per row, shape ``(batch,)``.
+        current_task: Task currently being trained (CIL bound).
+        nc_per_task: Per-task class counts or scalar (see :func:`compute_offsets`).
+        n_outputs: Logit width.
+        loader: ``args.loader``; only ``"class_incremental_loader"`` selects CIL.
+        fill_value: Value written into masked logits.
+
+    Returns:
+        Masked logits (clone); targets stay global class indices.
+
+    Usage:
+        logits = mask_replay_logits(raw, bt, t, [5, 6], 11, loader=args.loader)
+    """
+    if loader == "class_incremental_loader":
+        return apply_task_incremental_logit_mask(
+            logits,
+            int(current_task),
+            nc_per_task,
+            n_outputs,
+            cil_all_seen_upto_task=int(current_task),
+            fill_value=fill_value,
+            loader=loader,
+        )
+    masked = logits.clone()
+    for task_id in torch.unique(sample_tasks).tolist():
+        rows = sample_tasks == int(task_id)
+        masked[rows] = apply_task_incremental_logit_mask(
+            logits[rows],
+            int(task_id),
+            nc_per_task,
+            n_outputs,
+            fill_value=fill_value,
+            loader=loader,
+        )
     return masked
 
 
@@ -276,7 +317,7 @@ def get_date():
 
 
 def get_date_time():
-    return datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")[:-2]
+    return datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
 
 def log_dir(opt, timestamp=None, config_name=None):
@@ -285,16 +326,16 @@ def log_dir(opt, timestamp=None, config_name=None):
 
     rand_num = str(random.randint(1, 1001))
     dir_name = config_name if config_name else opt.model
-    logdir = opt.log_dir + "/%s/%s-%s/%s" % (
+    logdir = opt.log_dir + "/%s/%s_%s/%s" % (
         dir_name,
-        opt.expt_name,
         timestamp,
+        opt.expt_name,
         opt.seed,
     )
-    tfdir = opt.log_dir + "/%s/%s-%s/%s/%s" % (
+    tfdir = opt.log_dir + "/%s/%s_%s/%s/%s" % (
         dir_name,
-        opt.expt_name,
         timestamp,
+        opt.expt_name,
         opt.seed,
         "tfdir",
     )
@@ -323,6 +364,44 @@ def find_latest_checkpoint(folder_path):
     print("latest checkpoint is:")
     print(files[0])
     return files[0]
+
+
+def resolve_task_order_seed(args) -> int:
+    """Resolve the effective task-order seed and record where it came from.
+
+    Task presentation order is permuted with its own RNG stream, seeded either by
+    the training seed (the default, so that varying ``--seed`` varies task order
+    too) or by an explicit ``--task-order-seed``. Passing an explicit value keeps
+    the order fixed while ``--seed`` varies, which is how the two effects are
+    isolated from one another.
+
+    Must be called before :func:`log_dir`, which snapshots ``vars(args)`` into
+    ``training_parameters.json``.
+
+    Args:
+        args: Parsed argument namespace. ``args.task_order_seed`` is replaced by
+            the resolved integer and ``args.task_order_seed_source`` is set to
+            ``"seed"`` or ``"explicit"``.
+
+    Returns:
+        The resolved task-order seed.
+
+    Usage:
+        >>> import argparse
+        >>> args = argparse.Namespace(seed=39, task_order_seed=None)
+        >>> resolve_task_order_seed(args)
+        39
+        >>> args.task_order_seed_source
+        'seed'
+    """
+    raw = getattr(args, "task_order_seed", None)
+    if raw is None or (isinstance(raw, str) and len(raw.strip()) == 0):
+        args.task_order_seed = int(args.seed)
+        args.task_order_seed_source = "seed"
+    else:
+        args.task_order_seed = int(raw)
+        args.task_order_seed_source = "explicit"
+    return args.task_order_seed
 
 
 def init_seed(seed):
@@ -435,3 +514,37 @@ def scale_learning_rate_for_batch_size(
         return float(base_lr)
     scale = float(batch_size) / float(reference_batch_size)
     return float(base_lr) * scale
+
+
+@torch.no_grad()
+def proximal_anchor_(
+    param: torch.Tensor,
+    anchor: torch.Tensor,
+    stiffness: torch.Tensor,
+    step_size: float,
+) -> torch.Tensor:
+    """Apply the closed-form proximal step for a quadratic anchor, in place.
+
+    Solves ``argmin_p ||p - param||^2 / (2 * step_size) + sum(stiffness / 2 * (p - anchor)^2)``,
+    i.e. ``p = (param + step_size * stiffness * anchor) / (1 + step_size * stiffness)``.
+    Unlike an explicit gradient step on the penalty, this never overshoots the
+    anchor, so it stays stable for any stiffness. Negative stiffness is clamped
+    to zero because the proximal operator is only defined for a convex penalty.
+
+    Args:
+        param: Parameter tensor already updated by the task-loss step.
+        anchor: Consolidated parameter values to pull towards.
+        stiffness: Per-element curvature ``k`` of the penalty ``k / 2 * (p - anchor)^2``.
+        step_size: Learning rate of the task-loss step.
+
+    Returns:
+        The penalty ``sum(k / 2 * (param - anchor)^2)`` evaluated before anchoring.
+
+    Usage:
+        penalty = proximal_anchor_(p, p_star, lamb * fisher, lr)
+    """
+    stiffness = stiffness.clamp(min=0)
+    penalty = 0.5 * (stiffness * (param - anchor).pow(2)).sum()
+    rate = step_size * stiffness
+    param.add_(rate * anchor).div_(1.0 + rate)
+    return penalty

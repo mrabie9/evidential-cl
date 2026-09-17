@@ -13,11 +13,11 @@ fractions on disk; reported in points (x100).
 import glob
 import json
 import os
-import re
 from itertools import product
 
 import numpy as np
 from scipy import stats
+from results_txt import f1_stats
 
 REPO = "/home/lunet/wsmr11/repos/evidential-cl"
 ABL = os.path.join(REPO, "logs", "ablations", "cil")
@@ -85,9 +85,10 @@ def parse_seed(run_dir, seed):
     """Return (f1_total, bwt, diag, pfa, fwt) in fractions for one seed."""
     sd = os.path.join(run_dir, str(seed))
     txt = open(os.path.join(sd, "results.txt")).read()
-    f1 = float(re.search(r"Final F1:\s*([-\d.]+)", txt).group(1))
-    bwt = float(re.search(r"Backward:\s*([-\d.]+)", txt).group(1))
-    diag = float(re.search(r"Diagonal F1:\s*([-\d.]+)", txt).group(1))
+    f1_values = f1_stats(txt)
+    f1 = f1_values["Final F1"]
+    bwt = f1_values["Backward"]
+    diag = f1_values["Diagonal F1"]
     pfa = np.nan
     smj = os.path.join(sd, "seed_metrics.json")
     if os.path.exists(smj):

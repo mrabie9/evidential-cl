@@ -9,7 +9,8 @@ Both files are expected to be JSON arrays of row dictionaries. The script is
 robust to common key variants used in this repository:
 - task index: ``task`` or ``task_index``
 - algorithm: ``algo``
-- metrics: ``f1_cls`` or ``zero_shot_f1_cls`` (and similar for rec/prec/det/pfa)
+- metrics: ``macro_f1`` / ``macro_rec`` / ``macro_prec`` (pre-removal spellings
+  such as ``f1_cls`` / ``zero_shot_f1_cls`` are still accepted)
 
 Usage:
     python scripts/plot_zero_shot_comparison.py \
@@ -55,8 +56,8 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--metric",
-        choices=("f1_cls", "rec_cls", "prec_cls", "det", "pfa", "total_f1_zs"),
-        default="f1_cls",
+        choices=("macro_f1", "macro_rec", "macro_prec", "total_macro_f1_zs"),
+        default="macro_f1",
         help="Metric to plot.",
     )
     parser.add_argument(
@@ -90,13 +91,27 @@ def _task_index(row: Row) -> int | None:
 
 
 def _metric_value(row: Row, metric_name: str) -> float:
+    # Each entry lists the current key first, then pre-removal spellings.
     key_map = {
-        "f1_cls": ("f1_cls", "zero_shot_f1_cls"),
-        "rec_cls": ("rec_cls", "zero_shot_rec_cls"),
-        "prec_cls": ("prec_cls", "zero_shot_prec_cls"),
-        "det": ("det", "zero_shot_det"),
-        "pfa": ("pfa", "zero_shot_pfa"),
-        "total_f1_zs": ("total_f1_zs", "zero_shot_total_f1_zs"),
+        "macro_f1": ("macro_f1", "zero_shot_macro_f1", "f1_cls", "zero_shot_f1_cls"),
+        "macro_rec": (
+            "macro_rec",
+            "zero_shot_macro_rec",
+            "rec_cls",
+            "zero_shot_rec_cls",
+        ),
+        "macro_prec": (
+            "macro_prec",
+            "zero_shot_macro_prec",
+            "prec_cls",
+            "zero_shot_prec_cls",
+        ),
+        "total_macro_f1_zs": (
+            "total_macro_f1_zs",
+            "zero_shot_total_macro_f1_zs",
+            "total_f1_zs",
+            "zero_shot_total_f1_zs",
+        ),
     }
     for key in key_map[metric_name]:
         if key in row:

@@ -18,6 +18,12 @@ class IncrementalLoader:
         seed=1,
     ):
         self._opt = opt
+        if getattr(opt, "task_order_seed", None) is not None:
+            print(
+                "[WARNING] multi_task_loader does not permute task presentation "
+                "order; --task-order-seed "
+                f"({opt.task_order_seed}) has no effect under this loader."
+            )
         dataset_name = opt.dataset
         validation_split = opt.validation
         self.increment = opt.increment

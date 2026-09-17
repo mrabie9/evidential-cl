@@ -31,9 +31,7 @@ def _make_args(loader: str, **overrides) -> object:
     o.classes_per_task = overrides.get("classes_per_task", [3, 3])
     o.nc_per_task_list = ""
     o.nc_per_task = None
-    o.noise_label = overrides.get("noise_label", None)
     o.class_weighted_ce = False
-    o.use_detector_arch = False
     o.use_iq_aug_features = False
     o.data_scaling = "none"
     o.iq_aug_feature_type = "power"
@@ -41,8 +39,6 @@ def _make_args(loader: str, **overrides) -> object:
     o.optimizer = "sgd"
     o.clipgrad = 100.0
     o.cls_lambda = 1.0
-    o.det_memories = 0
-    o.det_replay_batch = 64
     o.alpha_init = 1e-3
     o.loader = loader
     o.inner_steps = 1

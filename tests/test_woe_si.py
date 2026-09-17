@@ -40,9 +40,7 @@ def _make_args(loader: str, **overrides) -> object:
     o.classes_per_task = overrides.get("classes_per_task", [3, 3])
     o.nc_per_task_list = ""
     o.nc_per_task = None
-    o.noise_label = overrides.get("noise_label", None)
     o.class_weighted_ce = False
-    o.use_detector_arch = False
     o.use_iq_aug_features = False
     o.data_scaling = "none"
     o.iq_aug_feature_type = "power"
@@ -50,8 +48,6 @@ def _make_args(loader: str, **overrides) -> object:
     o.optimizer = "sgd"
     o.clipgrad = 100.0
     o.cls_lambda = 1.0
-    o.det_memories = 0
-    o.det_replay_batch = 64
     o.alpha_init = 1e-3
     o.loader = loader
     o.inner_steps = 1
@@ -854,14 +850,14 @@ def test_lwf_term_is_off_by_default() -> None:
     assert model.lwf_lambda == 0.0
     x = torch.randn(4, 2, 1024)
     assert (
-        float(model._lwf_distillation_loss(model.net.forward_heads(x)[1], x, 1)) == 0.0
+        float(model._lwf_distillation_loss(model.net(x), x, 1)) == 0.0
     )
 
 
 def test_lwf_zero_before_a_teacher_exists() -> None:
     model = Net(1, 6, 2, _make_args("task_incremental_loader", woe_lwf_lambda=1.0))
     x = torch.randn(4, 2, 1024)
-    logits = model.net.forward_heads(x)[1]
+    logits = model.net(x)
     assert model.teacher is None
     assert float(model._lwf_distillation_loss(logits, x, 1).item()) == 0.0
 
@@ -882,7 +878,7 @@ def test_lwf_zero_against_an_identical_teacher() -> None:
     model.observe(x, torch.randint(0, 3, (6,)), 0)
     model._snapshot_teacher()
     torch.manual_seed(123)
-    logits = model.net.forward_heads(x, bn_training=True)[1]
+    logits = model.net(x, bn_training=True)
     torch.manual_seed(123)
     assert abs(float(model._lwf_distillation_loss(logits, x, 1).item())) < 1e-5
 
@@ -926,7 +922,7 @@ def test_lwf_positive_once_the_student_moves() -> None:
     model._snapshot_teacher()
     with torch.no_grad():
         model.net.model.fc.weight.mul_(3.0)
-    logits = model.net.forward_heads(x)[1]
+    logits = model.net(x)
     assert float(model._lwf_distillation_loss(logits, x, 1).item()) > 0.0
 
 

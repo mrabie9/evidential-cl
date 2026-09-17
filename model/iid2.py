@@ -3,12 +3,9 @@ import sys
 
 import torch
 
+from model.adab1n import adab1n_layers, end_task_all
 from model.resnet1d import ResNet1D
-from model.detection_replay import (
-    noise_label_from_args,
-    signal_mask_exclude_noise,
-    unpack_y_to_class_labels,
-)
+from model.replay_utils import unpack_y_to_class_labels
 from utils.training_metrics import macro_recall
 from utils import misc_utils
 from utils.class_weighted_loss import classification_cross_entropy
@@ -50,20 +47,27 @@ class IidConfig:
 
 
 class Net(torch.nn.Module):
-    """Plain ResNet1D classifier for non-lifelong (IID) experiments.
+    """Maximal-replay upper bound: plain ResNet1D trained on all data seen so far.
 
-    This model shares the same ``ResNet1D`` backbone as the other approaches
-    in the repository but **does not** implement any continual-learning
-    machinery (no task-wise offsets, no memory, no regularisers).
+    Runs through the ordinary continual schedule in ``main.life_experience``,
+    but ``cumulative_replay`` makes that loop train task ``t`` on the shuffled
+    union of the training sets of tasks ``0..t``. There is no other
+    continual-learning machinery (no memory budget, no regularisers).
 
-    The ``t`` argument is accepted for API compatibility with the training
-    loops but is ignored during the forward pass and optimisation.
+    Logits are masked the same way as the other baselines: under the
+    task-incremental loader each training row only competes within its own
+    task's class block (derived from its global label, since batches mix
+    tasks) and inference masks to task ``t``; under the class-incremental
+    loader every class seen up to task ``t`` stays active.
 
     Usage:
         model = Net(n_inputs, n_outputs, n_tasks, args)
-        logits = model(x, t)          # t is ignored
-        loss, rec = model.observe(x, y, t)
+        logits = model(x, t)
+        loss, rec, logits = model.observe(x, y, t)
     """
+
+    # Read by ``main.life_experience``: train each task on tasks 0..t combined.
+    cumulative_replay = True
 
     def __init__(
         self, n_inputs: int, n_outputs: int, n_tasks: int, args: object
@@ -86,8 +90,16 @@ class Net(torch.nn.Module):
             classes_per_task=getattr(args, "classes_per_task", None),
         )
         self.nc_per_task = misc_utils.max_task_class_count(self.classes_per_task)
-        self.noise_label: int | None = noise_label_from_args(args)
         self.incremental_loader_name = getattr(args, "loader", None)
+        # Global label -> owning task, for per-row TIL masking of mixed batches.
+        self.register_buffer(
+            "_label_to_task",
+            torch.repeat_interleave(
+                torch.arange(len(self.classes_per_task)),
+                torch.as_tensor(self.classes_per_task, dtype=torch.long),
+            ),
+            persistent=False,
+        )
 
         if self.cfg.arch != "resnet1d":
             raise ValueError(
@@ -100,31 +112,61 @@ class Net(torch.nn.Module):
         # Optimiser and loss.
         self.opt = torch.optim.SGD(self.parameters(), lr=self.cfg.lr, momentum=0.9)
 
+        # Empty unless --norm_type adab1n. No per-row task counts are set, so
+        # AdaB1N's cross-task reweighting stays off even though batches mix
+        # tasks, and the layer reduces to BatchNorm1d with a kappa-scheduled
+        # running-stat momentum; only the task counter is advanced, which keeps
+        # this a clean control arm.
+        self._adab1n = adab1n_layers(self.net)
+        self._steps_since_boundary = 0
+
     def forward(
         self,
         x: torch.Tensor,
         t: torch.Tensor | int,
         **kwargs,
     ) -> torch.Tensor:  # pragma: no cover - thin wrapper
-        """Return logits for all classes; ``t`` is ignored except for API parity.
+        """Return masked logits for task ``t``.
 
-        For class-incremental evaluation, ``cil_all_seen_upto_task`` masks logits
-        for classes not yet introduced (standard CIL protocol).
+        TIL masks to task ``t``'s class block; for class-incremental evaluation
+        ``cil_all_seen_upto_task`` keeps every class introduced so far.
         """
-        del t
-        logits = self.net(x)
-        cil = kwargs.get("cil_all_seen_upto_task")
-        if cil is None:
-            return logits
         return misc_utils.apply_task_incremental_logit_mask(
-            logits,
-            0,
+            self.net(x),
+            int(t),
             self.classes_per_task,
             self.n_outputs,
-            cil_all_seen_upto_task=cil,
-            global_noise_label=self.noise_label,
+            cil_all_seen_upto_task=kwargs.get("cil_all_seen_upto_task"),
             loader=self.incremental_loader_name,
         )
+
+    def _mask_training_logits(
+        self, logits: torch.Tensor, targets: torch.Tensor, t: int
+    ) -> torch.Tensor:
+        """Mask training logits for a batch drawn from tasks ``0..t``.
+
+        Args:
+            logits: Unmasked logits ``(batch, n_outputs)``.
+            targets: Global class labels for each row.
+            t: Task currently being trained.
+
+        Returns:
+            Logits where, under CIL, classes after task ``t`` are masked and,
+            otherwise (TIL), each row keeps only its own task's class block.
+        """
+        if self.incremental_loader_name == "class_incremental_loader":
+            return misc_utils.apply_task_incremental_logit_mask(
+                logits,
+                t,
+                self.classes_per_task,
+                self.n_outputs,
+                cil_all_seen_upto_task=t,
+                loader=self.incremental_loader_name,
+            )
+        row_tasks = self._label_to_task[targets]
+        col_tasks = self._label_to_task[: logits.size(1)]
+        own_block = row_tasks.unsqueeze(1) == col_tasks.unsqueeze(0)
+        return logits.masked_fill(~own_block, -1e9)
 
     def observe(
         self,
@@ -132,29 +174,27 @@ class Net(torch.nn.Module):
         y: torch.Tensor,
         t: torch.Tensor | int,
     ) -> tuple[float, float, torch.Tensor | None]:
-        """Perform a single SGD step on IID data.
+        """Perform SGD step(s) on a batch drawn from tasks ``0..t``.
 
         Args:
             x: Input batch.
-            y: Ground-truth class labels (0..n_outputs-1).
-            t: Task index (ignored; present only for interface compatibility).
+            y: Ground-truth global class labels (0..n_outputs-1).
+            t: Task currently being trained; batches may contain earlier tasks.
 
         Returns:
-            Tuple of (loss_value, training_recall).
+            Tuple of (loss_value, training_recall, masked_logits).
 
         Usage:
-            loss, rec = model.observe(x, y, t)
+            loss, rec, logits = model.observe(x, y, t)
         """
-        del t
-
+        self._steps_since_boundary += 1
         self.train()
         metric_logits = None
+        targets = unpack_y_to_class_labels(y).long()
         for _ in range(self.cfg.inner_steps):
             self.opt.zero_grad()
 
-            logits = self.net(x)
-            targets = unpack_y_to_class_labels(y).long()
-            signal_mask = signal_mask_exclude_noise(targets, self.noise_label)
+            logits = self._mask_training_logits(self.net(x), targets, int(t))
             loss_tensor = classification_cross_entropy(
                 logits,
                 targets,
@@ -166,15 +206,22 @@ class Net(torch.nn.Module):
 
             with torch.no_grad():
                 preds = torch.argmax(logits, dim=1)
-                if signal_mask.any():
-                    cls_tr_rec = macro_recall(
-                        preds[signal_mask].detach().cpu(),
-                        targets[signal_mask].detach().cpu(),
-                    )
-                else:
-                    cls_tr_rec = 0.0
-
+                cls_tr_rec = macro_recall(
+                    preds.detach().cpu(),
+                    targets.detach().cpu(),
+                )
         return float(loss_tensor.item()), float(cls_tr_rec), metric_logits
+
+    def finalize_task_after_training(self, train_loader=None) -> None:
+        """Advance AdaB1N's task counter at the end of a task (no-op otherwise).
+
+        Idempotent: a repeat call with no training in between does nothing, since
+        double-advancing would misalign later batches' task metadata.
+        """
+        if not self._adab1n or self._steps_since_boundary == 0:
+            return
+        end_task_all(self._adab1n)
+        self._steps_since_boundary = 0
 
 
 __all__ = ["Net"]

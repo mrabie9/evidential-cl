@@ -21,13 +21,11 @@ import numpy as np
 import quadprog
 
 from model.resnet1d import ResNet1D
-from model.detection_replay import (
-    DetectionReplayMixin,
-    classification_loss_zero_stub,
-    noise_label_from_args,
-    signal_mask_exclude_noise,
+from model.replay_utils import (
+    ReplayInputMixin,
     unpack_y_to_class_labels,
 )
+from model.task_bn import frozen_running_stats
 from utils.training_metrics import macro_recall
 from utils import misc_utils
 from utils.class_weighted_loss import classification_cross_entropy
@@ -35,7 +33,7 @@ from utils.class_weighted_loss import classification_cross_entropy
 
 @dataclass
 class GemConfig:
-    memory_strength: float = 0.0  # lambda in the paper
+    gamma: float = 0.0  # margin added to the dual QP constraint (gamma in the paper)
     gem_disable_qp: bool = False  # ablation: skip QP projection + replay-gradient pass
     gem_replay: bool = False  # add ER-style replay CE on buffer samples to the loss
     gem_replay_lambda: float = 1.0  # weight of the replay CE term
@@ -48,19 +46,20 @@ class GemConfig:
     dataset: str = "tinyimagenet"
     cuda: bool = True
     alpha_init: float = 1e-3
-    grad_clip_norm: Optional[float] = 100.0
+    grad_clip_norm: Optional[float] = 0.0
     input_channels: int = 2
-    det_lambda: float = 1.0
     cls_lambda: float = 1.0
-    det_memories: int = 2000
-    det_replay_batch: int = 64
 
     @staticmethod
     def from_args(args: object) -> "GemConfig":
         cfg = GemConfig()
         for field in cfg.__dataclass_fields__:
-            if hasattr(args, field):
-                setattr(cfg, field, getattr(args, field))
+            # `None` means "not set on args" (the parser registers `gamma`, which
+            # HAT and MER share, with a None default), so the dataclass default
+            # stands.
+            value = getattr(args, field, None)
+            if value is not None:
+                setattr(cfg, field, value)
         return cfg
 
 
@@ -120,25 +119,38 @@ def project2cone2(gradient, memories, margin=0.5, eps=1e-3):
     input:  gradient, p-vector
     input:  memories, (t * p)-vector
     output: x, p-vector
+
+    The O(parameters) algebra (building ``P``/``q`` and reconstructing the
+    update) runs on ``gradient``'s device in float64, matching the original
+    NumPy double precision. Only the tiny ``t x t`` QP is shipped to quadprog
+    on CPU, so the parameter-sized buffer never crosses the host<->device
+    boundary -- avoiding a per-step sync that dominates on large models.
     """
-    memories_np = memories.cpu().t().double().numpy()
-    gradient_np = gradient.cpu().contiguous().view(-1).double().numpy()
-    t = memories_np.shape[0]
-    P = np.dot(memories_np, memories_np.transpose())
-    P = 0.5 * (P + P.transpose()) + np.eye(t) * eps
-    q = np.dot(memories_np, gradient_np) * -1
+    memories_d = memories.to(dtype=torch.float64)  # (p, t)
+    gradient_d = gradient.contiguous().view(-1).to(dtype=torch.float64)  # (p,)
+    t = memories_d.size(1)
+
+    P = memories_d.t().mm(memories_d)  # (t, t)
+    P = 0.5 * (P + P.t()) + torch.eye(t, dtype=P.dtype, device=P.device) * eps
+    q = memories_d.t().mv(gradient_d).neg()  # (t,)
+
+    # Solve the t x t dual QP on CPU (quadprog is CPU-only); t is tiny.
+    P_np = P.cpu().numpy()
+    q_np = q.cpu().numpy()
     G = np.eye(t)
     h = np.zeros(t) + margin
-    v = quadprog.solve_qp(P, q, G, h)[0]
-    x = np.dot(v, memories_np) + gradient_np
-    gradient.copy_(torch.Tensor(x).view(-1, 1))
+    v = quadprog.solve_qp(P_np, q_np, G, h)[0]
+
+    v_d = torch.as_tensor(v, dtype=memories_d.dtype, device=memories_d.device)
+    x = memories_d.mv(v_d) + gradient_d  # (p,)
+    gradient.copy_(x.view(-1, 1))
 
 
-class Net(DetectionReplayMixin, nn.Module):
+class Net(ReplayInputMixin, nn.Module):
     def __init__(self, n_inputs, n_outputs, n_tasks, args):
         super(Net, self).__init__()
         self.cfg = GemConfig.from_args(args)
-        self.margin = self.cfg.memory_strength
+        self.margin = self.cfg.gamma
         # Ablation toggle: when False, skip both the past-task replay-gradient pass and the
         # QP projection, reducing GEM to plain fine-tuning at matched buffer size.
         self.use_qp = not bool(self.cfg.gem_disable_qp)
@@ -160,18 +172,9 @@ class Net(DetectionReplayMixin, nn.Module):
         self.class_weighted_ce = bool(getattr(args, "class_weighted_ce", True))
         self.n_outputs = n_outputs
         self.inner_steps = self.cfg.inner_steps
-        self.det_lambda = float(self.cfg.det_lambda)
         self.cls_lambda = float(self.cfg.cls_lambda)
-        self._init_det_replay(
-            self.cfg.det_memories,
-            self.cfg.det_replay_batch,
-            enabled=bool(getattr(args, "use_detector_arch", False)),
-        )
 
         self.opt = optim.SGD(self._ll_params(), self.cfg.lr, momentum=0.9)
-        self.det_opt = optim.SGD(
-            self.net.det_head.parameters(), self.cfg.lr, momentum=0.9
-        )
 
         self.n_memories = int(self.cfg.n_memories)
         self.task_memory_capacities = self._build_task_memory_capacities(
@@ -239,7 +242,6 @@ class Net(DetectionReplayMixin, nn.Module):
             classes_per_task=getattr(args, "classes_per_task", None),
         )
         self.nc_per_task = misc_utils.max_task_class_count(self.classes_per_task)
-        self.noise_label: int | None = noise_label_from_args(args)
         self.incremental_loader_name = getattr(args, "loader", None)
 
         if self.gpu:
@@ -322,8 +324,6 @@ class Net(DetectionReplayMixin, nn.Module):
 
     def _ll_params(self):
         for name, param in self.net.named_parameters():
-            if name.startswith("det_head"):
-                continue
             yield param
 
     def forward(self, x, t, *, cil_all_seen_upto_task=None):
@@ -343,7 +343,6 @@ class Net(DetectionReplayMixin, nn.Module):
             self.classes_per_task,
             self.n_outputs,
             cil_all_seen_upto_task=cil_all_seen_upto_task,
-            global_noise_label=self.noise_label,
             fill_value=-10e10,
             loader=self.incremental_loader_name,
         )
@@ -383,7 +382,6 @@ class Net(DetectionReplayMixin, nn.Module):
                 self.classes_per_task,
                 self.n_outputs,
                 cil_all_seen_upto_task=int(task_id),
-                global_noise_label=self.noise_label,
                 fill_value=-10e10,
                 loader=self.incremental_loader_name,
             )
@@ -431,6 +429,59 @@ class Net(DetectionReplayMixin, nn.Module):
             self.task_mem_filled[task_id] = min(capacity, filled_before_update + effbsz)
         self.task_mem_ptr[task_id] = 0 if endcnt == capacity else endcnt
 
+    def _store_past_task_gradients(self, current_task: int) -> None:
+        """Backprop each previously observed task's memory and store its gradient.
+
+        Fills ``self.grads`` with one column per past task, which the GEM
+        projection below then constrains the current gradient against.
+
+        Under CIL the memory loss is scored over every class of tasks
+        ``0..current_task`` with global labels, the space the current batch is
+        trained in; scoring it on the past task's own block would never
+        constrain old samples against newer classes. Under TIL it is the past
+        task's own block, as before.
+
+        These forwards carry old-task data while the current task is active, so
+        the whole loop runs under :func:`~model.task_bn.frozen_running_stats`:
+        the replay batches are normalized with their own statistics but must not
+        be folded into the current task's per-task BatchNorm running statistics.
+        """
+        with frozen_running_stats(self):
+            for tt in range(len(self.observed_tasks) - 1):
+                self.zero_grad()
+                past_task = self.observed_tasks[tt]
+                offset1, offset2 = compute_offsets(
+                    past_task, self.classes_per_task, self.is_cifar
+                )
+                filled = int(self.task_mem_filled[past_task].item())
+                if filled == 0:
+                    continue  # nothing stored for this task yet
+
+                # replay batch (shape already in memory)
+                mem_x = Variable(
+                    self.memory_data[past_task, :filled]
+                )  # (mem, F) or (mem, 2, L)
+                mem_y_flat = self.memory_labs[past_task, :filled]
+                if self.incremental_loader_name == "class_incremental_loader":
+                    logits_replay = self.forward(
+                        mem_x, current_task, cil_all_seen_upto_task=current_task
+                    )
+                    targets_replay = mem_y_flat
+                else:
+                    logits_replay = self.forward(mem_x, past_task)[:, offset1:offset2]
+                    targets_replay = mem_y_flat - offset1
+                ptloss = classification_cross_entropy(
+                    logits_replay,
+                    targets_replay,
+                    class_weighted_ce=self.class_weighted_ce,
+                )
+                ptloss.backward()
+                if self.cfg.grad_clip_norm:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.net.parameters(), self.cfg.grad_clip_norm
+                    )
+                store_grad(self._ll_params, self.grads, self.grad_dims, past_task)
+
     def observe(self, x, y, t):
         """
         One optimization step on batch (x,y,t), with GEM constraints and inner_steps.
@@ -443,38 +494,6 @@ class Net(DetectionReplayMixin, nn.Module):
             # legacy: flatten non-IQ inputs
             x = x.view(x.size(0), -1)
         y_work = unpack_y_to_class_labels(y)
-        # noise_label = None
-        # if class_counts is not None:
-        #     _, offset2 = misc_utils.compute_offsets(t, class_counts)
-        #     noise_label = offset2 - 1
-        # y_cls, y_det = self._unpack_labels(
-        #     y,
-        #     noise_label=noise_label,
-        #     use_detector_arch=bool(getattr(self, "det_enabled", False)),
-        # )
-        # if y_det is not None and self.det_memories > 0:
-        #     self._update_det_memory(x, y_det)
-        # x_det = x
-        # signal_mask = (y_det == 1) & (y_cls >= 0)
-        # if not signal_mask.any():
-        #     if not getattr(self, "det_enabled", True):
-        #         return 0.0, 0.0
-        #     self.det_opt.zero_grad()
-        #     det_logits, _ = self.net.forward_heads(x_det)
-        #     det_loss = self.det_loss(det_logits, y_det.float())
-        #     det_replay = self._sample_det_memory()
-        #     if det_replay is not None:
-        #         mem_x, mem_y = det_replay
-        #         mem_det_logits, _ = self.net.forward_heads(mem_x)
-        #         mem_loss = self.det_loss(mem_det_logits, mem_y.float())
-        #         det_loss = 0.5 * (det_loss + mem_loss)
-        #     det_loss = self.det_lambda * det_loss
-        #     det_loss.backward()
-        #     self.det_opt.step()
-        #     return float(det_loss.item()), 0.0
-
-        # x = x[signal_mask]
-        # y = y_cls[signal_mask]
 
         # track tasks
         if t != self.old_task:
@@ -492,57 +511,14 @@ class Net(DetectionReplayMixin, nn.Module):
 
             # gradients on past tasks (replay)
             if self.use_qp and len(self.observed_tasks) > 1:
-                for tt in range(len(self.observed_tasks) - 1):
-                    self.zero_grad()
-                    past_task = self.observed_tasks[tt]
-                    offset1, offset2 = compute_offsets(
-                        past_task, self.classes_per_task, self.is_cifar
-                    )
-                    filled = int(self.task_mem_filled[past_task].item())
-                    if filled == 0:
-                        continue  # nothing stored for this task yet
-
-                    # replay batch (shape already in memory)
-                    mem_x = Variable(
-                        self.memory_data[past_task, :filled]
-                    )  # (mem, F) or (mem, 2, L)
-                    mem_y_flat = self.memory_labs[past_task, :filled]
-                    replay_mask = signal_mask_exclude_noise(
-                        mem_y_flat, self.noise_label
-                    )
-                    if replay_mask.any():
-                        mem_x_sub = mem_x[replay_mask]
-                        logits_replay = self.forward(mem_x_sub, past_task)[
-                            :, offset1:offset2
-                        ]
-                        targets_replay = mem_y_flat[replay_mask] - offset1
-                        ptloss = classification_cross_entropy(
-                            logits_replay,
-                            targets_replay,
-                            class_weighted_ce=self.class_weighted_ce,
-                        )
-                    else:
-                        logits_replay = self.forward(mem_x[:1], past_task)[
-                            :, offset1:offset2
-                        ]
-                        ptloss = classification_loss_zero_stub(logits_replay)
-                    ptloss.backward()
-                    if self.cfg.grad_clip_norm:
-                        torch.nn.utils.clip_grad_norm_(
-                            self.net.parameters(), self.cfg.grad_clip_norm
-                        )
-                    store_grad(self._ll_params, self.grads, self.grad_dims, past_task)
+                self._store_past_task_gradients(t)
 
             # current batch
             self.zero_grad()
             logits_full = self.forward(x, t, cil_all_seen_upto_task=t)
             targets = y_work.long()
-            signal_mask = signal_mask_exclude_noise(y_work, self.noise_label)
-            if signal_mask.any():
-                preds = torch.argmax(logits_full[signal_mask], dim=1)
-                cls_tr_rec.append(macro_recall(preds, targets[signal_mask]))
-            else:
-                cls_tr_rec.append(0.0)
+            preds = torch.argmax(logits_full, dim=1)
+            cls_tr_rec.append(macro_recall(preds, targets))
             loss = classification_cross_entropy(
                 logits_full, targets, class_weighted_ce=self.class_weighted_ce
             )
@@ -582,18 +558,5 @@ class Net(DetectionReplayMixin, nn.Module):
 
             self.opt.step()
             metric_logits = logits_full.detach()
-        # if getattr(self, "det_enabled", True):
-        #     self.det_opt.zero_grad()
-        #     det_logits, _ = self.net.forward_heads(x_det)
-        #     det_loss = self.det_loss(det_logits, y_det.float())
-        #     det_replay = self._sample_det_memory()
-        #     if det_replay is not None:
-        #         mem_x, mem_y = det_replay
-        #         mem_det_logits, _ = self.net.forward_heads(mem_x)
-        #         mem_loss = self.det_loss(mem_det_logits, mem_y.float())
-        #         det_loss = 0.5 * (det_loss + mem_loss)
-        #     det_loss = self.det_lambda * det_loss
-        #     det_loss.backward()
-        #     self.det_opt.step()
         avg_cls_tr_rec = sum(cls_tr_rec) / len(cls_tr_rec) if cls_tr_rec else 0.0
         return loss.item(), avg_cls_tr_rec, metric_logits

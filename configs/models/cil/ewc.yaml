@@ -1,6 +1,3 @@
-# Model-specific overrides for ewc.
 model: ewc
 loader: class_incremental_loader
-
-lr: 0.001
-lamb: 1
+lamb: 10.0

@@ -1,7 +1,5 @@
-# Model-specific overrides for eralg4.
 model: eralg4
 loader: class_incremental_loader
 learn_lr: true
 meta_batches: 3
-
 opt_lr: 0.3

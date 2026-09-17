@@ -9,6 +9,12 @@ Typical usage:
     python scripts/plot_multi_algorithms_together_paper_subplots.py \
         --runs-dir logs/00_sync/one-shot_CIL \
         -o logs/00_sync/one-shot_CIL/plots
+
+    # Restrict to a subset of algorithms (still averaged across seeds)
+    python scripts/plot_multi_algorithms_together_paper_subplots.py \
+        --runs-dir logs/00_sync/one-shot_CIL \
+        --algo lwf,eralg4,cmaml \
+        -o plots/
 """
 
 from __future__ import annotations
@@ -21,6 +27,10 @@ from typing import Any, Dict, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.lines import Line2D
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from utils.metric_keys import first_present_key  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -29,16 +39,17 @@ LINESTYLES = ["-", "--", ":", "-.", (0, (5, 1))]
 LINEWIDTHS = [2.4, 1.8, 1.8, 1.5, 1.5]
 
 # Manual plot controls (set values to ``None`` to keep auto behavior).
-# Keys: train, final_validation, mean_val, average_forgetting
+# Keys: train, final_validation, mean_val, average_forgetting, val_per_task
 PANEL_YLIM_OVERRIDES: Dict[str, tuple[float, float] | None] = {
     "train": None,
     "final_validation": None,
     "mean_val": (0, 0.9),
-    "average_forgetting": (-0.8, 0.2),
+    "average_forgetting": (-0.7, 0.3),
+    "val_per_task": None,
 }
 
 # Manual legend ncol controls (set values to ``None`` to keep auto behavior).
-# Keys: train, final_validation, mean_val, average_forgetting
+# Keys: train, final_validation, mean_val, average_forgetting, val_per_task
 PANEL_LEGEND_NCOL_OVERRIDES: Dict[str, int | None] = {
     "train": None,
     "final_validation": None,
@@ -97,21 +108,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--train-metric",
         type=str,
-        choices=("total_f1", "cls_recall"),
-        default="cls_recall",
+        choices=("macro_f1", "macro_rec"),
+        default="macro_rec",
         help="Training metric used in the first panel (train vs step).",
     )
     parser.add_argument(
         "--val-metric",
         type=str,
-        choices=("total_f1", "cls_recall"),
-        default="total_f1",
+        choices=("macro_f1", "macro_rec"),
+        default="macro_f1",
         help="Validation metric used in mean-val and average-forgetting panels.",
     )
     parser.add_argument(
         "--include-iid2",
         action="store_true",
         help="Include iid2 runs (by default they are excluded for clarity).",
+    )
+    parser.add_argument(
+        "--algo",
+        action="append",
+        default=None,
+        help=(
+            "Restrict plotting to these algorithms. Repeatable and/or "
+            "comma-separated (example: --algo lwf,eralg4 --algo cmaml). "
+            "Defaults to every algorithm discovered under the run source."
+        ),
     )
     parser.add_argument(
         "--labels",
@@ -141,6 +162,12 @@ def parse_args() -> argparse.Namespace:
             "an additional FWT figure is generated using scripts/plot_fwt_metrics.py."
         ),
     )
+    parser.add_argument(
+        "--shade-std",
+        action="store_true",
+        default=False,
+        help="Shade ±1 std across seeds in multi-seed mode (off by default).",
+    )
     return parser.parse_args()
 
 
@@ -149,18 +176,25 @@ def _resolve_val_metric_for_run(choice: str, run: Any) -> tuple[str, str]:
 
     Mirrors the behavior in `plot_multi_algorithms.py`.
     """
-    if choice == "cls_recall":
-        return "val_acc", "Cls recall"
+    recall_key = next(
+        (k for task in run.tasks if (k := first_present_key(task, ["val_macro_rec"]))),
+        "val_macro_rec",
+    )
+    if choice == "macro_rec":
+        return recall_key, "Macro recall"
 
-    has_f1 = any("val_f1" in t for t in run.tasks)
-    if has_f1:
-        return "val_f1", "Total F1"
+    f1_key = next(
+        (k for task in run.tasks if (k := first_present_key(task, ["val_macro_f1"]))),
+        None,
+    )
+    if f1_key is not None:
+        return f1_key, "Macro F1"
 
     print(
-        f"[WARN] Requested val-metric=total_f1 but run '{run.name}' at {run.metrics_dir} "
-        "has no 'val_f1'; falling back to cls recall ('val_acc')."
+        f"[WARN] Requested val-metric=macro_f1 but run '{run.name}' at {run.metrics_dir} "
+        "has no macro-F1 key; falling back to macro recall."
     )
-    return "val_acc", "Cls recall"
+    return recall_key, "Macro recall"
 
 
 def _case_insensitive_detect_style(runs: Sequence[Any]) -> PlotStyle:
@@ -276,6 +310,170 @@ def _save_independent_figure(fig: plt.Figure, output_path: Path, dpi: int) -> No
     plt.close(fig)
 
 
+def _discover_all_metrics_dirs_per_algo(
+    saved_models_root: Path,
+) -> Dict[str, list[Path]]:
+    """Return all metrics directories grouped by algorithm name.
+
+    Expected layout: <saved_models_root>/<algo>/.../<seed>/metrics/task*.npz.
+    All qualifying metrics dirs are returned (not just the latest), enabling
+    per-algorithm seed aggregation.
+    """
+    result: Dict[str, list[Path]] = {}
+    if not saved_models_root.is_dir():
+        return result
+    for algo_dir in sorted(saved_models_root.iterdir()):
+        if not algo_dir.is_dir():
+            continue
+        dirs: list[Path] = []
+        for metrics_dir in sorted(algo_dir.rglob("metrics")):
+            if metrics_dir.is_dir() and any(metrics_dir.glob("task*.npz")):
+                dirs.append(metrics_dir.resolve())
+        if dirs:
+            result[algo_dir.name] = dirs
+    return result
+
+
+def _compute_val_metric_for_single_task(
+    tasks: Sequence[Any],
+    val_metric_key: str,
+    task_index: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Track one task's validation metric as later tasks are trained.
+
+    Args:
+        tasks: Per-checkpoint metric dictionaries for a single run, ordered by
+            the task that had just finished training.
+        val_metric_key: Validation metric key holding a per-task vector.
+        task_index: Zero-based index of the task to follow.
+
+    Returns:
+        Tuple ``(checkpoint_indices, values)`` covering checkpoints from
+        ``task_index`` onwards. Checkpoints missing the metric yield ``NaN``.
+
+    Usage:
+        >>> checkpoints, values = _compute_val_metric_for_single_task(
+        ...     tasks, "val_f1", task_index=0
+        ... )
+    """
+    checkpoint_indices: list[int] = []
+    values: list[float] = []
+    for checkpoint_index in range(task_index, len(tasks)):
+        metric_vector = tasks[checkpoint_index].get(val_metric_key)
+        checkpoint_indices.append(checkpoint_index)
+        if metric_vector is None or task_index >= len(metric_vector):
+            values.append(float("nan"))
+        else:
+            values.append(float(metric_vector[task_index]))
+    return (
+        np.asarray(checkpoint_indices, dtype=float),
+        np.asarray(values, dtype=float),
+    )
+
+
+def _metric_label_to_filename_token(metric_label: str) -> str:
+    """Convert a metric label into a hyphenated filename token.
+
+    Usage:
+        >>> _metric_label_to_filename_token("Total F1")
+        'Total-F1'
+    """
+    return re.sub(r"[^A-Za-z0-9]+", "-", metric_label).strip("-")
+
+
+def _parse_requested_algorithm_names(
+    algorithm_arguments: Sequence[str] | None,
+) -> list[str] | None:
+    """Normalise repeatable/comma-separated ``--algo`` values.
+
+    Args:
+        algorithm_arguments: Raw ``--algo`` values, or ``None`` when the flag
+            was not supplied.
+
+    Returns:
+        Lower-cased algorithm names in the order first requested, or ``None``
+        when no filtering was requested.
+
+    Usage:
+        >>> _parse_requested_algorithm_names(["lwf,eralg4", "cmaml"])
+        ['lwf', 'eralg4', 'cmaml']
+        >>> _parse_requested_algorithm_names(None) is None
+        True
+    """
+    if algorithm_arguments is None:
+        return None
+    requested_names: list[str] = []
+    for argument_value in algorithm_arguments:
+        for name in argument_value.split(","):
+            normalised_name = name.strip().lower()
+            if normalised_name and normalised_name not in requested_names:
+                requested_names.append(normalised_name)
+    return requested_names or None
+
+
+def _filter_runs_by_algorithm(
+    runs: Sequence[Any],
+    requested_algorithm_names: Sequence[str] | None,
+) -> list[Any]:
+    """Keep only the runs whose algorithm name was requested.
+
+    Args:
+        runs: Discovered runs, each exposing a ``name`` attribute.
+        requested_algorithm_names: Lower-cased names to keep, or ``None`` to
+            keep every run.
+
+    Returns:
+        The retained runs, in their original order.
+
+    Raises:
+        SystemExit: If a requested name matches no discovered run.
+
+    Usage:
+        >>> from types import SimpleNamespace
+        >>> discovered = [SimpleNamespace(name="lwf"), SimpleNamespace(name="gem")]
+        >>> [run.name for run in _filter_runs_by_algorithm(discovered, ["lwf"])]
+        ['lwf']
+    """
+    if requested_algorithm_names is None:
+        return list(runs)
+    discovered_names = {run.name.strip().lower() for run in runs}
+    missing_names = [
+        name for name in requested_algorithm_names if name not in discovered_names
+    ]
+    if missing_names:
+        raise SystemExit(
+            f"--algo requested {', '.join(missing_names)} but only "
+            f"{', '.join(sorted(discovered_names))} were discovered."
+        )
+    requested_name_set = set(requested_algorithm_names)
+    return [run for run in runs if run.name.strip().lower() in requested_name_set]
+
+
+def _aggregate_across_seeds(
+    seed_tasks_list: list[Any],
+    compute_fn: Any,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute mean and std of a per-task series across multiple seeds.
+
+    Returns (x, mean_y, std_y). Seeds with empty results are skipped.
+    x is taken from the first valid seed; all seeds are clipped to the
+    minimum length so that shapes align.
+    """
+    all_x: list[np.ndarray] = []
+    all_y: list[np.ndarray] = []
+    for tasks in seed_tasks_list:
+        x, y = compute_fn(tasks)
+        if x is None or (hasattr(x, "size") and x.size == 0):
+            continue
+        all_x.append(np.asarray(x, dtype=float))
+        all_y.append(np.asarray(y, dtype=float))
+    if not all_y:
+        return np.array([]), np.array([]), np.array([])
+    min_len = min(len(y) for y in all_y)
+    y_matrix = np.array([y[:min_len] for y in all_y], dtype=float)
+    return all_x[0][:min_len], np.nanmean(y_matrix, axis=0), np.nanstd(y_matrix, axis=0)
+
+
 def _build_experiment_prefix(run_source_dir: Path, runs: Sequence[Any]) -> str:
     """Build '<Multi/Single>-Epoch_<TIL/CIL>' prefix from run context."""
     experiment_path_parts = [str(run_source_dir)] + [
@@ -305,19 +503,56 @@ def _build_experiment_prefix(run_source_dir: Path, runs: Sequence[Any]) -> str:
     return f"{epoch_mode}-Epoch_{learning_setup}"
 
 
-def _candidate_fwt_json_paths(run_source_dir: Path) -> list[Path]:
-    """Build candidate fwt_metrics.json paths from the run source directory."""
-    candidates: list[Path] = []
-    candidates.append(run_source_dir / "fwt_metrics.json")
+FWT_JSON_FILENAMES: tuple[str, ...] = ("fwt_metrics.json", "fwt_metrics_A.json")
+FWT_SEARCH_PARENT_LEVELS: int = 3
 
-    source_parts = list(run_source_dir.parts)
-    if "00_sync" in source_parts:
-        sync_index = source_parts.index("00_sync")
-        full_experiment_parts = source_parts.copy()
-        full_experiment_parts[sync_index] = "full_experiments"
-        full_experiments_dir = Path(*full_experiment_parts)
-        candidates.append(full_experiments_dir / "fwt_metrics.json")
-        candidates.append(full_experiments_dir / "fwt_metrics_A.json")
+
+def _mirrored_full_experiments_dir(search_dir: Path) -> Path | None:
+    """Map a ``logs/00_sync/...`` directory onto its ``full_experiments`` twin.
+
+    Args:
+        search_dir: Directory that may live under a ``00_sync`` path segment.
+
+    Returns:
+        The equivalent directory with ``00_sync`` replaced by
+        ``full_experiments``, or ``None`` when the segment is absent.
+    """
+    search_parts = list(search_dir.parts)
+    if "00_sync" not in search_parts:
+        return None
+    search_parts[search_parts.index("00_sync")] = "full_experiments"
+    return Path(*search_parts)
+
+
+def _candidate_fwt_json_paths(run_source_dir: Path) -> list[Path]:
+    """Build candidate fwt_metrics.json paths from the run source directory.
+
+    The JSON is usually written at the experiment root (for example
+    ``logs/00_sync/one-shot_CIL/``) while ``--runs`` commonly points at the
+    nested ``saved_models`` directory, so parent directories are searched too.
+
+    Args:
+        run_source_dir: Directory the runs were discovered from.
+
+    Returns:
+        Candidate paths in priority order, nearest directory first.
+
+    Usage:
+        >>> paths = _candidate_fwt_json_paths(Path("logs/00_sync/cil/saved_models"))
+        >>> paths[0].name
+        'fwt_metrics.json'
+    """
+    search_dirs: list[Path] = [run_source_dir]
+    for parent_dir in list(run_source_dir.parents)[:FWT_SEARCH_PARENT_LEVELS]:
+        search_dirs.append(parent_dir)
+
+    candidates: list[Path] = []
+    for search_dir in search_dirs:
+        mirrored_dir = _mirrored_full_experiments_dir(search_dir)
+        for directory in (search_dir, mirrored_dir):
+            if directory is None:
+                continue
+            candidates.extend(directory / filename for filename in FWT_JSON_FILENAMES)
 
     return candidates
 
@@ -413,6 +648,8 @@ def main() -> None:
         _prepare_algo_runs,
         _resolve_train_x_axis_label,
         compute_average_forgetting,
+        get_task_color,
+        load_metrics as _load_task_metrics,
     )
     from scripts.plot_fwt_metrics import (
         ALGORITHM_DISPLAY_NAMES,
@@ -466,8 +703,12 @@ def main() -> None:
         run_index=args.run_index,
     )
 
+    requested_algorithm_names = _parse_requested_algorithm_names(args.algo)
     excluded_run_name_set = {"saved_models", "models", "plots", "figures"}
-    if not args.include_iid2:
+    iid2_requested_explicitly = (
+        requested_algorithm_names is not None and "iid2" in requested_algorithm_names
+    )
+    if not args.include_iid2 and not iid2_requested_explicitly:
         excluded_run_name_set.add("iid2")
     runs = [
         run for run in runs if run.name.strip().lower() not in excluded_run_name_set
@@ -477,11 +718,38 @@ def main() -> None:
             "No runs left after filtering wrapper directories/iid2. "
             "Pass --include-iid2 to include iid2."
         )
+    runs = _filter_runs_by_algorithm(runs, requested_algorithm_names)
     runs = sorted(runs, key=lambda run: group_sort_key(run.name))
 
     print("Algorithms and metrics directories:")
     for run in runs:
         print(f"  {run.name}: {run.metrics_dir}")
+
+    # Multi-seed: auto-detect if saved_models layout has >1 metrics dir per algo.
+    _saved_models_candidate = (
+        run_source_dir
+        if run_source_dir.name == "saved_models"
+        else run_source_dir / "saved_models"
+    )
+    _all_metrics_dirs = _discover_all_metrics_dirs_per_algo(_saved_models_candidate)
+    _active_algo_names = {run.name for run in runs}
+    _all_metrics_dirs = {
+        algo: dirs
+        for algo, dirs in _all_metrics_dirs.items()
+        if algo in _active_algo_names
+    }
+    is_multi_seed = any(len(dirs) > 1 for dirs in _all_metrics_dirs.values())
+    algo_seed_tasks: Dict[str, list[list[Any]]] = {}
+    if is_multi_seed:
+        for algo_name, dirs in _all_metrics_dirs.items():
+            algo_seed_tasks[algo_name] = [_load_task_metrics(d) for d in dirs]
+        print(
+            f"Multi-seed mode: found multiple seeds for "
+            f"{sum(1 for v in _all_metrics_dirs.values() if len(v) > 1)} algorithm(s)"
+        )
+        for algo, seed_tasks in algo_seed_tasks.items():
+            if len(seed_tasks) > 1:
+                print(f"  {algo}: {len(seed_tasks)} seeds")
 
     label_list: list[str] | None = None
     if args.labels is not None:
@@ -536,22 +804,63 @@ def main() -> None:
         run_label = run_labels[run_idx]
         if not run.tasks:
             continue
-        train_series, train_metric_label = _concat_train_metric_for_run(
+        _, train_metric_label = _concat_train_metric_for_run(
             run.tasks, args.train_metric
         )
-        if train_series is None:
-            continue
-        if args.train_metric == "total_f1":
-            x_values = np.arange(1, len(train_series) + 1)
-        else:
-            x_values = np.arange(len(train_series))
-        axis_train.plot(
-            x_values,
-            train_series,
-            label=run_label,
-            color=algorithm_colors.get(run.name, f"C{run_idx % 10}"),
-            **_line_style_for_index(algorithm_line_member_index.get(run.name, run_idx)),
+        run_color = algorithm_colors.get(run.name, f"C{run_idx % 10}")
+        line_style = _line_style_for_index(
+            algorithm_line_member_index.get(run.name, run_idx)
         )
+        seed_tasks_list = algo_seed_tasks.get(run.name, [run.tasks])
+        if len(seed_tasks_list) > 1:
+            _, mean_train, std_train = _aggregate_across_seeds(
+                seed_tasks_list,
+                lambda tasks: (
+                    (
+                        (
+                            np.arange(1, len(s) + 1)
+                            if args.train_metric == "macro_f1"
+                            else np.arange(len(s))
+                        ),
+                        s,
+                    )
+                    if (s := _concat_train_metric_for_run(tasks, args.train_metric)[0])
+                    is not None
+                    else (np.array([]), np.array([]))
+                ),
+            )
+            if mean_train.size == 0:
+                continue
+            x_values = (
+                np.arange(1, len(mean_train) + 1)
+                if args.train_metric == "macro_f1"
+                else np.arange(len(mean_train))
+            )
+            axis_train.plot(
+                x_values, mean_train, label=run_label, color=run_color, **line_style
+            )
+            if args.shade_std:
+                axis_train.fill_between(
+                    x_values,
+                    mean_train - std_train,
+                    mean_train + std_train,
+                    color=run_color,
+                    alpha=0.15,
+                )
+        else:
+            train_series, train_metric_label = _concat_train_metric_for_run(
+                seed_tasks_list[0], args.train_metric
+            )
+            if train_series is None:
+                continue
+            x_values = (
+                np.arange(1, len(train_series) + 1)
+                if args.train_metric == "macro_f1"
+                else np.arange(len(train_series))
+            )
+            axis_train.plot(
+                x_values, train_series, label=run_label, color=run_color, **line_style
+            )
     axis_train.set_ylabel(train_metric_label, fontsize=16)
     axis_train.set_xlabel(
         _resolve_train_x_axis_label(args.train_metric),
@@ -582,45 +891,44 @@ def main() -> None:
         dpi,
     )
 
-    # Figure 2: final validation metrics (bars for Pfa/Det/Cls recall).
+    # Figure 2: final validation metrics (bars for macro recall / macro F1).
     fig_final, axis_final = plt.subplots(figsize=figure_size, dpi=dpi)
     for run_idx, run in enumerate(runs):
         if not run.tasks:
             continue
-        last = run.tasks[-1]
-        mean_pfa = _mean_final_metric_for_run(last, "val_det_fa", len(run.tasks))
-        mean_det = _mean_final_metric_for_run(last, "val_det_acc", len(run.tasks))
-        mean_cls = _mean_final_metric_for_run(last, "val_acc", len(run.tasks))
+        seed_tasks_list = algo_seed_tasks.get(run.name, [run.tasks])
+
+        def _seed_final_metric(tasks: list[Any], key: str) -> float | None:
+            last = tasks[-1]
+            return _mean_final_metric_for_run(last, key, len(tasks))
+
+        def _mean_across_seeds(key: str) -> float | None:
+            vals = [_seed_final_metric(t, key) for t in seed_tasks_list]
+            vals = [v for v in vals if v is not None]
+            return float(np.mean(vals)) if vals else None
+
+        mean_rec = _mean_across_seeds("val_macro_rec")
+        mean_f1 = _mean_across_seeds("val_macro_f1")
 
         x_center = run_idx
-        width = 0.2
-        if mean_pfa is not None:
+        width = 0.3
+        if mean_rec is not None:
             axis_final.bar(
-                x_center - width,
-                mean_pfa,
+                x_center - width / 2,
+                mean_rec,
                 width=width,
-                label="Pfa" if run_idx == 0 else None,
+                label="Macro recall" if run_idx == 0 else None,
                 color=algorithm_colors.get(run.name, f"C{run_idx % 10}"),
-                hatch="//",
                 alpha=0.8,
             )
-        if mean_det is not None:
+        if mean_f1 is not None:
             axis_final.bar(
-                x_center,
-                mean_det,
+                x_center + width / 2,
+                mean_f1,
                 width=width,
-                label="Det recall" if run_idx == 0 else None,
+                label="Macro F1" if run_idx == 0 else None,
                 color=algorithm_colors.get(run.name, f"C{run_idx % 10}"),
                 hatch="..",
-                alpha=0.8,
-            )
-        if mean_cls is not None:
-            axis_final.bar(
-                x_center + width,
-                mean_cls,
-                width=width,
-                label="Cls recall" if run_idx == 0 else None,
-                color=algorithm_colors.get(run.name, f"C{run_idx % 10}"),
                 alpha=0.8,
             )
     axis_final.set_ylabel("Metric value", fontsize=16)
@@ -653,18 +961,50 @@ def main() -> None:
     fig_mean, axis_mean = plt.subplots(figsize=figure_size, dpi=dpi)
     mean_task_positions: set[int] = set()
     for run_idx, run in enumerate(runs):
-        x_vals, y_vals = _compute_mean_val_metric_over_tasks(run.tasks, first_key)
-        if x_vals.size == 0:
-            continue
-        zero_based_x_values = x_vals - 1
-        mean_task_positions.update(int(value) for value in zero_based_x_values.tolist())
-        axis_mean.plot(
-            zero_based_x_values,
-            y_vals,
-            label=run_labels[run_idx],
-            color=algorithm_colors.get(run.name, f"C{run_idx % 10}"),
-            **_line_style_for_index(algorithm_line_member_index.get(run.name, run_idx)),
+        run_color = algorithm_colors.get(run.name, f"C{run_idx % 10}")
+        line_style = _line_style_for_index(
+            algorithm_line_member_index.get(run.name, run_idx)
         )
+        seed_tasks_list = algo_seed_tasks.get(run.name, [run.tasks])
+        if len(seed_tasks_list) > 1:
+            x_vals, mean_y, std_y = _aggregate_across_seeds(
+                seed_tasks_list,
+                lambda tasks: _compute_mean_val_metric_over_tasks(tasks, first_key),
+            )
+            if x_vals.size == 0:
+                continue
+            zero_based_x = x_vals - 1
+            mean_task_positions.update(int(v) for v in zero_based_x.tolist())
+            axis_mean.plot(
+                zero_based_x,
+                mean_y,
+                label=run_labels[run_idx],
+                color=run_color,
+                **line_style,
+            )
+            if args.shade_std:
+                axis_mean.fill_between(
+                    zero_based_x,
+                    mean_y - std_y,
+                    mean_y + std_y,
+                    color=run_color,
+                    alpha=0.15,
+                )
+        else:
+            x_vals, y_vals = _compute_mean_val_metric_over_tasks(
+                seed_tasks_list[0], first_key
+            )
+            if x_vals.size == 0:
+                continue
+            zero_based_x = x_vals - 1
+            mean_task_positions.update(int(v) for v in zero_based_x.tolist())
+            axis_mean.plot(
+                zero_based_x,
+                y_vals,
+                label=run_labels[run_idx],
+                color=run_color,
+                **line_style,
+            )
     axis_mean.set_xlabel("Task", fontsize=16, labelpad=X_LABEL_PAD)
     axis_mean.set_ylabel("F1 Score", fontsize=16)
     _set_task_axis_like_fwt(
@@ -701,18 +1041,49 @@ def main() -> None:
     forgetting_task_positions: set[int] = set()
     for run_idx, run in enumerate(runs):
         val_metric_key, _ = _resolve_val_metric_for_run(args.val_metric, run)
-        x_vals, y_vals = compute_average_forgetting(run.tasks, val_metric_key)
-        if x_vals.size == 0:
-            continue
-        backward_transfer_values = -y_vals
-        forgetting_task_positions.update(int(value) for value in x_vals.tolist())
-        axis_forgetting.plot(
-            x_vals,
-            backward_transfer_values,
-            label=run_labels[run_idx],
-            color=algorithm_colors.get(run.name, f"C{run_idx % 10}"),
-            **_line_style_for_index(algorithm_line_member_index.get(run.name, run_idx)),
+        run_color = algorithm_colors.get(run.name, f"C{run_idx % 10}")
+        line_style = _line_style_for_index(
+            algorithm_line_member_index.get(run.name, run_idx)
         )
+        seed_tasks_list = algo_seed_tasks.get(run.name, [run.tasks])
+        if len(seed_tasks_list) > 1:
+            x_vals, mean_fgt, std_fgt = _aggregate_across_seeds(
+                seed_tasks_list,
+                lambda tasks: compute_average_forgetting(tasks, val_metric_key),
+            )
+            if x_vals.size == 0:
+                continue
+            forgetting_task_positions.update(int(v) for v in x_vals.tolist())
+            bwt_mean = -mean_fgt
+            axis_forgetting.plot(
+                x_vals,
+                bwt_mean,
+                label=run_labels[run_idx],
+                color=run_color,
+                **line_style,
+            )
+            if args.shade_std:
+                axis_forgetting.fill_between(
+                    x_vals,
+                    bwt_mean - std_fgt,
+                    bwt_mean + std_fgt,
+                    color=run_color,
+                    alpha=0.15,
+                )
+        else:
+            x_vals, y_vals = compute_average_forgetting(
+                seed_tasks_list[0], val_metric_key
+            )
+            if x_vals.size == 0:
+                continue
+            forgetting_task_positions.update(int(v) for v in x_vals.tolist())
+            axis_forgetting.plot(
+                x_vals,
+                -y_vals,
+                label=run_labels[run_idx],
+                color=run_color,
+                **line_style,
+            )
     axis_forgetting.set_xlabel("Task", fontsize=16, labelpad=X_LABEL_PAD)
     axis_forgetting.set_ylabel("Backward Transfer", fontsize=16)
     _set_task_axis_like_fwt(
@@ -748,7 +1119,105 @@ def main() -> None:
         dpi,
     )
 
-    # Figure 5: forward transfer over tasks (generated by plot_fwt_metrics.py).
+    # Figure 5: per-task validation metric as later tasks arrive. Colour encodes
+    # the task being evaluated; line style encodes the algorithm.
+    fig_per_task, axis_per_task = plt.subplots(figsize=figure_size, dpi=dpi)
+    per_task_positions: set[int] = set()
+    task_names_for_colors = getattr(runs[0], "task_names", None)
+    for run_idx, run in enumerate(runs):
+        val_metric_key, _ = _resolve_val_metric_for_run(args.val_metric, run)
+        run_linestyle = LINESTYLES[run_idx % len(LINESTYLES)]
+        seed_tasks_list = algo_seed_tasks.get(run.name, [run.tasks])
+        task_count = min(len(seed_tasks) for seed_tasks in seed_tasks_list)
+        for task_index in range(task_count):
+            if len(seed_tasks_list) > 1:
+                x_vals, y_vals, std_vals = _aggregate_across_seeds(
+                    seed_tasks_list,
+                    lambda tasks, task_index=task_index: (
+                        _compute_val_metric_for_single_task(
+                            tasks, val_metric_key, task_index
+                        )
+                    ),
+                )
+            else:
+                x_vals, y_vals = _compute_val_metric_for_single_task(
+                    seed_tasks_list[0], val_metric_key, task_index
+                )
+                std_vals = np.zeros_like(y_vals)
+            if x_vals.size == 0:
+                continue
+            per_task_positions.update(int(position) for position in x_vals.tolist())
+            task_color = get_task_color(task_index, task_names_for_colors)
+            axis_per_task.plot(
+                x_vals,
+                y_vals,
+                color=task_color,
+                linestyle=run_linestyle,
+                linewidth=1.6,
+            )
+            axis_per_task.plot(
+                x_vals[:1],
+                y_vals[:1],
+                marker="o",
+                markersize=4.0,
+                color=task_color,
+                linestyle="none",
+            )
+            if args.shade_std and len(seed_tasks_list) > 1:
+                axis_per_task.fill_between(
+                    x_vals,
+                    y_vals - std_vals,
+                    y_vals + std_vals,
+                    color=task_color,
+                    alpha=0.12,
+                )
+    axis_per_task.set_xlabel("Task", fontsize=16, labelpad=X_LABEL_PAD)
+    axis_per_task.set_ylabel("F1 Score", fontsize=16)
+    _set_task_axis_like_fwt(
+        axis_per_task,
+        sorted(per_task_positions),
+        task_index_to_dataset_name,
+    )
+    _hide_top_right_spines(axis_per_task)
+    axis_per_task.tick_params(axis="both", labelsize=TICK_LABEL_FONT_SIZE)
+    axis_per_task.grid(True, alpha=0.3)
+    algorithm_style_handles = [
+        Line2D(
+            [],
+            [],
+            color="black",
+            linestyle=LINESTYLES[run_idx % len(LINESTYLES)],
+            linewidth=1.6,
+            label=run_labels[run_idx],
+        )
+        for run_idx in range(len(runs))
+    ]
+    axis_per_task.legend(
+        handles=algorithm_style_handles,
+        **_build_export_legend_kwargs(
+            resolve_legend_kwargs(
+                style_key=style_key,
+                panel_key="mean_val",
+                base_legend_kwargs=legend_kwargs,
+                run_count=len(runs),
+            ),
+            "mean_val",
+        ),
+    )
+    manual_ylim_per_task = PANEL_YLIM_OVERRIDES.get("val_per_task")
+    if manual_ylim_per_task is not None:
+        axis_per_task.set_ylim(*manual_ylim_per_task)
+    _save_independent_figure(
+        fig_per_task,
+        output_dir
+        / (
+            f"{experiment_prefix}_Val-"
+            f"{_metric_label_to_filename_token(first_label)}-per-task"
+        ),
+        dpi,
+    )
+
+    # Figure 6: forward transfer over tasks (generated by plot_fwt_metrics.py).
     fwt_json_path = _resolve_fwt_json_path(args.fwt_json_path, run_source_dir)
     if fwt_json_path is None:
         print(
@@ -759,7 +1228,7 @@ def main() -> None:
         try:
             fwt_records = load_metrics(fwt_json_path)
             fwt_series_by_algorithm = build_series_by_algo(
-                fwt_records, "forward_transfer_total_f1_zs"
+                fwt_records, "forward_transfer_total_macro_f1_zs"
             )
             if not args.include_iid2:
                 fwt_series_by_algorithm.pop("iid2", None)
@@ -783,9 +1252,10 @@ def main() -> None:
                 fwt_plot_style["figsize"] = figure_size
                 plot_series(
                     series_by_algorithm=fwt_series_by_algorithm,
-                    metric_name="forward_transfer_total_f1_zs",
+                    metric_name="forward_transfer_total_macro_f1_zs",
                     output_path=fwt_output_path,
                     plot_style=fwt_plot_style,
+                    task_index_to_dataset_name_override=task_index_to_dataset_name,
                 )
                 print(
                     "Saved FWT subplot to "

@@ -2,7 +2,7 @@
 """
 Probe concurrency effects by sampling tqdm ETA for each job.
 
-This script runs either `main.py` or `main_single_round.py` under a pseudo-TTY
+This script runs `main.py` under a pseudo-TTY
 so tqdm is enabled, waits until the first epoch begins, then extracts the tqdm
 ETA after N iterations.
 
@@ -205,9 +205,7 @@ def _build_main_command(
 ) -> list[str]:
     """Build the `python3 ...` command for a single probe job."""
 
-    # `iid2` is a non-lifelong (single-round) baseline and must not go through
-    # `main.py`, which historically delegates its iid flow to `main_multi_task.py`.
-    entrypoint = "main_single_round.py" if target.model_name == "iid2" else "main.py"
+    entrypoint = "main.py"
 
     cmd = [
         sys.executable,
@@ -507,7 +505,7 @@ def _probe_one_job(
 
     proc, master_fd = _spawn_with_pty(cmd)
     try:
-        expected_task_for_tqdm = 0 if target.model_name != "iid2" else None
+        expected_task_for_tqdm = 0
         result = _parse_stream_until_eta(
             master_fd=master_fd,
             proc=proc,

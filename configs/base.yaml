@@ -6,16 +6,15 @@ data_path: data/rff/radar/full
 data_scaling: normalize
 # Optional inclusive SNR window (dB) for datasets with a per-sample SNR label
 # (deeprad lbl_tr/lbl_te column 0; uclresm snr_db_tr/snr_db_te). Files without
-# it (e.g. rcn) are unfiltered.
+# it are unfiltered.
 # snr_range: [0, 20]
-task_order_files: "t2-rcn,t0-rcn,t2-uclresm-25noise,t0-deeprad,t1-deeprad,t1-uclresm-25noise,t3-deeprad,t0-uclresm-25noise,t1-rcn,t2-deeprad"
-# task_order_files: "t0-deeprad,t1-deeprad,t3-deeprad,t2-deeprad"
+task_order_files: "deeprad_task_01,deeprad_task_02,deeprad_task_03,deeprad_task_04,radchar_task_01,radnist_task_01,radnist_task_02,uclresm_degraded_task_01,uclresm_degraded_task_02,uclresm_degraded_task_03"
 dataset: iq
 classes_per_it: 6
 val_rate: 1000
 iterations: 5000
 workers: 0
-validation: 0.5
+validation: 0
 class_order: random
 increment: 5
 # Keep small for GPU eval; 100000 causes OOM on large tasks (e.g. 100k samples × (3,1024))
@@ -30,16 +29,19 @@ state_logging: true
 samples_per_task: -1
 
 # Optimizer defaults
+lr: 0.03
 n_meta: 1
 inner_steps: 1
-n_epochs: 10
+n_epochs: 5
 batch_size: 256
 n_memories: 5120
 memories: 5120
 replay_batch_size: 128
 temperature: 5.0
 alpha_init: 0.001
-grad_clip_norm: 5.0
+# 0 disables gradient clipping for every model (both the grad_clip_norm and
+# clipgrad knobs); set a positive norm to re-enable it.
+grad_clip_norm: 0
 optimizer: sgd
 bgd_optimizer: sgd
 

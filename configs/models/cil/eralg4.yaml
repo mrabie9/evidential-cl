@@ -1,5 +1,4 @@
 model: eralg4
 loader: class_incremental_loader
 learn_lr: false
-lr: 0.01
-memory_loss_lambda: 1
+memory_loss_lambda: 1.0

@@ -45,28 +45,38 @@ def test_prepare_input_ambiguous_flat():
 def test_adapter_known_mix():
     adapter = AdcIqAdapter()
     with torch.no_grad():
-        adapter.weight.copy_(torch.tensor([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]))
+        adapter.weight.copy_(torch.tensor([1.0, 0.0, 0.0]))
         adapter.bias.zero_()
     b, l = 2, 16
     i = torch.randn(b, l)  # [b, l]
     q = torch.randn(b, l)  # [b, l]
-    adc3 = torch.randn(b, l)  # [b,l]
-    # print("Input I:", i)
-    # print("Input Q:", q)
-    # print("Stacked IQ", torch.stack([i, q], dim=1))
     x = torch.stack(
         [
             torch.stack([i, q], dim=1),
-            torch.stack([q, i], dim=1),
-            torch.stack([adc3, adc3], dim=1),
+            torch.randn(b, 2, l),
+            torch.randn(b, 2, l),
         ],
         dim=1,
     )  # (B, 3, 2, L)
     y = adapter(x)  # (B, 2, L)
-    print(y.shape)
-    # print(y[:,0,:],"\n", y[:,1,:])
+    # Weight selects ADC0 only, using the same coefficients for I and Q.
     assert torch.allclose(y[:, 0], i, atol=1e-6)
-    assert torch.allclose(y[:, 1], adc3, atol=1e-6)
+    assert torch.allclose(y[:, 1], q, atol=1e-6)
+
+
+def test_adapter_shares_weights_across_iq():
+    """The ADC mixing weights must be identical for the I and Q channels."""
+    adapter = AdcIqAdapter()
+    with torch.no_grad():
+        adapter.weight.copy_(torch.tensor([0.6, 0.3, 0.1]))
+        adapter.bias.zero_()
+    b, l = 3, 8
+    x = torch.randn(b, 3, 2, l)
+    y = adapter(x)
+    expected = torch.einsum("bal,a->bl", x[:, :, 0, :], adapter.weight)
+    assert torch.allclose(y[:, 0], expected, atol=1e-6)
+    expected_q = torch.einsum("bal,a->bl", x[:, :, 1, :], adapter.weight)
+    assert torch.allclose(y[:, 1], expected_q, atol=1e-6)
 
 
 def test_adapter_grad_flow():
@@ -94,6 +104,7 @@ if __name__ == "__main__":
     test_prepare_input_2adc_flat()
     test_prepare_input_ambiguous_flat()
     test_adapter_known_mix()
+    test_adapter_shares_weights_across_iq()
     test_adapter_grad_flow()
     test_resnet1d_integration()
     print("All adapter tests passed.")

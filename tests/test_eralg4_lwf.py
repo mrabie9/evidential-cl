@@ -36,9 +36,7 @@ def _make_args(**overrides) -> object:
     o.classes_per_task = [3, 3]
     o.nc_per_task_list = ""
     o.nc_per_task = None
-    o.noise_label = None
     o.class_weighted_ce = False
-    o.use_detector_arch = False
     o.use_iq_aug_features = False
     o.data_scaling = "none"
     o.iq_aug_feature_type = "power"
@@ -59,9 +57,6 @@ def _make_args(**overrides) -> object:
     o.grad_clip_norm = 2.0
     o.memory_loss_lambda = 1.0
     o.cls_lambda = 1.0
-    o.det_lambda = 1.0
-    o.det_memories = 0
-    o.det_replay_batch = 64
     o.eralg4_masked_loss = True
     o.eralg4_grad_avg = 1
     o.eralg4_joint_er = overrides.get("joint", False)
@@ -78,8 +73,13 @@ def _build(**overrides):
 
 
 def _paired_run(model, x, y_first, y_second) -> None:
-    """One step on each of two tasks, with every RNG the loop reads pinned."""
-    for y, task in ((y_first, 0), (y_second, 1)):
+    """One step on task 0 and two on task 1, with every RNG the loop reads pinned.
+
+    ResNet1D carries no dropout, so on the first step of task 1 the student is
+    still identical to the teacher just frozen from it and the LwF gradient is
+    exactly zero. The second task-1 step is the first one it can move.
+    """
+    for y, task in ((y_first, 0), (y_second, 1), (y_second, 1)):
         torch.manual_seed(99)
         random.seed(99)
         model.observe(x, y, task)
@@ -90,7 +90,7 @@ def test_lwf_term_is_off_by_default() -> None:
     model = _build()
     assert model.lwf_lambda == 0.0
     x = torch.randn(4, 2, 1024)
-    logits = model.net.forward_heads(x)[1]
+    logits = model.net(x)
     assert float(model._lwf_distillation_loss(logits, x, 1).item()) == 0.0
 
 
@@ -130,11 +130,11 @@ def test_lwf_changes_the_update(joint: bool) -> None:
     """The term must reach the parameters, not just the reported loss.
 
     Two models train from identical weights on identical batches, one with
-    distillation on.  Both the dropout masks (``torch``) and the reservoir
-    draws (``random``, which ``getBatch`` / ``_sample_replay`` use) are
-    re-seeded per step, so the only difference between the runs is the
-    distillation gradient.  Task 0 cannot differ (no teacher yet, and no
-    previous classes), so the divergence is checked after a step on task 1.
+    distillation on.  The reservoir draws (``random``, which ``getBatch`` /
+    ``_sample_replay`` use) are re-seeded per step, so the only difference
+    between the runs is the distillation gradient.  Task 0 cannot differ (no
+    teacher yet, and no previous classes), so the divergence is checked after
+    two steps on task 1.
     ``test_lwf_off_leaves_the_update_identical`` guards this pairing: without
     the ``random`` seeding both arms drift apart on replay sampling alone and
     the assertion below would hold vacuously.

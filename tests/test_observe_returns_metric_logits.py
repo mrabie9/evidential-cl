@@ -29,9 +29,7 @@ def _minimal_rwalk_args(*, n_tasks: int = 2) -> object:
     args.classes_per_task = [5, 6][:n_tasks] if n_tasks <= 2 else [5] * n_tasks
     args.nc_per_task_list = ""
     args.nc_per_task = None
-    args.noise_label = None
     args.class_weighted_ce = False
-    args.use_detector_arch = False
     args.use_iq_aug_features = False
     args.data_scaling = "none"
     args.iq_aug_feature_type = "power"
@@ -41,10 +39,7 @@ def _minimal_rwalk_args(*, n_tasks: int = 2) -> object:
     args.alpha = 0.9
     args.eps = 0.01
     args.clipgrad = 100.0
-    args.det_lambda = 1.0
     args.cls_lambda = 1.0
-    args.det_memories = 0
-    args.det_replay_batch = 64
     args.norm_track_stats = True
     args.alpha_init = 1e-3
     args.inner_steps = 1
@@ -63,9 +58,7 @@ def _minimal_life_experience_args() -> SimpleNamespace:
         amp_dtype="bfloat16",
         state_logging=False,
         n_epochs=1,
-        use_detector_arch=False,
         classes_per_task=5,
-        noise_label=None,
         class_order="sequential",
     )
 
@@ -117,8 +110,9 @@ def test_life_experience_skips_metric_forward_when_logits_returned(
 
     def _fake_eval(_model, tasks, _args, **_kwargs):
         task_count = len(tasks)
-        zeros = [0.5] * task_count
-        return zeros, zeros, zeros, zeros, zeros
+        per_task = [0.5] * task_count
+        # (macro_rec, macro_prec, macro_f1)
+        return per_task, per_task, per_task
 
     with (
         patch("main.eval_tasks", side_effect=_fake_eval),

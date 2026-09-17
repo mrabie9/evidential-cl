@@ -1,11 +1,7 @@
-# Model-specific overrides for ctn.
 model: ctn
 loader: task_incremental_loader
-
-lr: 0.03
-ctx_lr: 0.003
+ctx_lr: 0.0001
 task_emb: 64
-memory_strength: 10
-
+memory_strength: 5
 validation: 0.3
 amp: false

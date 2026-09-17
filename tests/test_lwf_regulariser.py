@@ -34,9 +34,7 @@ def _make_args(prefix: str, **overrides) -> object:
     o.classes_per_task = overrides.get("classes_per_task", [3, 3])
     o.nc_per_task_list = ""
     o.nc_per_task = None
-    o.noise_label = overrides.get("noise_label", None)
     o.class_weighted_ce = False
-    o.use_detector_arch = False
     o.use_iq_aug_features = False
     o.data_scaling = "none"
     o.iq_aug_feature_type = "power"
@@ -44,9 +42,6 @@ def _make_args(prefix: str, **overrides) -> object:
     o.optimizer = "sgd"
     o.clipgrad = 100.0
     o.cls_lambda = 1.0
-    o.det_lambda = 1.0
-    o.det_memories = 0
-    o.det_replay_batch = 64
     o.alpha_init = 1e-3
     o.loader = overrides.get("loader", "task_incremental_loader")
     o.class_incremental = True
@@ -75,7 +70,7 @@ def test_lwf_term_is_off_by_default(module, prefix: str) -> None:
     model = _build(module, prefix)
     assert model.lwf_lambda == 0.0
     x = torch.randn(4, 2, 1024)
-    logits = model.net.forward_heads(x)[1]
+    logits = model.net(x)
     assert float(model._lwf_distillation_loss(logits, x, 1).item()) == 0.0
 
 
@@ -94,7 +89,7 @@ def test_lwf_snapshot_is_a_noop_when_disabled(module, prefix: str) -> None:
 def test_lwf_zero_before_a_teacher_exists(module, prefix: str) -> None:
     model = _build(module, prefix, lwf_lambda=1.0)
     x = torch.randn(4, 2, 1024)
-    logits = model.net.forward_heads(x)[1]
+    logits = model.net(x)
     assert model.teacher is None
     assert float(model._lwf_distillation_loss(logits, x, 1).item()) == 0.0
 
@@ -107,7 +102,7 @@ def test_lwf_zero_on_the_first_task(module, prefix: str) -> None:
     x = torch.randn(6, 2, 1024)
     model.observe(x, torch.randint(0, 3, (6,)), 0)
     model._snapshot_lwf_teacher()
-    logits = model.net.forward_heads(x)[1]
+    logits = model.net(x)
     assert float(model._lwf_distillation_loss(logits, x, 0).item()) == 0.0
 
 
@@ -126,7 +121,7 @@ def test_lwf_zero_against_an_identical_teacher(module, prefix: str) -> None:
     model.observe(x, torch.randint(0, 3, (6,)), 0)
     model._snapshot_lwf_teacher()
     torch.manual_seed(123)
-    logits = model.net.forward_heads(x, bn_training=True)[1]
+    logits = model.net(x, bn_training=True)
     torch.manual_seed(123)
     assert abs(float(model._lwf_distillation_loss(logits, x, 1).item())) < 1e-5
 
@@ -166,7 +161,7 @@ def test_lwf_positive_once_the_student_moves(module, prefix: str) -> None:
     model._snapshot_lwf_teacher()
     with torch.no_grad():
         model.net.model.fc.weight.mul_(3.0)
-    logits = model.net.forward_heads(x)[1]
+    logits = model.net(x)
     assert float(model._lwf_distillation_loss(logits, x, 1).item()) > 0.0
 
 
@@ -214,12 +209,3 @@ def test_lwf_changes_the_update(module, prefix: str) -> None:
 def test_lwf_rejects_non_positive_temperature(module, prefix: str) -> None:
     with pytest.raises(ValueError):
         _build(module, prefix, lwf_lambda=1.0, lwf_temperature=0.0)
-
-
-@pytest.mark.parametrize("module,prefix", HOSTS, ids=HOST_IDS)
-def test_previous_class_indices_keep_the_noise_label(module, prefix: str) -> None:
-    """The noise class recurs in every task, so it is always distilled."""
-    model = _build(module, prefix, lwf_lambda=1.0, noise_label=5)
-    indices = model._previous_class_indices(1, torch.device("cpu")).tolist()
-    assert indices == [0, 1, 2, 5]
-    assert model._previous_class_indices(0, torch.device("cpu")).tolist() == [5]

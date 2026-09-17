@@ -10,11 +10,42 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tuning import hyperparam_tuner
+
+
+def test_extract_macro_f1_mean_cil_uses_union_headline_not_column_mean(
+    tmp_path: Path,
+) -> None:
+    """CIL scoring must read the pooled headline, not average per-task columns.
+
+    ``val_macro_f1`` under CIL holds per-task columns sliced from one pooled
+    pass (see ``main.eval_cil_pooled``); averaging its tail mixes in tasks the
+    model has since forgotten instead of scoring the class-union headline
+    stored separately as ``cil_union_macro_f1``.
+    """
+    metrics_dir = tmp_path / "metrics"
+    metrics_dir.mkdir()
+    np.savez(
+        metrics_dir / "task1.npz",
+        val_macro_f1=np.array([0.95, 0.36, 0.06, 0.02]),
+        cil_union_macro_f1=np.array([0.95, 0.06]),
+    )
+
+    til_score = hyperparam_tuner.extract_macro_f1_mean_from_trial_logs(
+        tmp_path, num_tasks=2, cil_mode=False
+    )
+    cil_score = hyperparam_tuner.extract_macro_f1_mean_from_trial_logs(
+        tmp_path, num_tasks=2, cil_mode=True
+    )
+
+    assert til_score == (0.06 + 0.02) / 2
+    assert cil_score == 0.06
 
 
 def test_resolve_cli_config_path_uses_caller_cwd(tmp_path: Path) -> None:
@@ -61,6 +92,8 @@ def test_run_tuning_records_yaml_error_without_failing(
         seed_offset=0,
         vary_seed=False,
         keep_expt_name=False,
+        stage2_top_k=0,
+        stage2_seeds="",
     )
 
     class _FakeCliParser:
@@ -104,7 +137,9 @@ def test_run_tuning_records_yaml_error_without_failing(
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("write failed")),
     )
 
-    preset = hyperparam_tuner.TuningPreset(model_name="hat")
+    preset = hyperparam_tuner.TuningPreset(
+        model_name="hat", default_grid={"lr": [0.001]}
+    )
     hyperparam_tuner.run_tuning(preset)
 
     assert captured_summaries, "Expected summary persistence calls."
@@ -179,3 +214,78 @@ def test_select_best_trial_breaks_score_ties_by_param_completeness() -> None:
     )
     assert best is not None
     assert best["trial"] == 16
+def test_hierarchical_writeback_keeps_earlier_stage_winners(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Every searched key of the best trial is written, not just its own stage.
+
+    Constant ``--override`` values are not searched, so they must stay out of
+    the model YAML.
+    """
+    written: list[dict[str, Any]] = []
+
+    cli = SimpleNamespace(
+        config=[str(tmp_path / "model.yaml")],
+        config_dir=[],
+        override=["lr=0.01"],
+        grid=[],
+        num_samples=None,
+        search_seed=0,
+        max_trials=None,
+        shuffle=False,
+        tune_only=[],
+        hierarchical=True,
+        lr_first=False,
+        lr_key="lr",
+        dry_run=False,
+        output_root=str(tmp_path / "out"),
+        seed_offset=0,
+        vary_seed=False,
+        keep_expt_name=False,
+        stage2_top_k=0,
+        stage2_seeds="",
+    )
+
+    class _FakeCliParser:
+        def parse_args(self) -> SimpleNamespace:
+            return cli
+
+    def _fake_trial(_base_args, overrides, trial_params, trial_idx, *_a, **_k):
+        params = dict(overrides, **trial_params)
+        score = params.get("a", 0) * 10 + params.get("b", 0)
+        return {
+            "status": "ok",
+            "trial": trial_idx,
+            "params": params,
+            "trial_params": dict(trial_params),
+            "score": float(score),
+            "duration_sec": 0.0,
+            "log_dir": str(tmp_path / "run"),
+        }
+
+    monkeypatch.setattr(hyperparam_tuner, "build_cli", lambda _preset: _FakeCliParser())
+    monkeypatch.setattr(
+        hyperparam_tuner.file_parser,
+        "parse_args_from_yaml",
+        lambda _sources: SimpleNamespace(model="m", expt_name="m", seed=0),
+    )
+    monkeypatch.setattr(
+        hyperparam_tuner, "parse_override_specs", lambda *_: {"lr": 0.01}
+    )
+    monkeypatch.setattr(
+        hyperparam_tuner.misc_utils, "get_date_time", lambda: "2026-01-01_00-00-00"
+    )
+    monkeypatch.setattr(hyperparam_tuner, "run_single_trial", _fake_trial)
+    monkeypatch.setattr(hyperparam_tuner, "dump_summary", lambda *_: None)
+    monkeypatch.setattr(
+        hyperparam_tuner,
+        "write_best_params_to_yaml",
+        lambda _path, values: written.append(dict(values)) or values,
+    )
+
+    preset = hyperparam_tuner.TuningPreset(
+        model_name="m", default_grid={"a": [1, 2], "b": [3, 4]}
+    )
+    hyperparam_tuner.run_tuning(preset)
+
+    assert written == [{"a": 2, "b": 4}]

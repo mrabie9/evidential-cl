@@ -1,0 +1,11 @@
+# AdaB1N norm-layer settings for the IID2 control host, layered on top of
+# configs/models/til/iid2.yaml.
+#
+# IID2 sets no per-row task counts, so AdaB1N's cross-task reweighting cannot
+# engage and adab1n_init_weight is deliberately not swept here: only kappa is in
+# play.
+#
+# tuning/tune_adab1n.py writes the winning values back into THIS file rather than
+# the host fragment, so iid2's baseline config stays free of norm-layer state.
+norm_type: adab1n
+kappa: 1.0

@@ -34,7 +34,6 @@ def build_common_args() -> SimpleNamespace:
     return SimpleNamespace(
         arch="resnet1d",
         cuda=False,
-        use_detector_arch=False,
         class_weighted_ce=True,
         data_scaling="normalize",
         use_iq_aug_features=False,
@@ -62,10 +61,7 @@ def build_ctn_args() -> SimpleNamespace:
     # Former 2×2 grid folds to four alternating rounds (see CtnConfig.from_args).
     args.inner_steps = 4
     args.batch_size = 8
-    args.det_lambda = 1.0
     args.cls_lambda = 1.0
-    args.det_memories = 64
-    args.det_replay_batch = 8
     return args
 
 
@@ -87,10 +83,7 @@ def build_laer_args() -> SimpleNamespace:
     args.second_order = True
     args.meta_batches = 2
     args.dataset = "iq"
-    args.det_lambda = 1.0
     args.cls_lambda = 1.0
-    args.det_memories = 64
-    args.det_replay_batch = 8
     return args
 
 

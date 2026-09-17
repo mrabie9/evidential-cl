@@ -25,7 +25,7 @@ If --log is omitted, the newest `run_*` directory under
 `logs/full_experiments/` is used when available; otherwise the newest
 `full_experiments_*.log` file is used.
 
-Memory sweep comparison (TR and TE: f1_c, det, fa, f1):
+Memory sweep comparison (TR and TE: rec, prec, f1):
     python scripts/summarise_full_experiments.py --mem-compare-runs \\
         logs/full_experiments/run_20260511_221802_lnx-elkk-1_mem_512 \\
         logs/full_experiments/run_20260513_173647_lnx-elkk-1_mem_1024
@@ -53,6 +53,7 @@ import argparse
 import glob
 import os
 import re
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -60,6 +61,9 @@ from collections import Counter
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from utils.metric_keys import metric_aliases  # noqa: E402
 
 
 @dataclass
@@ -70,13 +74,9 @@ class AlgoSummary:
     cls_rec_tr: Optional[float] = None
     cls_prec_tr: Optional[float] = None
     cls_f1_tr: Optional[float] = None
-    det_tr: Optional[float] = None
-    fa_tr: Optional[float] = None
     cls_rec_te: Optional[float] = None
     cls_prec_te: Optional[float] = None
     cls_f1_te: Optional[float] = None
-    det_te: Optional[float] = None
-    fa_te: Optional[float] = None
     size_gb: Optional[float] = None
     time_sec: Optional[float] = None
 
@@ -90,8 +90,6 @@ ERROR_RE = re.compile(
     r"ERROR:\s+(?P<algo>[\w\-]+)\s+failed with exit code\s+(?P<code>\d+)"
 )
 TOTAL_ACC_RE = re.compile(r"Total Accuracy:\s+(?P<val>[0-9.]+)")
-TOTAL_DET_RE = re.compile(r"Total Detection:\s+(?P<val>[0-9.]+)")
-TOTAL_FA_RE = re.compile(r"Total False Alarm:\s+(?P<val>[0-9.]+)")
 # Results line: ... # val: ... # 2276.83
 RESULTS_TIME_RE = re.compile(r"#\s+val:\s+[^#]+#\s+(?P<sec>[0-9.]+)\s*$")
 # Epoch line with Prec and F1: Task 0 Epoch 1/1 | Loss 1.38 | Train Acc 0.47 | Prec 0.50 | F1 0.45 | Epoch Time ...
@@ -100,22 +98,16 @@ EPOCH_PREC_F1_RE = re.compile(
 )
 # Epoch Time for fallback when results line has no time (e.g. incomplete run)
 EPOCH_TIME_RE = re.compile(r"Epoch Time\s+(?P<sec>[0-9.]+)s")
-SUMMARY_TR_RE = re.compile(
-    r"SUMMARY_TR\s+"
-    r"(?:cls_rec=(?P<cls_rec>[0-9.]+)\s+)?"
-    r"(?:cls_prec=(?P<cls_prec>[0-9.]+)\s+)?"
-    r"(?:cls_f1=(?P<cls_f1>[0-9.]+)\s+)?"
-    r"(?:det=(?P<det>[0-9.]+)\s+)?"
-    r"(?:fa=(?P<fa>[0-9.]+))?"
+# ``macro_*`` is the current spelling; ``cls_*`` is accepted so that runs logged
+# before the detection-metric removal still parse. Trailing ``det=``/``fa=``
+# tokens from those older logs are ignored.
+_SUMMARY_FIELDS = (
+    r"(?:(?:macro|cls)_rec=(?P<cls_rec>[0-9.]+)\s*)?"
+    r"(?:(?:macro|cls)_prec=(?P<cls_prec>[0-9.]+)\s*)?"
+    r"(?:(?:macro|cls)_f1=(?P<cls_f1>[0-9.]+)\s*)?"
 )
-SUMMARY_TE_RE = re.compile(
-    r"SUMMARY_TE\s+"
-    r"(?:cls_rec=(?P<cls_rec>[0-9.]+)\s+)?"
-    r"(?:cls_prec=(?P<cls_prec>[0-9.]+)\s+)?"
-    r"(?:cls_f1=(?P<cls_f1>[0-9.]+)\s+)?"
-    r"(?:det=(?P<det>[0-9.]+)\s+)?"
-    r"(?:fa=(?P<fa>[0-9.]+))?"
-)
+SUMMARY_TR_RE = re.compile(r"SUMMARY_TR\s+" + _SUMMARY_FIELDS)
+SUMMARY_TE_RE = re.compile(r"SUMMARY_TE\s+" + _SUMMARY_FIELDS)
 MODEL_SIZE_RE = re.compile(r"Model size:\s+(?P<gb>[0-9.]+)\s+GB")
 LOG_TIMESTAMP_RE = re.compile(r"^\[(?P<stamp>\d{4}-\d{2}-\d{2}T[^]]+)\]")
 LOGGING_TO_RE = re.compile(r"Logging to\s+(?P<path>\S+)")
@@ -126,8 +118,6 @@ SEED_DIRECTORY_RE = re.compile(r"^seed[-_](?P<seed>\d+)$")
 BASE_SWEEP_LABEL = "base"
 SweepLabelValue = Union[int, str]
 SweepMetricValues = Tuple[
-    Optional[float],
-    Optional[float],
     Optional[float],
     Optional[float],
     Optional[float],
@@ -196,10 +186,6 @@ def parse_log(path: str) -> Dict[str, AlgoSummary]:
                     s.cls_prec_tr = float(m.group("cls_prec"))
                 if m.group("cls_f1"):
                     s.cls_f1_tr = float(m.group("cls_f1"))
-                if m.group("det"):
-                    s.det_tr = float(m.group("det"))
-                if m.group("fa"):
-                    s.fa_tr = float(m.group("fa"))
                 continue
 
             m = SUMMARY_TE_RE.search(line)
@@ -210,10 +196,6 @@ def parse_log(path: str) -> Dict[str, AlgoSummary]:
                     s.cls_prec_te = float(m.group("cls_prec"))
                 if m.group("cls_f1"):
                     s.cls_f1_te = float(m.group("cls_f1"))
-                if m.group("det"):
-                    s.det_te = float(m.group("det"))
-                if m.group("fa"):
-                    s.fa_te = float(m.group("fa"))
                 continue
 
             m = MODEL_SIZE_RE.search(line)
@@ -227,16 +209,8 @@ def parse_log(path: str) -> Dict[str, AlgoSummary]:
                     s.cls_rec_te = float(m.group("val"))
                 continue
 
-            m = TOTAL_DET_RE.search(line)
-            if m:
-                if s.det_te is None:
-                    s.det_te = float(m.group("val"))
                 continue
 
-            m = TOTAL_FA_RE.search(line)
-            if m:
-                if s.fa_te is None:
-                    s.fa_te = float(m.group("val"))
                 continue
 
             m = EPOCH_PREC_F1_RE.search(line)
@@ -285,10 +259,6 @@ def parse_job_log(path: str, algo_name: Optional[str] = None) -> Dict[str, AlgoS
                     summary.cls_prec_tr = float(match.group("cls_prec"))
                 if match.group("cls_f1"):
                     summary.cls_f1_tr = float(match.group("cls_f1"))
-                if match.group("det"):
-                    summary.det_tr = float(match.group("det"))
-                if match.group("fa"):
-                    summary.fa_tr = float(match.group("fa"))
                 continue
 
             match = SUMMARY_TE_RE.search(line)
@@ -299,10 +269,6 @@ def parse_job_log(path: str, algo_name: Optional[str] = None) -> Dict[str, AlgoS
                     summary.cls_prec_te = float(match.group("cls_prec"))
                 if match.group("cls_f1"):
                     summary.cls_f1_te = float(match.group("cls_f1"))
-                if match.group("det"):
-                    summary.det_te = float(match.group("det"))
-                if match.group("fa"):
-                    summary.fa_te = float(match.group("fa"))
                 continue
 
             match = MODEL_SIZE_RE.search(line)
@@ -315,14 +281,8 @@ def parse_job_log(path: str, algo_name: Optional[str] = None) -> Dict[str, AlgoS
                 summary.cls_rec_te = float(match.group("val"))
                 continue
 
-            match = TOTAL_DET_RE.search(line)
-            if match and summary.det_te is None:
-                summary.det_te = float(match.group("val"))
                 continue
 
-            match = TOTAL_FA_RE.search(line)
-            if match and summary.fa_te is None:
-                summary.fa_te = float(match.group("val"))
                 continue
 
             match = EPOCH_PREC_F1_RE.search(line)
@@ -449,31 +409,23 @@ def _fill_missing_metrics_from_npz(
     """
     with np.load(metrics_file_path, allow_pickle=False) as metrics_data:
         train_recall = _extract_latest_metric(
-            metrics_data, ["train_cls_rec", "train_rec", "cls_tr_rec"]
+            metrics_data, metric_aliases("train_macro_rec")
         )
         train_precision = _extract_latest_metric(
-            metrics_data, ["train_cls_prec", "train_prec"]
+            metrics_data, metric_aliases("train_macro_prec")
         )
-        train_f1 = _extract_latest_metric(metrics_data, ["train_f1", "train_f1_c"])
-        train_detection = _extract_latest_metric(
-            metrics_data, ["train_det_rec", "train_det"]
-        )
-        train_false_alarm = _extract_latest_metric(
-            metrics_data, ["train_det_pfa", "train_det_fa", "train_fa"]
+        train_f1 = _extract_latest_metric(
+            metrics_data, metric_aliases("train_macro_f1")
         )
 
         validation_recall = _extract_latest_metric(
-            metrics_data, ["val_cls_rec", "val_rec", "val_acc"]
+            metrics_data, metric_aliases("val_macro_rec_per_epoch")
         )
         validation_precision = _extract_latest_metric(
-            metrics_data, ["val_cls_prec", "val_prec"]
+            metrics_data, metric_aliases("val_macro_prec_per_epoch")
         )
-        validation_f1 = _extract_latest_metric(metrics_data, ["val_f1", "val_f1_c"])
-        validation_detection = _extract_latest_metric(
-            metrics_data, ["val_det_rec", "val_det_acc", "val_det"]
-        )
-        validation_false_alarm = _extract_latest_metric(
-            metrics_data, ["val_det_pfa", "val_det_fa", "val_fa"]
+        validation_f1 = _extract_latest_metric(
+            metrics_data, metric_aliases("val_macro_f1")
         )
 
     if summary.cls_rec_tr is None:
@@ -482,10 +434,6 @@ def _fill_missing_metrics_from_npz(
         summary.cls_prec_tr = train_precision
     if summary.cls_f1_tr is None:
         summary.cls_f1_tr = train_f1
-    if summary.det_tr is None:
-        summary.det_tr = train_detection
-    if summary.fa_tr is None:
-        summary.fa_tr = train_false_alarm
 
     if summary.cls_rec_te is None:
         summary.cls_rec_te = validation_recall
@@ -493,10 +441,6 @@ def _fill_missing_metrics_from_npz(
         summary.cls_prec_te = validation_precision
     if summary.cls_f1_te is None:
         summary.cls_f1_te = validation_f1
-    if summary.det_te is None:
-        summary.det_te = validation_detection
-    if summary.fa_te is None:
-        summary.fa_te = validation_false_alarm
 
 
 def _apply_metrics_fallback_from_job_log(
@@ -531,13 +475,9 @@ def _merge_summary(into: AlgoSummary, source: AlgoSummary) -> None:
         "cls_rec_tr",
         "cls_prec_tr",
         "cls_f1_tr",
-        "det_tr",
-        "fa_tr",
         "cls_rec_te",
         "cls_prec_te",
         "cls_f1_te",
-        "det_te",
-        "fa_te",
         "size_gb",
         "time_sec",
     ):
@@ -821,14 +761,10 @@ def print_summary(
             "TR rec",
             "TR prec",
             "TR F1_c",
-            "TR det",
-            "TR fa",
             "TR f1",
             "TE rec",
             "TE prec",
             "TE F1_c",
-            "TE det",
-            "TE fa",
             "TE f1",
             "Size_GB",
             "Time",
@@ -841,11 +777,9 @@ def print_summary(
         w_time = 8
         header = (
             f"{'Algo':<{w_algo}} {'Exit':<{w_exit}} "
-            f"{'rec':>{w_num}} {'prec':>{w_num}} {'F1_c':>{w_num}} "
-            f"{'det':>{w_num}} {'fa':>{w_num}} {'f1':>{w_num}} "
+            f"{'rec':>{w_num}} {'prec':>{w_num}} {'F1_c':>{w_num}} {'f1':>{w_num}} "
             f"| "
-            f"{'rec':>{w_num}} {'prec':>{w_num}} {'F1_c':>{w_num}} "
-            f"{'det':>{w_num}} {'fa':>{w_num}} {'f1':>{w_num}} "
+            f"{'rec':>{w_num}} {'prec':>{w_num}} {'F1_c':>{w_num}} {'f1':>{w_num}} "
             f"{'Size_GB':>{w_num}} {'Time':>{w_time}}"
         )
         print(header)
@@ -868,14 +802,10 @@ def print_summary(
                 _fmt(s.cls_rec_tr).strip(),
                 _fmt(s.cls_prec_tr).strip(),
                 _fmt(train_classification_f1).strip(),
-                _fmt(s.det_tr).strip(),
-                _fmt(s.fa_tr).strip(),
                 _fmt(s.cls_f1_tr).strip(),
                 _fmt(s.cls_rec_te).strip(),
                 _fmt(s.cls_prec_te).strip(),
                 _fmt(test_classification_f1).strip(),
-                _fmt(s.det_te).strip(),
-                _fmt(s.fa_te).strip(),
                 _fmt(s.cls_f1_te).strip(),
                 size_str,
                 time_str,
@@ -887,12 +817,10 @@ def print_summary(
             print(
                 f"{s.name:<{w_algo}} {exit_str:<{w_exit}} "
                 f"{_fmt(s.cls_rec_tr):>{w_num}} {_fmt(s.cls_prec_tr):>{w_num}} "
-                f"{_fmt(train_classification_f1):>{w_num}} "
-                f"{_fmt(s.det_tr):>{w_num}} {_fmt(s.fa_tr):>{w_num}} {_fmt(s.cls_f1_tr):>{w_num}} "
+                f"{_fmt(train_classification_f1):>{w_num}} {_fmt(s.cls_f1_tr):>{w_num}} "
                 f"| "
                 f"{_fmt(s.cls_rec_te):>{w_num}} {_fmt(s.cls_prec_te):>{w_num}} "
-                f"{_fmt(test_classification_f1):>{w_num}} "
-                f"{_fmt(s.det_te):>{w_num}} {_fmt(s.fa_te):>{w_num}} {_fmt(s.cls_f1_te):>{w_num}} "
+                f"{_fmt(test_classification_f1):>{w_num}} {_fmt(s.cls_f1_te):>{w_num}} "
                 f"{size_str:>{w_num}} {time_str:>{w_time}}"
             )
 
@@ -1027,22 +955,14 @@ def _metric_values_from_summary(summary: AlgoSummary) -> SweepMetricValues:
         summary: Parsed algorithm summary.
 
     Returns:
-        Tuple of train f1_c, det, fa, f1, then test f1_c, det, fa, f1.
+        Tuple of train rec, prec, f1, then test rec, prec, f1.
     """
-    train_f1_c = _classification_f1_from_recall_precision(
-        summary.cls_rec_tr, summary.cls_prec_tr
-    )
-    test_f1_c = _classification_f1_from_recall_precision(
-        summary.cls_rec_te, summary.cls_prec_te
-    )
     return (
-        train_f1_c,
-        summary.det_tr,
-        summary.fa_tr,
+        summary.cls_rec_tr,
+        summary.cls_prec_tr,
         summary.cls_f1_tr,
-        test_f1_c,
-        summary.det_te,
-        summary.fa_te,
+        summary.cls_rec_te,
+        summary.cls_prec_te,
         summary.cls_f1_te,
     )
 
@@ -1079,10 +999,10 @@ def _aggregate_sweep_mean_pm_cells(
         sweep_metric_rows: Per-run metric tuples (non-baseline sweep runs only).
 
     Returns:
-        Eight formatted strings: TR f1_c, det, fa, f1, then TE f1_c, det, fa, f1.
+        Six formatted strings: TR rec, prec, f1, then TE rec, prec, f1.
     """
     if not sweep_metric_rows:
-        return [_format_mean_plus_minus([]) for _ in range(8)]
+        return [_format_mean_plus_minus([]) for _ in range(6)]
     column_values = list(zip(*sweep_metric_rows))
     return [_format_mean_plus_minus(column) for column in column_values]
 
@@ -1117,7 +1037,7 @@ def _mean_te_val_f1_for_sort(sweep_metric_rows: Sequence[SweepMetricValues]) -> 
     Returns:
         Mean TE F1, or positive infinity when no values exist.
     """
-    te_f1_values = [metric_row[7] for metric_row in sweep_metric_rows]
+    te_f1_values = [metric_row[5] for metric_row in sweep_metric_rows]
     numeric_values = [float(value) for value in te_f1_values if value is not None]
     if not numeric_values:
         return float("inf")
@@ -1159,13 +1079,11 @@ def _print_sweep_mean_pm_summary_table(
         print()
         header_cells = [
             "Algo",
-            "tr_f1_c",
-            "tr_det",
-            "tr_fa",
+            "tr_rec",
+            "tr_prec",
             "tr_f1",
-            "te_f1_c",
-            "te_det",
-            "te_fa",
+            "te_rec",
+            "te_prec",
             "te_f1",
         ]
         print("| " + " | ".join(header_cells) + " |")
@@ -1185,14 +1103,12 @@ def _print_sweep_mean_pm_summary_table(
     width_numeric = 11
     header_parts = [
         f"{'Algo':<{width_algorithm}}",
-        f"{'f1_c':>{width_numeric}}",
-        f"{'det':>{width_numeric}}",
-        f"{'fa':>{width_numeric}}",
+        f"{'rec':>{width_numeric}}",
+        f"{'prec':>{width_numeric}}",
         f"{'f1':>{width_numeric}}",
         "|",
-        f"{'f1_c':>{width_numeric}}",
-        f"{'det':>{width_numeric}}",
-        f"{'fa':>{width_numeric}}",
+        f"{'rec':>{width_numeric}}",
+        f"{'prec':>{width_numeric}}",
         f"{'f1':>{width_numeric}}",
     ]
     header_line = " ".join(header_parts)
@@ -1205,7 +1121,7 @@ def _print_sweep_mean_pm_summary_table(
         row_parts = [f"{algorithm_name:<{width_algorithm}}"]
         for cell_index, formatted_cell in enumerate(mean_pm_cells):
             stripped_cell = formatted_cell.strip()
-            if cell_index == 4:
+            if cell_index == 3:
                 row_parts.append("|")
             row_parts.append(f"{stripped_cell:>{width_numeric}}")
         print(" ".join(row_parts))
@@ -1258,7 +1174,7 @@ def _print_tr_te_sweep_comparison(
     base_run_directory_paths: Optional[List[str]] = None,
     separate_algorithms: bool = False,
 ) -> None:
-    """Print TR/TE f1_c, det, fa, f1 rows keyed by a per-run integer parsed from the path.
+    """Print TR/TE rec, prec, f1 rows keyed by a per-run integer parsed from the path.
 
     Args:
         run_directory_paths: Coordinator run directories to load with :func:`parse_path`.
@@ -1339,13 +1255,11 @@ def _print_tr_te_sweep_comparison(
         if show_run_column:
             header_cells.append("run_dir")
         header_cells += [
-            "tr_f1_c",
-            "tr_det",
-            "tr_fa",
+            "tr_rec",
+            "tr_prec",
             "tr_f1",
-            "te_f1_c",
-            "te_det",
-            "te_fa",
+            "te_rec",
+            "te_prec",
             "te_f1",
         ]
         print("| " + " | ".join(header_cells) + " |")
@@ -1384,14 +1298,12 @@ def _print_tr_te_sweep_comparison(
         if show_run_column:
             header_parts.append(f"{'run_dir':<{width_run}}")
         header_parts += [
-            f"{'f1_c':>{width_numeric}}",
-            f"{'det':>{width_numeric}}",
-            f"{'fa':>{width_numeric}}",
+            f"{'rec':>{width_numeric}}",
+            f"{'prec':>{width_numeric}}",
             f"{'f1':>{width_numeric}}",
             "|",
-            f"{'f1_c':>{width_numeric}}",
-            f"{'det':>{width_numeric}}",
-            f"{'fa':>{width_numeric}}",
+            f"{'rec':>{width_numeric}}",
+            f"{'prec':>{width_numeric}}",
             f"{'f1':>{width_numeric}}",
         ]
         header_line = " ".join(header_parts)
@@ -1418,12 +1330,10 @@ def _print_tr_te_sweep_comparison(
                 f"{_fmt(metric_values[0]):>{width_numeric}}",
                 f"{_fmt(metric_values[1]):>{width_numeric}}",
                 f"{_fmt(metric_values[2]):>{width_numeric}}",
-                f"{_fmt(metric_values[3]):>{width_numeric}}",
                 "|",
+                f"{_fmt(metric_values[3]):>{width_numeric}}",
                 f"{_fmt(metric_values[4]):>{width_numeric}}",
                 f"{_fmt(metric_values[5]):>{width_numeric}}",
-                f"{_fmt(metric_values[6]):>{width_numeric}}",
-                f"{_fmt(metric_values[7]):>{width_numeric}}",
             ]
             print(" ".join(row_parts))
             previous_algorithm_name = algorithm_name
@@ -1480,10 +1390,10 @@ def print_mem_buffer_comparison(
         sweep_label_header="mem",
         sweep_label_from_run=_parse_memory_buffer_size_from_run_directory,
         markdown_section_title=(
-            "### Memory buffer comparison (TR and TE: f1_c, det, fa, f1)"
+            "### Memory buffer comparison (TR and TE: rec, prec, f1)"
         ),
         readable_title_line=(
-            "Memory buffer comparison (TR: f1_c det fa f1 | TE: f1_c det fa f1)"
+            "Memory buffer comparison (TR: rec prec f1 | TE: rec prec f1)"
         ),
         empty_message="No algorithm runs found for memory buffer comparison.",
         base_run_directory_paths=base_run_paths,
@@ -1529,10 +1439,10 @@ def print_task_order_seed_comparison(
         sweep_label_header="task_order_seed",
         sweep_label_from_run=_parse_task_order_seed_from_run_directory,
         markdown_section_title=(
-            "### Task order seed comparison (TR and TE: f1_c, det, fa, f1)"
+            "### Task order seed comparison (TR and TE: rec, prec, f1)"
         ),
         readable_title_line=(
-            "Task order seed comparison (TR: f1_c det fa f1 | TE: f1_c det fa f1)"
+            "Task order seed comparison (TR: rec prec f1 | TE: rec prec f1)"
         ),
         empty_message="No algorithm runs found for task order seed comparison.",
         base_run_directory_paths=base_run_paths,
@@ -1634,7 +1544,7 @@ def _parse_arguments() -> argparse.Namespace:
         metavar="RUN_DIR",
         help=(
             "Coordinator run directories (typically logs/full_experiments/run_*_mem_*) "
-            "to compare TR and TE f1_c, det, fa, and f1 across buffer sizes. "
+            "to compare TR and TE rec, prec, and f1 across buffer sizes. "
             "Printed after the main summary when --log/--logs are also used; "
             "buffer size is read from the directory name suffix _mem_<n> "
             "(see full_experiments_mem_sweep.sh)."
@@ -1648,7 +1558,7 @@ def _parse_arguments() -> argparse.Namespace:
         metavar="RUN_DIR",
         help=(
             "Coordinator run directories (typically run_*_task_order_seed_<n>) "
-            "to compare TR and TE f1_c, det, fa, and f1 across task-order seeds. "
+            "to compare TR and TE rec, prec, and f1 across task-order seeds. "
             "Same table as --mem-compare-runs; seed is read from suffix "
             "_task_order_seed_<n> (see full_experiments_task_order_seed_sweep.sh)."
         ),

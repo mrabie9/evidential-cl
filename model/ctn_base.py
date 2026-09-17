@@ -118,7 +118,6 @@ class ContextNet(nn.Module):
             iq_aug_feature_type=iq_aug_feature_type,
         )
         self.feature_dim = self.model.fc.in_features
-        self.det_head = nn.Linear(self.feature_dim, 1)
 
         # self.film1 = nn.Linear(task_emb, nf * 1 * 2)
         # self.film2 = nn.Linear(task_emb, nf * 2 * 2)
@@ -136,10 +135,7 @@ class ContextNet(nn.Module):
         return nn.Sequential(*layers)
 
     def base_param(self):
-        base_iter = chain(
-            self.model.parameters(),
-            self.det_head.parameters(),
-        )
+        base_iter = chain(self.model.parameters())
         for param in base_iter:
             if param.requires_grad:
                 yield param
@@ -195,20 +191,6 @@ class ContextNet(nn.Module):
         h4 = self.forward_h4(x)
         h4 = self._apply_film(h4, t, use_all=use_all)
         return self._pool_features(h4)
-
-    def forward_heads(self, x, t=None, use_all=True):
-        h4 = self.forward_h4(x)
-        det_feat = self._pool_features(h4)
-        det_logits = self.det_head(det_feat).squeeze(1)
-        cls_h4 = self._apply_film(h4, t, use_all=use_all)
-        cls_feat = self._pool_features(cls_h4)
-        cls_logits = self.model.fc(cls_feat)
-        return det_logits, cls_logits
-
-    def forward_det_agnostic(self, x, use_all=True):
-        h4 = self.forward_h4(x)
-        feat = self._pool_features(h4)
-        return self.det_head(feat).squeeze(1)
 
     def forward(self, x, t, use_all=True):
         h4 = self.forward_h4(x)

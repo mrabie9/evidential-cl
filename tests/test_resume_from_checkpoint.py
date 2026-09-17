@@ -103,9 +103,7 @@ def _minimal_rwalk_args(*, n_tasks: int) -> object:
     args.classes_per_task = [5] * n_tasks
     args.nc_per_task_list = ""
     args.nc_per_task = None
-    args.noise_label = None
     args.class_weighted_ce = False
-    args.use_detector_arch = False
     args.use_iq_aug_features = False
     args.data_scaling = "none"
     args.iq_aug_feature_type = "power"
@@ -115,10 +113,7 @@ def _minimal_rwalk_args(*, n_tasks: int) -> object:
     args.alpha = 0.9
     args.eps = 0.01
     args.clipgrad = 100.0
-    args.det_lambda = 1.0
     args.cls_lambda = 1.0
-    args.det_memories = 0
-    args.det_replay_batch = 64
     args.norm_track_stats = True
     args.alpha_init = 1e-3
     args.inner_steps = 1
@@ -171,9 +166,7 @@ def test_life_experience_skips_completed_tasks_when_resuming(tmp_path: Path) -> 
         amp_dtype="bfloat16",
         state_logging=False,
         n_epochs=1,
-        use_detector_arch=False,
         classes_per_task=5,
-        noise_label=None,
         class_order="sequential",
         log_dir=str(tmp_path),
         calc_test_accuracy=False,
@@ -193,8 +186,9 @@ def test_life_experience_skips_completed_tasks_when_resuming(tmp_path: Path) -> 
     model.observe = _counting_observe
 
     def _fake_eval(_model, tasks, _args, **_kwargs):
-        zeros = [0.5] * len(tasks)
-        return zeros, zeros, zeros, zeros, zeros
+        per_task = [0.5] * len(tasks)
+        # (macro_rec, macro_prec, macro_f1)
+        return per_task, per_task, per_task
 
     saved_tasks: list[int] = []
 

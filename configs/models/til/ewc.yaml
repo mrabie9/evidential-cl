@@ -1,15 +1,12 @@
-# Model-specific overrides for ewc.
 model: ewc
 loader: task_incremental_loader
-
-lr: 0.003
-lamb: 1
-
-# How the quadratic anchor is applied: loss | proximal.
-#   loss     -- add lambda * Omega * (theta - theta*)^2 to the training loss and
-#               let the optimiser descend it (the original behaviour).
+lamb: 10000000.0
+# How the quadratic anchor is applied: proximal | loss.
 #   proximal -- keep it out of the backward pass and apply its closed-form
 #               minimiser after the optimiser step (utils/proximal_anchor.py).
+#               The strength above was tuned upstream in this mode.
+#   loss     -- add lambda * Omega * (theta - theta*)^2 to the training loss and
+#               let the optimiser descend it (the original behaviour).
 # The two modes do NOT share a useful penalty strength; sweep each separately
 # (scripts/run_anchor_mode_benchmark.py).
-anchor_mode: loss
+anchor_mode: proximal

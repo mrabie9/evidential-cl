@@ -1,4 +1,3 @@
 model: er_ring
 loader: task_incremental_loader
-lr: 0.001
-memory_loss_lambda: 1
+memory_loss_lambda: 1.0

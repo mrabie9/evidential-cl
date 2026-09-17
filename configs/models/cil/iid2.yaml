@@ -1,0 +1,3 @@
+model: iid2
+loader: class_incremental_loader
+lr: 0.03

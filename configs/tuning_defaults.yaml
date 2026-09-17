@@ -1,13 +1,12 @@
 # Baseline configuration used when sweeping hyperparameters.
-# Do not merge configs/base.yaml here: full-run task_order_files and data_path
-# are incompatible with the small HPT tuning dataset (task0, task1, task2).
-expt_name: tuning_sweep_CIL
+expt_name: tuning_sweep
 arch: resnet1d
 loader: task_incremental_loader
+# Blank on purpose: configs/base.yaml's full-run task_order_files name files
+# that do not exist in the small HPT tuning dataset.
 task_order_files: ""
 
-data_path: "data/rff/radar_det_cls/hpt"
-# data_path: data/rff/radar/full
+data_path: data/rff/radar/hpt
 dataset: iq
 data_scaling: normalize
 classes_per_it: 6
@@ -20,10 +19,10 @@ samples_per_task: -1
 val_rate: 10
 
 cuda: true
+seed: 99
 amp: false
-seed: 0
 log_every: 50
-log_dir: logs / tuning / individual
+log_dir: logs/tuning/individual
 tf_dir: ""
 calc_test_accuracy: false
 state_logging: false
@@ -34,13 +33,11 @@ temperature: 5
 n_epochs: 5
 optimizer: sgd
 batch_size: 256
-replay_batch_size: 64
-# `clipgrad` was here. It never reached any model -- no argparse argument
-# declares that dest -- so every tuning run to date clipped at each
-# learner's own default (100 for SI/RWalk/WoE-SI, 5 for EWC, 10 for UCL).
-# Registering it now would silently change all of those, so it is removed
-# instead. `grad_clip_norm` below is the one that actually applies.
-grad_clip_norm: 5.0
+replay_batch_size: 128
+# 0 disables gradient clipping; set a positive norm to re-enable it. There is
+# no `clipgrad` key: no argparse argument declares it, so it would never reach
+# a model, and every learner's own `clipgrad` default is already 0.
+grad_clip_norm: 0
 
 # La-MAML parameters
 opt_lr: 0.1  # learning rate for LRs

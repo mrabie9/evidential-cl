@@ -79,7 +79,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from model.detection_replay import unpack_y_to_class_labels
+from model.replay_utils import unpack_y_to_class_labels
 from model.woe_si import Net as WoeSiNet, per_class_total_evidence
 from utils import misc_utils
 from utils.class_weighted_loss import classification_cross_entropy
@@ -287,7 +287,7 @@ class Net(WoeSiNet):
 
         loss = torch.zeros(1, device=device)
         if self.uses_ce_replay and self.replay_lambda != 0.0:
-            cls_logits = self.net.forward_heads(replay_x)[1]
+            cls_logits = self.net(replay_x)
             masked_logits = self._mask_replay_logits(cls_logits, replay_t)
             loss = loss + self.replay_lambda * classification_cross_entropy(
                 masked_logits,
@@ -465,7 +465,6 @@ class Net(WoeSiNet):
                 self.classes_per_task,
                 self.n_outputs,
                 cil_all_seen_upto_task=int(task_id),
-                global_noise_label=self.noise_label,
                 loader=self.incremental_loader_name,
             )
         return masked

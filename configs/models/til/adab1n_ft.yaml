@@ -1,0 +1,22 @@
+# AdaB1N settings for the naive fine-tuning arm (ER-Alg4 host, replay disabled).
+# Layer on top of configs/models/til/eralg4.yaml.
+#
+# memories: 0 empties the reservoir so no replay batch is ever drawn, reducing the
+# host to sequential fine-tuning with no continual-learning mechanism. Batches are
+# therefore single-task, AdaB1N's cross-task reweighting cannot engage, and
+# adab1n_init_weight is deliberately absent from this arm's grid.
+#
+# Swept 2026-09-11 (5 trials x 3 seeds, n_epochs=10, val_macro_f1): kappa ranged
+# 0.0976 (kappa=0.25) to 0.1859 (kappa=0.0 and 1.0, identical). Read as
+# instability rather than a kappa optimum — without replay the run forgets
+# catastrophically and the metric is jumpy, and the two extremes tying argues
+# against a monotonic effect. Left at 1.0 (ordinary BatchNorm momentum).
+#
+# This arm scored 0.157 overall vs 0.359 for the replay arm, so replay is worth
+# ~0.20 macro-F1 here — far more than any norm-layer setting.
+#
+# NOTE: tune_adab1n.py rewrites this file with the winning params and strips these
+# comments, so re-read it after any sweep.
+norm_type: adab1n
+kappa: 1.0
+memories: 0

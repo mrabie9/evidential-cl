@@ -42,6 +42,7 @@ from scripts.collect_bwt_from_metrics import (  # noqa: E402
     _extract_logged_output_dir_from_log,
     _extract_model_name_from_log_header,
 )
+from utils.metric_keys import first_present_key  # noqa: E402
 
 try:
     from torch.serialization import add_safe_globals  # type: ignore
@@ -176,12 +177,15 @@ def _parse_task_end_test_f1_from_metrics_dir(metrics_dir: Path) -> Dict[int, flo
     task_end_test_f1_by_task: Dict[int, float] = {}
     for task_index, metrics_path in enumerate(task_metrics_files):
         with np.load(metrics_path, allow_pickle=True) as metrics_data:
-            if "val_f1" not in metrics_data:
+            val_f1_key = first_present_key(metrics_data, ["val_macro_f1"])
+            if val_f1_key is None:
                 raise SystemExit(
-                    "Missing 'val_f1' in metrics file (required for cls_f1-only "
-                    f"test BWT): {metrics_path}"
+                    "Missing 'val_macro_f1' (or legacy 'val_f1') in metrics "
+                    f"file (required for cls_f1-only test BWT): {metrics_path}"
                 )
-            val_f1_values = np.asarray(metrics_data["val_f1"], dtype=float).reshape(-1)
+            val_f1_values = np.asarray(metrics_data[val_f1_key], dtype=float).reshape(
+                -1
+            )
             tasks_seen = task_index + 1
             if val_f1_values.size > tasks_seen:
                 val_f1_values = val_f1_values[-tasks_seen:]
@@ -360,9 +364,9 @@ def _evaluate_final_model_f1_by_task(
     )
     with torch.no_grad():
         eval_output = evaluator(model, list(task_loaders), run_args)
-    _cls_rec, _cls_prec, cls_f1, _det, _fa = _split_eval_output(eval_output)
+    _macro_rec, _macro_prec, macro_f1 = _split_eval_output(eval_output)
     return {
-        task_index: _extract_metric_at_index(cls_f1, task_index)
+        task_index: _extract_metric_at_index(macro_f1, task_index)
         for task_index in range(len(task_loaders))
     }
 
