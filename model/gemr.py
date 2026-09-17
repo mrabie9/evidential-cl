@@ -64,8 +64,12 @@ class GemRConfig:
         """
         cfg = GemRConfig()
         for field in cfg.__dataclass_fields__:
-            if hasattr(args, field):
-                setattr(cfg, field, getattr(args, field))
+            value = getattr(args, field, None)
+            # `None` means the argument was registered but never set (the parser
+            # gives shared names like `beta` and `gamma` a None default so each
+            # model keeps its own), so the dataclass default stands.
+            if value is not None:
+                setattr(cfg, field, value)
         return cfg
 
 

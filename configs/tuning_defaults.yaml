@@ -48,13 +48,11 @@ alpha_init: 0.001  # initialization for the LRs
 memories: 5120
 n_memories: 5120  # total replay-buffer capacity across all tasks
 
-# Parameters specific to MER were removed here. `beta` is not MER-specific as a
-# flag name -- ucl_bresnet, bcl_dual and bcl_single all have a `beta` config
-# field with different meanings and different defaults -- so once `--beta` is a
-# registered argument (it has to be, for UCL) a value left here reaches all of
-# them. It had never applied to anything: unregistered YAML keys are dropped by
-# parser._apply_config_overrides, and there is no MER tuning preset. Set MER's
-# gamma/beta/s on the command line if MER is ever tuned.
+# Parameters specific to MER were removed here. `gamma` and `beta` are not
+# MER-specific as flag names -- GEM, GEM-R and HAT read `gamma`; UCL, BCL-Dual
+# and BCL-Single read `beta`, each with its own meaning and default -- so values
+# left here would reach all of them on every tuning run. There is no MER tuning
+# preset; set MER's gamma/beta/s on the command line if MER is ever tuned.
 
 # Parameters specific to Meta-BGD
 bgd_optimizer: bgd  # Optimizer (choices: [adam, adagrad, bgd, sgd])
