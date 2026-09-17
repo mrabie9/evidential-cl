@@ -29,6 +29,7 @@ from model.detection_replay import (
     noise_label_from_args,
     unpack_y_to_class_labels,
 )
+from model.lwf_regulariser import LwfDistillationMixin
 from utils.training_metrics import macro_recall
 from utils import misc_utils
 from utils.class_weighted_loss import classification_cross_entropy
@@ -83,7 +84,7 @@ class ErAlgConfig:
         return cfg
 
 
-class Net(DetectionReplayMixin, nn.Module):
+class Net(DetectionReplayMixin, LwfDistillationMixin, nn.Module):
     def __init__(self, n_inputs, n_outputs, n_tasks, args):
         super(Net, self).__init__()
 
@@ -121,6 +122,10 @@ class Net(DetectionReplayMixin, nn.Module):
         self.temp = float(self.cfg.temperature)
         self.kl = nn.KLDivLoss(reduction="batchmean")
         self.teacher = None  # frozen model snapshot, set at each task boundary
+        # LwF (eralg4_lwf_lambda): distillation on the CURRENT task's batch over
+        # the columns of completed tasks -- a function-space term that needs no
+        # buffer, unlike er_distill above. Shares the same teacher snapshot.
+        self._init_lwf_distillation(args, "eralg4")
         self._init_det_replay(
             self.cfg.det_memories,
             self.cfg.det_replay_batch,
@@ -158,6 +163,9 @@ class Net(DetectionReplayMixin, nn.Module):
 
     def compute_offsets(self, task):
         return misc_utils.compute_offsets(task, self.classes_per_task)
+
+    def _device(self) -> torch.device:
+        return next(self.net.parameters()).device
 
     def _ll_params(self):
         for name, param in self.net.named_parameters():
@@ -344,11 +352,16 @@ class Net(DetectionReplayMixin, nn.Module):
             # Distillation: freeze the just-finished model as a teacher, mirroring
             # er_ring / gem_distill / BCL-Dual. Replay-sample KL below distills the
             # student toward this snapshot within each row's task class slice.
-            if self.use_distill:
+            if self.use_distill and self.lwf_lambda == 0.0:
                 self.teacher = copy.deepcopy(self.net)
                 self.teacher.eval()
                 for param in self.teacher.parameters():
                     param.requires_grad = False
+            # LwF teacher: a strict superset of the snapshot above (it also
+            # zeroes BatchNorm momentum so a bn_training=True teacher forward
+            # leaves the frozen running buffers alone), so when both terms are
+            # on the one snapshot serves both. No-op when LwF is off.
+            self._snapshot_lwf_teacher()
             self.current_task = t
 
         metric_logits = None
@@ -485,6 +498,14 @@ class Net(DetectionReplayMixin, nn.Module):
                     F.log_softmax(student_masked / self.temp, dim=1), teacher_probs
                 )
 
+            # LwF on the current rows (the tail of the batch): KL against the
+            # frozen teacher over previously-completed classes. Unmasked logits
+            # go in -- the mixin selects the previous-class columns itself.
+            if self.lwf_lambda != 0.0 and rc < prediction.size(0):
+                loss = loss + self.lwf_lambda * self._lwf_distillation_loss(
+                    prediction[rc:], bx[rc:], t
+                )
+
             loss.backward()
             if self.cfg.grad_clip_norm:
                 torch.nn.utils.clip_grad_norm_(
@@ -586,7 +607,14 @@ class Net(DetectionReplayMixin, nn.Module):
                     replay_loss = torch.zeros(
                         (), device=current_logits.device, dtype=current_logits.dtype
                     )
-                k_losses.append(current_loss + (self.memory_loss_lambda * replay_loss))
+                k_loss = current_loss + (self.memory_loss_lambda * replay_loss)
+                # LwF on the current batch only; the replay rows already carry
+                # their own hard labels through take_multitask_loss above.
+                if self.lwf_lambda != 0.0:
+                    k_loss = k_loss + self.lwf_lambda * self._lwf_distillation_loss(
+                        current_logits, live_x, t
+                    )
+                k_losses.append(k_loss)
 
             loss = k_losses[0] if k_avg == 1 else sum(k_losses) / k_avg
             cls_tr_rec.append(self._batch_accuracy(current_t, current_logits, y))

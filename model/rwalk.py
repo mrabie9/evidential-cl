@@ -22,6 +22,7 @@ from model.detection_replay import (
     signal_mask_exclude_noise,
     unpack_y_to_class_labels,
 )
+from model.lwf_regulariser import LwfDistillationMixin
 from utils.training_metrics import macro_recall
 from utils import misc_utils
 from utils.class_weighted_loss import classification_cross_entropy
@@ -69,7 +70,7 @@ class RWalkConfig:
         return cfg
 
 
-class Net(DetectionReplayMixin, nn.Module):
+class Net(DetectionReplayMixin, LwfDistillationMixin, nn.Module):
     """RWalk continual learner built on top of ``ResNet1D``."""
 
     def __init__(
@@ -108,6 +109,7 @@ class Net(DetectionReplayMixin, nn.Module):
         self.eps = float(self.cfg.eps)
         self.anchor_mode = resolve_anchor_mode(args)
         self.use_proximal_anchor = self.anchor_mode == "proximal"
+        self._init_lwf_distillation(args, "rwalk")
         self.clipgrad = self.cfg.clipgrad
         self.det_lambda = float(self.cfg.det_lambda)
         self.cls_lambda = float(self.cfg.cls_lambda)
@@ -217,6 +219,15 @@ class Net(DetectionReplayMixin, nn.Module):
                 # + self.det_lambda * det_loss
                 + self.lamb * regulariser
             )
+            if self.lwf_lambda != 0.0:
+                # Function-space regulariser running alongside the parameter
+                # anchor. Its gradient reaches `param.grad` and therefore the
+                # running Fisher / path integral below, which is the existing
+                # convention here: the regulariser's own gradient is already
+                # integrated too.
+                loss = loss + self.lwf_lambda * self._lwf_distillation_loss(
+                    cls_logits, x, t
+                )
             loss.backward()
 
             if self.clipgrad is not None:
@@ -336,6 +347,9 @@ class Net(DetectionReplayMixin, nn.Module):
             self.current_task,
             (self.fisher[name] + self.s[name] for name in self.fisher),
         )
+        # Freeze the just-finished task as the LwF teacher (no-op when the
+        # distillation term is off).
+        self._snapshot_lwf_teacher()
         self.tasks_trained += 1
 
     # ------------------------------------------------------------------

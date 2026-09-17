@@ -287,6 +287,28 @@ def get_parser():
         "reduction. K=1 (default) is the historical behaviour.",
     )
     parser.add_argument(
+        "--eralg4_lwf_lambda",
+        type=float,
+        default=0.0,
+        help="eralg4 (ER-reservoir): weight on a Learning-without-Forgetting "
+        "logit-distillation term (temperature-scaled KL against a frozen "
+        "end-of-task teacher, over the columns of already-completed tasks) "
+        "evaluated on the CURRENT task's incoming batch. 0 (default) disables "
+        "it. Distinct from --er_distill, which distills the REPLAY rows inside "
+        "each row's own task class slice: LwF needs no buffer and constrains "
+        "the function where the new data actually is. Composable with "
+        "--er_distill; both share the one end-of-task teacher snapshot. Runs "
+        "through the shared model/lwf_regulariser.py used by si / rwalk / "
+        "woe_si, so the numerics match model.lwf.",
+    )
+    parser.add_argument(
+        "--eralg4_lwf_temperature",
+        type=float,
+        default=5.0,
+        help="eralg4: softmax temperature for --eralg4_lwf_lambda. Matches "
+        "model.lwf's default of 5.0.",
+    )
+    parser.add_argument(
         "--cmaml_joint_er",
         action="store_true",
         help="C-MAML / La-MAML (lamaml_cifar): PROBE flag, twin of "
@@ -857,10 +879,56 @@ def get_parser():
         help="SI damping term in the per-task importance normaliser.",
     )
     parser.add_argument(
+        "--si_lwf_lambda",
+        type=float,
+        default=0.0,
+        help=(
+            "si: weight on a Learning-without-Forgetting logit-distillation term "
+            "(temperature-scaled KL against a frozen end-of-task teacher on "
+            "previously-seen classes). 0 (default) disables it. Orthogonal to "
+            "the SI path-integral anchor -- the anchor constrains parameters, "
+            "this constrains the function -- so both can be on at once. Setting "
+            "this with si_c=0 gives an LwF control inside this module. Mirrors "
+            "--woe_lwf_lambda."
+        ),
+    )
+    parser.add_argument(
+        "--si_lwf_temperature",
+        type=float,
+        default=5.0,
+        help=(
+            "si: softmax temperature for --si_lwf_lambda. Matches model.lwf's "
+            "default of 5.0."
+        ),
+    )
+    parser.add_argument(
         "--lamb",
         type=float,
         default=None,
         help="EWC / RWalk anchor-penalty strength lambda.",
+    )
+    parser.add_argument(
+        "--rwalk_lwf_lambda",
+        type=float,
+        default=0.0,
+        help=(
+            "rwalk: weight on a Learning-without-Forgetting logit-distillation "
+            "term (temperature-scaled KL against a frozen end-of-task teacher on "
+            "previously-seen classes). 0 (default) disables it. Orthogonal to "
+            "the F + s anchor -- the anchor constrains parameters, this "
+            "constrains the function -- so both can be on at once. Setting this "
+            "with lamb=0 gives an LwF control inside this module. Mirrors "
+            "--woe_lwf_lambda."
+        ),
+    )
+    parser.add_argument(
+        "--rwalk_lwf_temperature",
+        type=float,
+        default=5.0,
+        help=(
+            "rwalk: softmax temperature for --rwalk_lwf_lambda. Matches "
+            "model.lwf's default of 5.0."
+        ),
     )
     parser.add_argument(
         "--alpha",
