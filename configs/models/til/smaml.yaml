@@ -6,4 +6,4 @@ use_old_task_memory: false
 second_order: false
 opt_lr: 0.0003
 opt_wt: 0.01
-alpha_init: 0.003
+alpha_init: 0.001

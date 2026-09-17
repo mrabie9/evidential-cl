@@ -1,7 +1,7 @@
 model: ctn
 loader: task_incremental_loader
-ctx_lr: 0.0001
+ctx_lr: 0.01
 task_emb: 64
-memory_strength: 5
+memory_strength: 1
 validation: 0.3
 amp: false

@@ -1,4 +1,4 @@
 model: bcl_dual
 loader: task_incremental_loader
-memory_strength: 1
-beta: 0.2
+memory_strength: 100
+beta: 0.8

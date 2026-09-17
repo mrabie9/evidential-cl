@@ -2,4 +2,5 @@ model: eralg4
 loader: task_incremental_loader
 learn_lr: true
 meta_batches: 3
-opt_lr: 0.03
+opt_lr: 0.1
+memory_loss_lambda: 0.5

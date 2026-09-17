@@ -4,6 +4,6 @@ learn_lr: true
 sync_update: false
 use_old_task_memory: false
 second_order: false
-opt_lr: 0.0001
+opt_lr: 0.001
 alpha_init: 0.01
 momentum: 0.9
