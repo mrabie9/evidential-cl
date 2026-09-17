@@ -831,6 +831,21 @@ def get_parser():
     # methods that share the name `alpha` -- RWalk's Fisher EMA momentum and
     # UCL's mu-penalty strength -- from inheriting each other's default.
     parser.add_argument(
+        "--anchor_omega_uniform",
+        action="store_true",
+        help=(
+            "EWC / SI: replace the measured per-parameter importance with a "
+            "constant at consolidation, so the anchor keeps its accumulation "
+            "rule and loses only the RANKING. This is the control that says "
+            "whether importance carries anything in this domain: if the "
+            "uniform-Omega frontier matches the measured one, the method is "
+            "L2-SP and the importance estimate is noise. Mirrors woe_si's "
+            "woe_omega_transform='uniform' (ones per task, not mass-matched), "
+            "so lambda must be re-swept -- SI's Omega median is ~380x smaller "
+            "than ones and EWC's ~8e5x, which is where the matched grids sit."
+        ),
+    )
+    parser.add_argument(
         "--anchor_mode",
         type=str,
         default="loss",
@@ -993,7 +1008,7 @@ def get_parser():
         "--eucr_uncertainty",
         type=str,
         default="both",
-        choices=["nonspecificity", "discord", "both"],
+        choices=["nonspecificity", "discord", "both", "uniform", "random_proj"],
         help="EUCR consolidation importance readout: nonspecificity (omega), "
         "discord (entropy of the pignistic probability), or both (DS total).",
     )
@@ -1004,6 +1019,96 @@ def get_parser():
         choices=["dm", "pignistic"],
         help="EUCR classification head: dm (expected-utility + evidential BCE) or "
         "pignistic (BetP probability + NLL, no KL warm-up).",
+    )
+    parser.add_argument(
+        "--eucr_temper",
+        type=float,
+        default=0.0,
+        help="EUCR cautious-combination exponent: divide both Dempster log-sums by "
+        "n_prototypes**temper. 0 is Dempster's rule (the P prototypes are treated as "
+        "P independent sources, though they all read one feature vector); 1 is the "
+        "geometric mean of commonalities, which is idempotent under identical "
+        "sources and stops the ignorance mass degenerating in the prototype count.",
+    )
+    parser.add_argument(
+        "--eucr_ce_aux_weight",
+        type=float,
+        default=0.0,
+        help="EUCR: weight on an auxiliary per-task linear+cross-entropy head "
+        "sharing the backbone (direction G). 0 disables it. The DS head still makes "
+        "every prediction at evaluation, so any gain is a statement about the DS "
+        "head given good features, not about the linear head.",
+    )
+    parser.add_argument(
+        "--eucr_ds_detach",
+        action="store_true",
+        help="EUCR: with --eucr_ce_aux_weight, stop the DS head's gradient at the "
+        "pooled feature, so the backbone is shaped by cross-entropy alone and the "
+        "evidential head is a pure readout on top of it.",
+    )
+    parser.add_argument(
+        "--eucr_anchor_mode",
+        type=str,
+        default="loss",
+        choices=["loss", "proximal"],
+        help="EUCR consolidation anchor form. 'loss' adds lambda*Omega*(theta-"
+        "theta*)^2 to the objective; measured unstable here, since Omega's tail "
+        "puts the largest coordinates outside the explicit-descent window and the "
+        "global gradient clip then attenuates the task signal ~60x. 'proximal' "
+        "applies the anchor in closed form after the optimiser step, where it "
+        "cannot overshoot. Proximal needs a much larger lambda: 1/(2*lr).",
+    )
+    parser.add_argument(
+        "--eucr_bn_stats",
+        type=str,
+        default="batch",
+        choices=["batch", "running", "freeze", "per_task"],
+        help="EUCR BatchNorm statistics policy across tasks. 'batch' matches the "
+        "harness, which scores every ResNet1D model with batch statistics. "
+        "'running' is the old EUCR behaviour, which was a different protocol "
+        "from every model it was compared against. "
+        "shipped behaviour, where each task overwrites the statistics and "
+        "consolidation cannot reach them (measured: ~84%% of end-of-sequence task-0 "
+        "forgetting). 'freeze' stops updating them after the first task. "
+        "'per_task' banks one set per task and selects by task id at test time, "
+        "which is free in TIL.",
+    )
+    parser.add_argument(
+        "--eucr_readout_scale",
+        type=str,
+        default="untemper",
+        choices=["untemper", "none"],
+        help="EUCR: with --eucr_temper > 0, rescale the pignistic decision logits by "
+        "n_prototypes**temper so tempering does not collapse the readout temperature "
+        "(without this, temper=1 trains to 0.000 macro recall). The mass function "
+        "stays tempered, so omega and the conflict readout are unaffected. No-op at "
+        "temper=0.",
+    )
+    parser.add_argument(
+        "--eucr_activation_norm",
+        type=str,
+        default="max",
+        choices=["max", "none"],
+        help="EUCR prototype-activation normalisation. 'max' divides by the "
+        "per-sample maximum activation (shipped behaviour; pins the best prototype "
+        "at s~1 and so forces the fused ignorance mass to ~0 for every input). "
+        "'none' leaves alpha*exp(-gamma*d), which is already in (0, 1).",
+    )
+    parser.add_argument(
+        "--eucr_belief_init",
+        type=str,
+        default="random",
+        choices=["random", "class"],
+        help="EUCR Dempster-Shafer belief (beta) initialisation: random, or class "
+        "(prototype p starts biased toward class p %% num_class, which breaks the "
+        "near-uniform symmetry the head otherwise has to unlearn).",
+    )
+    parser.add_argument(
+        "--eucr_head_lr_scale",
+        type=float,
+        default=0.25,
+        help="EUCR learning-rate multiplier for the evidential parameter group "
+        "(ds_head / dm_head / probes) relative to the shared backbone group.",
     )
 
     # WoE-SI (Weight-of-Evidence Synaptic Intelligence) parameters.
@@ -1023,10 +1128,14 @@ def get_parser():
         "--woe_centering_mode",
         type=str,
         default="centered_uniform",
-        choices=["centered_uniform", "raw_uniform", "full_lc"],
+        choices=["centered_uniform", "raw_uniform", "prop2_uniform", "full_lc"],
         help=(
             "WoE-SI feature-centering / alpha scheme for the DS weights of "
-            "evidence (Denoeux 2019 Eq 25/29). 'full_lc' is not implemented."
+            "evidence (Denoeux 2019 Eq 25/29). 'prop2_uniform' is Denoeux's own "
+            "Prop 2 Eq 38 identification, under which sum_j w_jk = z_k exactly; "
+            "'centered_uniform' is this project's convention and drops the "
+            "sum_q beta*_qk mu_q term (measured 40-191x larger than the "
+            "beta*_0k it keeps). 'full_lc' is not implemented."
         ),
     )
     parser.add_argument(
@@ -1034,6 +1143,19 @@ def get_parser():
         type=float,
         default=0.9,
         help="WoE-SI EMA momentum for the per-task running feature mean mu_j.",
+    )
+    parser.add_argument(
+        "--woe_mu_mode",
+        type=str,
+        default="ema",
+        choices=["ema", "frozen_pretask"],
+        help=(
+            "Which mu centres the Denoeux weights of evidence. 'ema' (default) "
+            "uses the within-task running mean woe_feature_mean. "
+            "'frozen_pretask' uses the unweighted mean of phi over the task's "
+            "full training set, computed in a pre-pass before the task's first "
+            "gradient step and held fixed for the task (PR-3)."
+        ),
     )
     parser.add_argument(
         "--woe_importance_stride",
@@ -1089,13 +1211,48 @@ def get_parser():
         "--woe_replay_mode",
         type=str,
         default="ce",
-        choices=["ce", "evidence", "both"],
+        choices=[
+            "ce",
+            "evidence",
+            "both",
+            "evidence_sym",
+            "logit",
+            "ce_logit",
+            "ce_evidence_sym",
+        ],
         help=(
             "woe_si_replay: what the reservoir contributes to the loss. 'ce' "
             "(default) rehearses stored samples with cross-entropy. 'evidence' "
             "stores each item's DS total evidence at insertion time and applies a "
             "one-sided penalty when that evidence later decays, leaving increases "
-            "free. 'both' sums the two."
+            "free. 'both' sums the two. 'evidence_sym' and 'logit' are a matched "
+            "pair for the question of *what a buffer should store*: both charge a "
+            "symmetric squared drift from a per-item snapshot over the same draw, "
+            "differing only in whether the target is the evidence (w_plus, "
+            "w_minus) or the raw logits (i.e. Dark Experience Replay). The "
+            "Dempster-Shafer prediction is that the logit arm loses, because "
+            "z_k = w+_k - w-_k keeps only the difference of the two channels and "
+            "discards their common magnitude -- the ignorance degree of freedom. "
+            "All non-'ce' modes are weighted by woe_evidence_lambda."
+        ),
+    )
+    parser.add_argument(
+        "--woe_replay_store",
+        type=str,
+        default="input",
+        choices=["input", "feature"],
+        help=(
+            "woe_si_replay: what the reservoir physically stores per item. "
+            "'input' (default) keeps the canonicalised network input. 'feature' "
+            "keeps the penultimate features phi and replays them straight into "
+            "the readout. The DS motive is that the evidence is a function of phi "
+            "at the readout, so phi is a sufficient statistic for it and the input "
+            "is a more expensive route to the same thing; on this data phi is 512 "
+            "floats against a 1024-float input, so a matched byte budget buys 2x "
+            "the exemplars. Compare at matched *bytes*, not matched item count. "
+            "Costs: stored features go stale as the backbone drifts (they are "
+            "never re-encoded), and replay then reaches only the readout, leaving "
+            "the backbone with no rehearsal gradient at all."
         ),
     )
     parser.add_argument(
@@ -1140,7 +1297,7 @@ def get_parser():
         "--woe_omega_transform",
         type=str,
         default="relu",
-        choices=["relu", "abs"],
+        choices=["relu", "abs", "uniform", "displacement"],
         help=(
             "woe_si: how the signed path integral is projected onto the "
             "non-negative Omega the quadratic anchor requires. Some projection "
@@ -1153,17 +1310,47 @@ def get_parser():
         ),
     )
     parser.add_argument(
+        "--woe_omega_accum",
+        type=str,
+        default="sum",
+        choices=["sum", "max", "sum_norm", "max_norm"],
+        help=(
+            "woe_si: how per-task importance is combined across tasks into the "
+            "cumulative Omega the anchor uses. 'sum' (default) is Dempster's "
+            "rule -- weights of evidence add, which assumes the tasks are "
+            "*distinct* bodies of evidence. 'max' is Denoeux's cautious rule "
+            "for non-distinct evidence: the canonical weight function combines "
+            "by minimum, and since a weight of evidence is -log of it, that is "
+            "a maximum on this scale. Sequential tasks share a backbone and "
+            "each is initialised from the last, so they are emphatically not "
+            "distinct -- which makes 'max' the derivable choice and 'sum' the "
+            "approximation. Also the theory behind online-EWC/SI decay factors, "
+            "which patch summed importance by hand. Lowers total Omega without "
+            "changing which parameters are non-zero, so woe_lambda must be "
+            "re-swept upward (by roughly the number of consolidations)."
+        ),
+    )
+    parser.add_argument(
         "--woe_importance_scalar",
         type=str,
         default="i2",
-        choices=["i2", "z2", "phi2", "ce"],
+        choices=["i2", "z2", "phi2", "ce", "i1", "logit", "conflict"],
         help=(
             "woe_si: which scalar the SI path integral tracks. 'i2' (default) "
             "is the Dempster-Shafer information content, i.e. WoE-SI proper. "
             "The rest are ablations: 'z2' squared active-logit norm, 'phi2' "
             "squared feature norm, 'ce' the task loss (= plain Synaptic "
-            "Intelligence). They sit on different scales, so woe_lambda must "
-            "be swept per scalar."
+            "Intelligence), 'i1' the p=1 member of the same I_p family (the L1 "
+            "norm of the weights of evidence) -- the sibling of the method's "
+            "own scalar rather than an outside stand-in, testing whether the "
+            "exponent Denoeux chose for tractability matters. 'logit' and "
+            "'conflict' are the two halves of the exact decomposition "
+            "I_2 = ||z'||^2 + 2 sum_k w+_k w-_k, which attribute the "
+            "ranking to the decisiveness or the contradiction term. Note "
+            "'logit' is NOT 'z2': under centered_uniform the total weight "
+            "of evidence is z_k - beta_k.mu, and the divisor is J^2 rather "
+            "than the active-class count. They sit on "
+            "different scales, so woe_lambda must be swept per scalar."
         ),
     )
     parser.add_argument(
@@ -1178,6 +1365,185 @@ def get_parser():
             "than the logits. Incompatible with woe_reg_level='output', which "
             "already applies this term weighted by woe_lambda. Its scale is "
             "the J^2-normalised one, where the swept value was ~3."
+        ),
+    )
+    parser.add_argument(
+        "--woe_lc_lambda",
+        type=float,
+        default=0.0,
+        help=(
+            "Least-Commitment objective (woe_si and eralg4): weight on a term "
+            "that *minimises* the DS information content I_2 of the readout's "
+            "mass function on the current task's rows and columns, alongside CE. "
+            "Commit no more evidence than the data requires, so evidential room "
+            "is left for later tasks. Algebraically a squared-norm penalty on "
+            "the centred logits plus a per-class conflict penalty, i.e. a "
+            "confidence penalty with a DS-specific extra term. 0 (default) "
+            "disables it. Shares the J^2 normalisation of the I_2 importance "
+            "signal, so it is on that scale, not the cross-entropy's. "
+            "NEGATIVE values are allowed and invert the term into a reward -- "
+            "the conflict-seeking hypothesis (make each class score a small "
+            "residue of large opposing evidence, so features must specialise). "
+            "Only do that with woe_lc_term='kappa': i2/logit/conflict are "
+            "unbounded above and quadratic in the readout scale, and w+ - w- is "
+            "all cross-entropy sees, so a negative lambda on them rewards an "
+            "inflation direction CE is blind to and the run diverges."
+        ),
+    )
+    parser.add_argument(
+        "--woe_lc_term",
+        type=str,
+        default="i2",
+        choices=["i2", "logit", "conflict", "kappa"],
+        help=(
+            "Least-Commitment objective: which half of I_2 to charge. I_2 splits "
+            "exactly as ||z'||^2 + 2*sum_k w+_k*w-_k, a confidence penalty on the "
+            "centred logits plus a per-class conflict penalty. 'i2' (default) "
+            "charges both, 'logit' only the confidence half (no evidence theory "
+            "in it -- the control), 'conflict' only the DS-specific half, which "
+            "charges support for and against the same class being simultaneously "
+            "large. The three differ in magnitude, so woe_lc_lambda does not "
+            "transfer between them; measure with WOE_LC_DEBUG=1 first. "
+            "'kappa' is not a piece of I_2 at all: it is the exact Dempster "
+            "conflict (1-e^-w+/tau)(1-e^-w-/tau) in [0,1], averaged over "
+            "classes and carrying no J^p divisor. It exists so a NEGATIVE "
+            "woe_lc_lambda -- maximise conflict, to force feature "
+            "specialisation -- is well posed: it keeps the raw product's "
+            "reward for both channels being large but saturates, so the reward "
+            "runs out instead of running away. Affects "
+            "only what the objective charges, never the scalar the SI path "
+            "integral tracks."
+        ),
+    )
+    parser.add_argument(
+        "--woe_lc_tau",
+        type=float,
+        default=4.0,
+        help=(
+            "Least-Commitment objective: evidence scale tau of the "
+            "woe_lc_term='kappa' belief transform 1-exp(-w/tau); ignored by "
+            "every other term. Not cosmetic -- the transform saturates hard, "
+            "and past w/tau ~ 16.6 it rounds to 1.0 in float32 with exactly "
+            "zero gradient, so tau must sit near the typical w_plus (measured "
+            "at 4.1-5.3 here). tau is also the knob that says how much "
+            "opposing evidence counts as 'enough' when the term is rewarded "
+            "rather than penalised."
+        ),
+    )
+    parser.add_argument(
+        "--woe_lc_p",
+        type=int,
+        default=2,
+        choices=[1, 2],
+        help=(
+            "Least-Commitment objective: exponent p of the Denoeux I_p family, "
+            "I_p = sum_k (w+_k^p + w-_k^p). Denoeux picks p=2 for tractability "
+            "and says so, and every recorded result here used it. p=1 is a "
+            "different mechanism, not a milder one: since w+_k + w-_k = "
+            "sum_j |w_jk|, I_1 is the L1 norm of the weight-of-evidence matrix, "
+            "so minimising it drives most features to vacuity and concentrates "
+            "the evidence on a few -- structurally what PackNet and HAT do by "
+            "masking, which makes p a bridge between the regularisation and "
+            "architectural families. p=2 spreads evidence instead. Normalised "
+            "by J^p, which keeps each a per-feature average but does NOT put "
+            "them on a common scale: re-sweep woe_lc_lambda per p. Affects only "
+            "what the objective charges; the tracked scalar's exponent is "
+            "woe_importance_scalar ('i1' vs 'i2')."
+        ),
+    )
+    parser.add_argument(
+        "--woe_lc_readout_only",
+        action="store_true",
+        help=(
+            "Least-Commitment objective: detach the backbone features in the "
+            "penalty, so it constrains only the linear readout. I_2 is zero "
+            "either when the readout vanishes (the intended confidence penalty) "
+            "or when phi collapses onto the running feature mean -- and the "
+            "second route is nearly free for the current task while wrecking the "
+            "shared features old tasks read. This flag isolates which of the two "
+            "any measured effect came from. Mirrors "
+            "--woe_evidence_readout_only for the replay decay penalty."
+        ),
+    )
+    parser.add_argument(
+        "--woe_evidential_mode",
+        type=str,
+        default="off",
+        choices=["off", "balance", "belief"],
+        help=(
+            "woe_si: replace cross-entropy with an evidential objective -- a "
+            "two-sided log loss on a bounded per-class evidential score b_k, "
+            "asking for evidence supporting the label and against the others. "
+            "'off' (default) keeps plain CE. 'balance' scores "
+            "b_k = w+/(w+ + w-), the share of the class's total contribution "
+            "magnitude that supports it; it is exactly invariant to rescaling "
+            "the readout row, which is what stops the objective being satisfied "
+            "by inflating beta (the failure that makes the one-sided hinge "
+            "unsound). 'belief' scores the DS singleton belief "
+            "(1 - e^-w+/tau)*e^-w-/tau, faithful to the evidence semantics but "
+            "scale-dependent, so it needs woe_evidential_tau near the measured "
+            "w_plus. Charged on the current task's columns only."
+        ),
+    )
+    parser.add_argument(
+        "--woe_evidential_gamma",
+        type=float,
+        default=1.0,
+        help=(
+            "woe_si: mixing weight of the evidential objective against CE, as "
+            "(1-gamma)*CE + gamma*evidential. 1.0 (default) replaces CE "
+            "outright, which is the honest test of the idea; intermediate values "
+            "keep a CE signal on the logits while the evidential term shapes the "
+            "evidence. Ignored unless woe_evidential_mode is set."
+        ),
+    )
+    parser.add_argument(
+        "--woe_evidential_tau",
+        type=float,
+        default=4.0,
+        help=(
+            "woe_si: evidence scale for woe_evidential_mode='belief'. The belief "
+            "transform 1-exp(-w/tau) saturates hard -- past w/tau ~ 16.6 it "
+            "rounds to exactly 1.0 in float32 and the gradient is exactly zero -- "
+            "so tau must sit near the typical w_plus, measured at 4.1-5.3 on this "
+            "model. Unused by mode='balance', which is scale-free."
+        ),
+    )
+    parser.add_argument(
+        "--woe_evidential_predict",
+        type=str,
+        default="logit",
+        choices=["logit", "score"],
+        help=(
+            "woe_si: which score prediction uses when the evidential objective "
+            "is on. 'logit' (default) keeps argmax over the raw logits, the rule "
+            "every recorded result was evaluated under. 'score' predicts with the "
+            "evidential score instead -- argmax over d_k/s_k = 2*b_k - 1, i.e. "
+            "the logit normalised by the class's total contribution magnitude. "
+            "The two rankings are different functions and measurably disagree "
+            "(3-18%% of samples), with the evidential one the more accurate on "
+            "training batches, so evaluating a model trained on b_k with argmax "
+            "over z is a measurement artefact. Free of task-local state under "
+            "woe_centering_mode=raw_uniform; under centred features the score "
+            "depends on mu, which is reset every task."
+        ),
+    )
+    parser.add_argument(
+        "--woe_evidential_class_balance",
+        type=lambda value: str(value).lower() not in ("0", "false", "no"),
+        default=True,
+        help=(
+            "woe_si: weight the evidential loss by inverse label frequency in the "
+            "minibatch (default true, the same scheme as class_weighted_ce). Not "
+            "cosmetic: each class row is the target for p_k of the batch and a "
+            "non-target for the rest, and total commitment s_k enters w+_k with a "
+            "positive coefficient either way, so with unequal priors the "
+            "non-target term dominates and the objective degenerates into a net "
+            "shrinkage of commitment -- approximately the Least-Commitment "
+            "objective, which measured monotonically harmful (readme E1). "
+            "Balancing makes the effective composition uniform, so the built-in "
+            "1/(K-1) weight on the non-target term cancels the shrinkage exactly. "
+            "Set false only to measure that degeneration deliberately."
         ),
     )
     parser.add_argument(
@@ -1200,6 +1566,27 @@ def get_parser():
         help=(
             "woe_si: softmax temperature for --woe_lwf_lambda. Matches "
             "model.lwf's default of 5.0."
+        ),
+    )
+    parser.add_argument(
+        "--woe_teacher_dropout",
+        type=str,
+        default="keep",
+        choices=["keep", "disable"],
+        help=(
+            "woe_si: whether the frozen distillation teacher keeps the "
+            "backbone's dropout active. The teacher is scored with "
+            "bn_training=True so it normalises with the current batch's "
+            "statistics (see _lwf_distillation_loss), but ResNet1D.forward "
+            "implements that as model.train(True), which also switches the four "
+            "trunk dropout modules on. The LwF target is therefore stochastic: "
+            "two forwards of identical weights on identical input differ by "
+            "~0.48 in logit space. 'disable' zeroes the *teacher copy's* dropout "
+            "probability at snapshot time, which removes that noise while "
+            "leaving batch-statistic normalisation exactly as it was -- the "
+            "student's own dropout is untouched. 'keep' (default) reproduces the "
+            "readme B4 numbers bit for bit. Also applies to the "
+            "--woe_evidence_distill_lambda teacher, which is the same snapshot."
         ),
     )
     parser.add_argument(

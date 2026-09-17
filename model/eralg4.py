@@ -29,6 +29,7 @@ from model.detection_replay import (
     noise_label_from_args,
     unpack_y_to_class_labels,
 )
+from model.woe_si import least_commitment_penalty
 from utils.training_metrics import macro_recall
 from utils import misc_utils
 from utils.class_weighted_loss import classification_cross_entropy
@@ -64,6 +65,18 @@ class ErAlgConfig:
     er_distill: bool = False
     memory_strength: float = 1.0
     temperature: float = 5.0
+    # Least-Commitment objective (see model.woe_si.least_commitment_penalty):
+    # minimise the Dempster-Shafer information content I_2 of the readout's mass
+    # function on the *current-task* rows alongside CE, so the model commits only
+    # the evidence the data requires. 0 (default) leaves plain ER untouched. The
+    # two centring knobs are shared with woe_si so the same lambda means the same
+    # thing in both learners.
+    woe_lc_lambda: float = 0.0
+    woe_lc_readout_only: bool = False
+    woe_lc_term: str = "i2"
+    woe_lc_p: int = 2
+    woe_centering_mode: str = "centered_uniform"
+    woe_mu_momentum: float = 0.9
 
     arch: str = "resnet1d"
     dataset: str = "tinyimagenet"
@@ -121,6 +134,32 @@ class Net(DetectionReplayMixin, nn.Module):
         self.temp = float(self.cfg.temperature)
         self.kl = nn.KLDivLoss(reduction="batchmean")
         self.teacher = None  # frozen model snapshot, set at each task boundary
+        # Least-Commitment objective. `lc_feature_mean` is the per-task EMA of the
+        # penultimate features that centres the DS weights of evidence, mirroring
+        # woe_si's `woe_feature_mean`. Kept as a plain attribute rather than a
+        # registered buffer so the state dict -- and therefore every existing
+        # eralg4 checkpoint -- is unchanged; it is a per-task statistic that is
+        # reset at each boundary anyway.
+        self.lc_lambda = float(self.cfg.woe_lc_lambda)
+        # Confine the term to the readout; see woe_si.Net.__init__ for why the
+        # backbone route (phi -> mu, feature collapse) is the one to isolate.
+        self.lc_readout_only = bool(self.cfg.woe_lc_readout_only)
+        # Which half of I_2 to charge; see model.woe_si.least_commitment_penalty.
+        self.lc_term = str(self.cfg.woe_lc_term)
+        # Exponent of the I_p family; p=1 makes the term an L1 (sparsity)
+        # criterion on the weights of evidence. See model.woe_si.
+        self.lc_p = int(self.cfg.woe_lc_p)
+        self.lc_centering_mode = str(self.cfg.woe_centering_mode)
+        self.lc_mu_momentum = float(self.cfg.woe_mu_momentum)
+        self.lc_feature_mean: Optional[torch.Tensor] = None
+        if self.lc_lambda != 0.0 and self.cfg.learn_lr:
+            # la_ER updates the weights through hand-rolled per-parameter alpha
+            # steps on a separately recomputed ER loss; the term is not wired
+            # into that path, and silently ignoring it would misreport the run.
+            raise ValueError(
+                "woe_lc_lambda is not implemented for the --learn_lr (la_ER) "
+                "path; run it on the standard ER or joint-ER loop."
+            )
         self._init_det_replay(
             self.cfg.det_memories,
             self.cfg.det_replay_batch,
@@ -256,6 +295,72 @@ class Net(DetectionReplayMixin, nn.Module):
 
         return bxs, bys, bts, replay_count
 
+    def _least_commitment_loss(self, features: torch.Tensor, t: int) -> torch.Tensor:
+        """Least-Commitment penalty on the current task's rows and columns.
+
+        The DS-native counterpart of a confidence penalty: minimising the
+        information content ``I_2`` of the readout's mass function asks the model
+        to commit only the evidence the data requires, leaving evidential room
+        for later tasks. See ``model.woe_si.least_commitment_penalty`` for the
+        algebra (it decomposes into a centred-logit norm plus a per-class
+        conflict term) and the ``J^2`` normalisation, which is shared so that one
+        ``woe_lc_lambda`` means the same thing in both learners.
+
+        Scoped deliberately:
+
+        * **current-task rows only.** Replayed rows exist to hold old tasks in
+          place; asking the model to un-commit the evidence it holds on them is
+          the opposite of what the buffer is for.
+        * **current-task columns only.** Same reasoning, at the readout.
+
+        Args:
+            features: Penultimate features of the current-task rows, attached to
+                the graph.
+            t: Current task index.
+
+        Returns:
+            Scalar penalty; ``0`` when the slice is empty.
+        """
+        if features.size(0) == 0:
+            return torch.zeros((), device=features.device, dtype=features.dtype)
+        self._update_lc_feature_mean(features.detach())
+        if self.lc_readout_only:
+            features = features.detach()
+        columns = misc_utils.current_task_class_indices(
+            t,
+            self.classes_per_task,
+            self.n_outputs,
+            global_noise_label=self.noise_label,
+            device=features.device,
+        )
+        if columns.numel() == 0:
+            return torch.zeros((), device=features.device, dtype=features.dtype)
+        readout = self.net.model.fc
+        return least_commitment_penalty(
+            features,
+            readout.weight[columns],
+            readout.bias[columns],
+            self.lc_feature_mean,
+            centering_mode=self.lc_centering_mode,
+            term=self.lc_term,
+            p=self.lc_p,
+        )
+
+    def _update_lc_feature_mean(self, batch_features: torch.Tensor) -> None:
+        """EMA-update the per-task feature mean that centres the LC penalty.
+
+        Mirrors ``woe_si.Net._update_feature_mean``: seeded with the first
+        batch's mean rather than with zeros, so the centring reference is never
+        an arbitrary origin the evidence is measured against.
+        """
+        batch_mean = batch_features.mean(dim=0)
+        if self.lc_feature_mean is None:
+            self.lc_feature_mean = batch_mean
+        else:
+            self.lc_feature_mean = self.lc_feature_mean.mul(self.lc_mu_momentum).add(
+                batch_mean, alpha=1.0 - self.lc_mu_momentum
+            )
+
     def _mask_logits_for_sample_tasks(
         self, raw_logits: torch.Tensor, sample_task_indices: torch.Tensor
     ) -> torch.Tensor:
@@ -349,6 +454,10 @@ class Net(DetectionReplayMixin, nn.Module):
                 self.teacher.eval()
                 for param in self.teacher.parameters():
                     param.requires_grad = False
+            # The LC centring reference is a per-task statistic: carrying the
+            # previous task's feature mean into a new radar dataset would measure
+            # the evidence against the wrong origin.
+            self.lc_feature_mean = None
             self.current_task = t
 
         metric_logits = None
@@ -464,8 +573,18 @@ class Net(DetectionReplayMixin, nn.Module):
             bx = bx.squeeze()
             # Raw logits; per-sample task masking happens inside
             # ``take_multitask_loss`` (global CE targets index ``n_outputs``).
-            prediction = self.net.forward(bx)
+            # Split into features + readout (exactly what ``net.forward`` does
+            # internally) so the Least-Commitment term can reuse this forward
+            # rather than paying for a second one.
+            features = self.net.forward_features(bx)
+            prediction = self.net.forward_classifier(features)
             loss = self._weighted_multitask_loss(prediction, by, bt, replay_count)
+            if self.lc_lambda != 0.0:
+                # ``getBatch`` lays the batch out as [replay rows, current rows].
+                replay_rows = max(0, min(int(replay_count), features.size(0)))
+                loss = loss + self.lc_lambda * self._least_commitment_loss(
+                    features[replay_rows:], t
+                )
             cls_tr_rec.append(self._batch_accuracy(bt, prediction, by))
             self._dbg("BASE", pass_itr, t, bx, prediction, by, bt, replay_count, loss)
 
@@ -573,8 +692,17 @@ class Net(DetectionReplayMixin, nn.Module):
             k_losses = []
             for _k in range(k_avg):
                 live_x = self._canonicalize_input(raw_x, detach=False)
-                current_logits = self.net.forward(live_x)
+                current_features = self.net.forward_features(live_x)
+                current_logits = self.net.forward_classifier(current_features)
                 current_loss = self.take_multitask_loss(current_t, current_logits, y)
+                if self.lc_lambda != 0.0:
+                    # This forward already holds only current-task rows, so the
+                    # whole slice is charged.
+                    current_loss = (
+                        current_loss
+                        + self.lc_lambda
+                        * self._least_commitment_loss(current_features, t)
+                    )
 
                 if replay is not None:
                     replay_x, replay_y, replay_t = replay

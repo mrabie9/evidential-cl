@@ -94,6 +94,7 @@ class Net(DetectionReplayMixin, nn.Module):
         self.incremental_loader_name = getattr(args, "loader", None)
 
         self.lamb = float(self.cfg.lamb)
+        self.omega_uniform = bool(getattr(args, "anchor_omega_uniform", False))
         self.anchor_mode = resolve_anchor_mode(args)
         self.use_proximal_anchor = self.anchor_mode == "proximal"
         self.clipgrad = float(self.cfg.clipgrad) if self.cfg.clipgrad > 0 else None
@@ -293,6 +294,11 @@ class Net(DetectionReplayMixin, nn.Module):
             if fisher_est is None:
                 continue
             fisher_est = fisher_est * scale
+            if self.omega_uniform:
+                # See --anchor_omega_uniform: keep the merge rule, drop the
+                # ranking. EWC merges by running average, so a constant stays
+                # constant rather than counting tasks as SI's sum does.
+                fisher_est = torch.ones_like(fisher_est)
             if name in self.fisher:
                 prev = self.fisher[name]
                 merged = (prev * self._tasks_consolidated + fisher_est) / (

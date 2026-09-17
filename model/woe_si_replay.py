@@ -60,22 +60,34 @@ also confines the mechanism to the one place the Dempster-Shafer construction is
 exact -- for the backbone, ``d I / d theta`` is ``(d I / d phi)(d phi / d theta)``,
 where only the first factor carries DS content.
 
-The evidence snapshot is stored *alongside* the input, not instead of it: penalising
-decay requires re-evaluating the current model on the stored item, which needs the
-input. The extra cost is ``2 * n_outputs`` floats per item against an input of a few
-thousand, so it is a few percent of buffer memory.
+The evidence snapshot is stored *alongside* the stored item, not instead of it:
+penalising drift requires re-evaluating the current model, which needs something to
+evaluate. The extra cost is ``2 * n_outputs`` floats per item against a stored item
+of 512-1024, so it is a few percent of buffer memory.
 
-Config: ``configs/models/til/woe_si_replay.yaml``. Extra knobs:
-``woe_replay_memories`` (buffer capacity), ``woe_replay_batch_size`` (replay draw
-per step), ``woe_replay_lambda`` (replay CE weight), ``woe_replay_mode``
-(``ce``/``evidence``/``both``), ``woe_evidence_lambda`` (evidence-decay weight),
+``woe_replay_store`` decides what that stored item is. The default ``'input'`` keeps
+the canonicalised network input; ``'feature'`` keeps the penultimate features ``phi``
+and replays them straight into the readout. The Dempster-Shafer motive is that the
+evidence is a function of ``phi`` at the readout, making ``phi`` a sufficient
+statistic for it and the input a more expensive route to the same place -- worth 2x
+the exemplars per byte here (512 floats against 1024). It costs staleness (stored
+features are never re-encoded as the backbone drifts) and confines replay to the
+readout, so the backbone gets no rehearsal gradient at all.
+
+Config: ``configs/models/til/woe_si_replay.yaml``, or
+``configs/models/til/woe_si_injection.yaml`` for the anchor-off, small-buffer host
+the storage question is measured on. Extra knobs: ``woe_replay_memories`` (buffer
+capacity), ``woe_replay_batch_size`` (replay draw per step), ``woe_replay_lambda``
+(replay CE weight), ``woe_replay_mode``
+(``ce``/``evidence``/``both``/``evidence_sym``/``logit``), ``woe_replay_store``
+(``input``/``feature``), ``woe_evidence_lambda`` (weight on any non-CE term),
 ``woe_evidence_scale`` (``weight``/``belief``) and ``woe_evidence_belief_tau``.
 """
 
 from __future__ import annotations
 
 import random
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -85,11 +97,68 @@ from utils import misc_utils
 from utils.class_weighted_loss import classification_cross_entropy
 
 # What the reservoir contributes to the training loss:
-#   "ce"       -- cross-entropy on rehearsed samples (the original behaviour).
-#   "evidence" -- one-sided penalty on the DS total evidence of rehearsed samples
-#                 falling below what it was when they were stored.
-#   "both"     -- the sum of the two.
-_REPLAY_MODES = ("ce", "evidence", "both")
+#   "ce"           -- cross-entropy on rehearsed samples (the original behaviour).
+#   "evidence"     -- one-sided penalty on the DS total evidence of rehearsed
+#                     samples falling below what it was when they were stored.
+#   "both"         -- the sum of "ce" and "evidence".
+#   "evidence_sym" -- symmetric squared drift of (w_plus, w_minus) from the
+#                     snapshot: any movement is charged, not only decay.
+#   "logit"        -- symmetric squared drift of the *logits* from the snapshot,
+#                     i.e. Dark Experience Replay (Buzzega et al. 2020).
+#
+# The last two exist as a **matched pair**, and that is the whole point of them.
+# Under a Dempster-Shafer reading, replay works by re-injecting evidence for old
+# classes to counteract the conflict new evidence introduces. If that is really
+# the mechanism, then what a buffer needs to carry is the weight-of-evidence
+# vector rather than the input -- and distilling `w` should beat distilling the
+# logits, because a logit is the *difference* w_plus - w_minus and therefore
+# discards the ignorance degree of freedom: (8, 1) and (108, 101) are the same
+# logit built from wildly different amounts of evidence, and only the second is
+# a claim the model should be held to.
+#
+# "logit" and "evidence_sym" are deliberately the same functional form (a
+# symmetric squared drift against a per-item snapshot taken at insertion) over
+# the same items, drawn from the same buffer, at the same width. The only thing
+# that differs is *what is distilled*, so the comparison isolates the DS content
+# rather than confounding it with the shape of the penalty -- which is what the
+# pre-existing one-sided "evidence" mode could not do against a DER baseline.
+_REPLAY_MODES = (
+    "ce",
+    "evidence",
+    "both",
+    "evidence_sym",
+    "logit",
+    # DER++ analogues: distillation *on top of* CE rehearsal rather than instead
+    # of it. C6 read a null between the `logit` and `evidence_sym` targets as
+    # evidence about what a buffer should store, but both recovered only ~19% of
+    # the gap CE rehearsal closes -- a null between two targets inside a vehicle
+    # that barely delivers cannot discriminate the targets. These arms establish
+    # whether distillation works at all on this host before that null is read.
+    "ce_logit",
+    "ce_evidence_sym",
+)
+
+# What the reservoir physically stores per item:
+#   "input"   -- the canonicalised network input (the original behaviour).
+#   "feature" -- the penultimate features phi, replayed straight into the readout.
+#
+# The DS motivation is the second half of the same hypothesis: the evidence
+# w_jk = beta_kj * (phi_j - mu_j) + beta_0k / J is a function of phi at the
+# readout, so phi is a *sufficient statistic* for everything the evidence
+# reading cares about, and the input is a more expensive way of arriving at it.
+# On this data that is a 2x footprint saving -- 512 floats against a 1024-float
+# input -- so at a matched byte budget a feature buffer holds twice the
+# exemplars. Measure at a matched *budget*, never at a matched item count, or the
+# comparison hands one arm twice the memory and proves nothing.
+#
+# Two costs to state plainly rather than discover. First, stored features go
+# stale as the backbone drifts, where a stored input is re-encoded by the current
+# backbone every time it is drawn; this is the standard latent-replay trade and
+# the reason the saving is not free. Second, replay then reaches only the
+# readout -- the backbone receives no rehearsal gradient at all -- which makes
+# this the buffer-side analogue of `woe_evidence_readout_only` and confines the
+# mechanism to the one place the DS construction is exact.
+_REPLAY_STORES = ("input", "feature")
 
 
 class ReservoirReplayBuffer:
@@ -109,9 +178,15 @@ class ReservoirReplayBuffer:
         >>> draw = buffer.sample(32)
     """
 
-    def __init__(self, capacity: int, store_evidence: bool = False) -> None:
+    def __init__(
+        self,
+        capacity: int,
+        store_evidence: bool = False,
+        store_logits: bool = False,
+    ) -> None:
         self.capacity = int(capacity)
         self.store_evidence = bool(store_evidence)
+        self.store_logits = bool(store_logits)
         self.inputs: List[torch.Tensor] = []
         self.labels: List[int] = []
         self.tasks: List[int] = []
@@ -120,6 +195,10 @@ class ReservoirReplayBuffer:
         # unless ``store_evidence``.
         self.evidence_plus: List[torch.Tensor] = []
         self.evidence_minus: List[torch.Tensor] = []
+        # The same, for raw logits -- the Dark Experience Replay target that the
+        # evidence snapshot is compared against. One of the two is populated, per
+        # ``woe_replay_mode``; they are never both needed at once.
+        self.logits: List[torch.Tensor] = []
         self.seen = 0
 
     def __len__(self) -> int:
@@ -132,16 +211,21 @@ class ReservoirReplayBuffer:
         task_id: int,
         evidence_plus: Optional[torch.Tensor] = None,
         evidence_minus: Optional[torch.Tensor] = None,
+        logits: Optional[torch.Tensor] = None,
     ) -> None:
         """Insert a batch, respecting the reservoir replacement policy.
 
         Args:
-            inputs: Batch of stored-ready inputs, shape ``(batch, ...)`` (CPU).
+            inputs: Batch of stored-ready items, shape ``(batch, ...)`` (CPU).
+                Network inputs, or penultimate features under
+                ``woe_replay_store='feature'``.
             labels: Integer class labels, shape ``(batch,)``.
             task_id: Task index the batch belongs to.
             evidence_plus: Optional ``(batch, n_outputs)`` snapshot of ``w_plus``
                 at insertion time. Required when the buffer stores evidence.
             evidence_minus: Optional ``(batch, n_outputs)`` snapshot of ``w_minus``.
+            logits: Optional ``(batch, n_outputs)`` snapshot of the raw logits.
+                Required when the buffer stores logits.
         """
         if self.capacity <= 0 or inputs.size(0) == 0:
             return
@@ -149,6 +233,11 @@ class ReservoirReplayBuffer:
             raise ValueError(
                 "buffer was built with store_evidence=True but add() received no "
                 "evidence snapshot"
+            )
+        if self.store_logits and logits is None:
+            raise ValueError(
+                "buffer was built with store_logits=True but add() received no "
+                "logit snapshot"
             )
         slots, _filled, seen = misc_utils.reservoir_slots(
             inputs.size(0), len(self.inputs), self.seen, self.capacity
@@ -158,6 +247,7 @@ class ReservoirReplayBuffer:
         labels_cpu = labels.detach().cpu().long()
         plus_cpu = evidence_plus.detach().cpu() if self.store_evidence else None
         minus_cpu = evidence_minus.detach().cpu() if self.store_evidence else None
+        logits_cpu = logits.detach().cpu() if self.store_logits else None
         for index, slot in enumerate(slots):
             if slot < 0:
                 continue
@@ -170,6 +260,8 @@ class ReservoirReplayBuffer:
                 if self.store_evidence:
                     self.evidence_plus[slot] = plus_cpu[index].clone()
                     self.evidence_minus[slot] = minus_cpu[index].clone()
+                if self.store_logits:
+                    self.logits[slot] = logits_cpu[index].clone()
             else:
                 # Fill phase: reservoir_slots hands back the next dense index.
                 self.inputs.append(input_item)
@@ -178,19 +270,32 @@ class ReservoirReplayBuffer:
                 if self.store_evidence:
                     self.evidence_plus.append(plus_cpu[index].clone())
                     self.evidence_minus.append(minus_cpu[index].clone())
+                if self.store_logits:
+                    self.logits.append(logits_cpu[index].clone())
 
-    def sample(self, batch_size: int, with_evidence: bool = False):
+    def sample(
+        self,
+        batch_size: int,
+        with_evidence: bool = False,
+        with_logits: bool = False,
+    ) -> Optional[Dict[str, torch.Tensor]]:
         """Draw up to ``batch_size`` items uniformly without replacement.
 
         Args:
             batch_size: Requested number of replay items.
             with_evidence: When ``True``, also return the stored ``(w_plus,
                 w_minus)`` snapshots. Requires ``store_evidence``.
+            with_logits: When ``True``, also return the stored logit snapshot.
+                Requires ``store_logits``.
 
         Returns:
-            Tuple ``(inputs, labels, tasks)``, or ``(inputs, labels, tasks,
-            evidence_plus, evidence_minus)`` when ``with_evidence``. ``None`` when
-            the buffer is empty or ``batch_size <= 0``.
+            A dict with keys ``inputs``, ``labels`` and ``tasks``, plus
+            ``evidence_plus``/``evidence_minus`` when ``with_evidence`` and
+            ``logits`` when ``with_logits``. ``None`` when the buffer is empty or
+            ``batch_size <= 0``.
+
+        Raises:
+            ValueError: If a snapshot is requested that the buffer does not hold.
         """
         if not self.inputs or batch_size <= 0:
             return None
@@ -199,16 +304,28 @@ class ReservoirReplayBuffer:
                 "sample(with_evidence=True) needs a buffer built with "
                 "store_evidence=True"
             )
+        if with_logits and not self.store_logits:
+            raise ValueError(
+                "sample(with_logits=True) needs a buffer built with "
+                "store_logits=True"
+            )
         draw = min(int(batch_size), len(self.inputs))
         indices = random.sample(range(len(self.inputs)), draw)
-        inputs = torch.stack([self.inputs[i] for i in indices])
-        labels = torch.tensor([self.labels[i] for i in indices], dtype=torch.long)
-        tasks = torch.tensor([self.tasks[i] for i in indices], dtype=torch.long)
-        if not with_evidence:
-            return inputs, labels, tasks
-        plus = torch.stack([self.evidence_plus[i] for i in indices])
-        minus = torch.stack([self.evidence_minus[i] for i in indices])
-        return inputs, labels, tasks, plus, minus
+        batch = {
+            "inputs": torch.stack([self.inputs[i] for i in indices]),
+            "labels": torch.tensor([self.labels[i] for i in indices], dtype=torch.long),
+            "tasks": torch.tensor([self.tasks[i] for i in indices], dtype=torch.long),
+        }
+        if with_evidence:
+            batch["evidence_plus"] = torch.stack(
+                [self.evidence_plus[i] for i in indices]
+            )
+            batch["evidence_minus"] = torch.stack(
+                [self.evidence_minus[i] for i in indices]
+            )
+        if with_logits:
+            batch["logits"] = torch.stack([self.logits[i] for i in indices])
+        return batch
 
 
 class Net(WoeSiNet):
@@ -236,12 +353,38 @@ class Net(WoeSiNet):
         self.evidence_readout_only = bool(
             getattr(args, "woe_evidence_readout_only", False)
         )
+        self.replay_store = str(getattr(args, "woe_replay_store", "input"))
+        if self.replay_store not in _REPLAY_STORES:
+            raise ValueError(
+                f"woe_replay_store must be one of {_REPLAY_STORES}, "
+                f"got {self.replay_store!r}"
+            )
+        self.stores_features = self.replay_store == "feature"
         # woe_evidence_scale / woe_evidence_belief_tau are read and validated by
         # model.woe_si.Net.__init__, which the super() call above already ran.
-        self.uses_evidence_replay = self.replay_mode in ("evidence", "both")
-        self.uses_ce_replay = self.replay_mode in ("ce", "both")
+        self.uses_evidence_replay = self.replay_mode in (
+            "evidence",
+            "both",
+            "evidence_sym",
+            "ce_evidence_sym",
+        )
+        # "evidence" and "both" charge decay only; the "*_sym" modes charge any
+        # drift, which is the form that matches the DER logit baseline.
+        self.evidence_drift_symmetric = self.replay_mode in (
+            "evidence_sym",
+            "ce_evidence_sym",
+        )
+        self.uses_ce_replay = self.replay_mode in (
+            "ce",
+            "both",
+            "ce_logit",
+            "ce_evidence_sym",
+        )
+        self.uses_logit_replay = self.replay_mode in ("logit", "ce_logit")
         self.replay_buffer = ReservoirReplayBuffer(
-            self.replay_memories, store_evidence=self.uses_evidence_replay
+            self.replay_memories,
+            store_evidence=self.uses_evidence_replay,
+            store_logits=self.uses_logit_replay,
         )
 
         # Feature mean used to centre the evidence of each task's stored items.
@@ -272,22 +415,20 @@ class Net(WoeSiNet):
         if len(self.replay_buffer) == 0:
             return torch.zeros(1, device=device)
         sample = self.replay_buffer.sample(
-            self.replay_batch_size, with_evidence=self.uses_evidence_replay
+            self.replay_batch_size,
+            with_evidence=self.uses_evidence_replay,
+            with_logits=self.uses_logit_replay,
         )
         if sample is None:
             return torch.zeros(1, device=device)
 
-        if self.uses_evidence_replay:
-            replay_x, replay_y, replay_t, stored_plus, stored_minus = sample
-        else:
-            replay_x, replay_y, replay_t = sample
-            stored_plus = stored_minus = None
-        replay_x = replay_x.to(device)
-        replay_y = replay_y.to(device).long()
+        replay_x = sample["inputs"].to(device)
+        replay_y = sample["labels"].to(device).long()
+        replay_t = sample["tasks"]
 
         loss = torch.zeros(1, device=device)
         if self.uses_ce_replay and self.replay_lambda != 0.0:
-            cls_logits = self.net.forward_heads(replay_x)[1]
+            cls_logits = self._replay_logits(replay_x)
             masked_logits = self._mask_replay_logits(cls_logits, replay_t)
             loss = loss + self.replay_lambda * classification_cross_entropy(
                 masked_logits,
@@ -296,9 +437,92 @@ class Net(WoeSiNet):
             )
         if self.uses_evidence_replay and self.evidence_lambda != 0.0:
             loss = loss + self.evidence_lambda * self._evidence_decay_loss(
-                replay_x, replay_t, stored_plus.to(device), stored_minus.to(device)
+                replay_x,
+                replay_t,
+                sample["evidence_plus"].to(device),
+                sample["evidence_minus"].to(device),
+            )
+        if self.uses_logit_replay and self.evidence_lambda != 0.0:
+            loss = loss + self.evidence_lambda * self._logit_distillation_loss(
+                replay_x, replay_t, sample["logits"].to(device)
             )
         return loss
+
+    # ------------------------------------------------------------------
+    def _replay_features(self, replay_x: torch.Tensor) -> torch.Tensor:
+        """Penultimate features for a replay draw, however the buffer stores it.
+
+        Under ``woe_replay_store='feature'`` the stored tensor already *is* the
+        feature vector, so there is no backbone pass to make -- which is both the
+        2x footprint saving and its cost: the features were encoded by whatever
+        backbone existed when the item was stored, and are never refreshed.
+
+        ``bn_training=False`` on the input path so a replay draw never perturbs
+        the BatchNorm running statistics, which the current-task pass owns.
+        """
+        if self.stores_features:
+            return replay_x
+        return self.net.forward_features(replay_x, bn_training=False)
+
+    # ------------------------------------------------------------------
+    def _replay_logits(self, replay_x: torch.Tensor) -> torch.Tensor:
+        """Classification logits for a replay draw, from inputs or features."""
+        if self.stores_features:
+            return self.net.forward_classifier(replay_x, bn_training=False)
+        return self.net.forward_heads(replay_x)[1]
+
+    # ------------------------------------------------------------------
+    def _logit_distillation_loss(
+        self,
+        replay_x: torch.Tensor,
+        replay_t: torch.Tensor,
+        stored_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Dark Experience Replay: squared drift of the logits from the snapshot.
+
+        The control arm for :meth:`_evidence_decay_loss` under
+        ``woe_replay_mode='evidence_sym'``. Deliberately identical in every
+        respect except the quantity distilled -- same buffer, same draw, same
+        per-item snapshot taken at insertion, same symmetric squared form, same
+        restriction to the columns of the item's own task -- so any difference
+        between the two arms is attributable to ``w`` versus ``z`` and not to the
+        shape of the penalty.
+
+        The DS prediction is that this one loses, because ``z_k = w+_k - w-_k``
+        retains only the difference of the two channels and throws away their
+        common magnitude, which is precisely the ignorance the evidential reading
+        says a rehearsal target should carry.
+
+        Normalised per scored item and by the same ``_evidence_normaliser`` the
+        evidence arm uses, so ``woe_evidence_lambda`` means a comparable thing in
+        both -- comparable, not identical: a logit drift is one squared term per
+        class where the evidence drift is two, so the grids overlap but the peaks
+        need not coincide.
+
+        Args:
+            replay_x: Rehearsed inputs or features ``(batch, ...)``, on device.
+            replay_t: Per-item task ids ``(batch,)``.
+            stored_logits: Snapshot logits ``(batch, n_outputs)``.
+
+        Returns:
+            Scalar penalty; zero when no item can be scored.
+        """
+        logits = self._replay_logits(replay_x)
+        total = torch.zeros((), device=logits.device)
+        scored = 0
+        for task_id in torch.unique(replay_t).tolist():
+            rows = (replay_t == int(task_id)).to(logits.device)
+            if not bool(rows.any()):
+                continue
+            active = self._active_class_indices(int(task_id), logits.device)
+            if active.numel() == 0:
+                continue
+            drift = (logits[rows][:, active] - stored_logits[rows][:, active]).pow(2)
+            total = total + drift.sum(dim=1).sum()
+            scored += int(rows.sum().item())
+        if scored == 0:
+            return torch.zeros(1, device=logits.device)
+        return total / (scored * self._evidence_normaliser(self.feature_dim))
 
     # ------------------------------------------------------------------
     def _evidence_decay_loss(
@@ -338,7 +562,7 @@ class Net(WoeSiNet):
         Returns:
             Scalar penalty; zero when no item can be scored.
         """
-        features = self.net.forward_features(replay_x, bn_training=False)
+        features = self._replay_features(replay_x)
         if self.evidence_readout_only:
             # Detach so the penalty is a function of the readout alone: rehearsed
             # items constrain `fc` and never reach the backbone, which is then
@@ -367,9 +591,13 @@ class Net(WoeSiNet):
             was_plus, was_minus = self._to_penalty_scale(
                 stored_plus[rows][:, active], stored_minus[rows][:, active]
             )
-            decay = torch.relu(was_plus - now_plus).pow(2) + torch.relu(
-                now_minus - was_minus
-            ).pow(2)
+            if self.evidence_drift_symmetric:
+                # Charge any movement, matching the DER logit control's form.
+                decay = (now_plus - was_plus).pow(2) + (now_minus - was_minus).pow(2)
+            else:
+                decay = torch.relu(was_plus - now_plus).pow(2) + torch.relu(
+                    now_minus - was_minus
+                ).pow(2)
             total = total + decay.sum(dim=1).sum()
             scored += int(rows.sum().item())
         if scored == 0:
@@ -400,11 +628,49 @@ class Net(WoeSiNet):
             return
         y_cls = unpack_y_to_class_labels(y).long()
         stored_x = self._input_for_replay(x)
-        if not self.uses_evidence_replay:
-            self.replay_buffer.add(stored_x, y_cls, int(t))
-            return
-        plus, minus = self._snapshot_evidence(stored_x, int(t))
-        self.replay_buffer.add(stored_x, y_cls, int(t), plus, minus)
+        if self.uses_evidence_replay:
+            plus, minus = self._snapshot_evidence(stored_x, int(t))
+        else:
+            plus = minus = None
+        logits = self._snapshot_logits(stored_x) if self.uses_logit_replay else None
+        # Encode last: the evidence and logit snapshots are taken on the input so
+        # they are the values the *current* network assigns, and only then is the
+        # item reduced to the representation the buffer keeps.
+        if self.stores_features:
+            stored_x = self._snapshot_features(stored_x)
+        self.replay_buffer.add(
+            stored_x,
+            y_cls,
+            int(t),
+            evidence_plus=plus,
+            evidence_minus=minus,
+            logits=logits,
+        )
+
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def _snapshot_features(self, stored_x: torch.Tensor) -> torch.Tensor:
+        """Penultimate features of a batch, for a feature-storing buffer.
+
+        ``bn_training=False`` so encoding an item for storage never perturbs the
+        BatchNorm running statistics the current-task pass owns.
+        """
+        return self.net.forward_features(
+            stored_x.to(self._device()), bn_training=False
+        ).detach()
+
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def _snapshot_logits(self, stored_x: torch.Tensor) -> torch.Tensor:
+        """Current classification logits for a batch, at full ``n_outputs`` width.
+
+        The Dark Experience Replay target, snapshotted on the canonicalised input
+        exactly as :meth:`_snapshot_evidence` snapshots the evidence, so the two
+        rehearsal targets are recorded at the same moment from the same network.
+        """
+        return self.net.forward_heads(stored_x.to(self._device()), bn_training=False)[
+            1
+        ].detach()
 
     # ------------------------------------------------------------------
     @torch.no_grad()

@@ -33,7 +33,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PYTHON = "/home/lunet/wsmr11/repos/La-MAML/la-maml_env/bin/python"
@@ -54,25 +54,31 @@ METHODS: Dict[str, Dict[str, object]] = {
         "config": "ewc",
         "flag": "--lamb",
         "configured": 1.0,
-        "grid": [1e4, 1e5, 1e6],
+        "grid": [1e3, 1e4],
     },
     "si": {
         "config": "si",
         "flag": "--si_c",
         "configured": 0.4,
-        "grid": [1e3, 1e4, 1e5],
+        # Measured 2026-09-03 at n_epochs 1 / inner_steps 2 / p=0, seed 0: the
+        # proximal peak is 1e3, a decade above the old top of this grid, and it
+        # is interior (1e3 -> 0.5876, 3e3 -> 0.5520, 1e4 -> 0.5240, 3e4 ->
+        # 0.5107). The two points the old grid did cover scored 0.3429 (1e1) and
+        # 0.5020 (1e2), so every proximal-si number taken from it understated the
+        # method by up to 0.25.
+        "grid": [1e2, 1e3, 1e4],
     },
     "rwalk": {
         "config": "rwalk",
         "flag": "--lamb",
         "configured": 1.0,
-        "grid": [1e3, 1e4, 1e5],
+        "grid": [1e2, 1e3, 1e4],
     },
     "ucl": {
         "config": "ucl",
         "flag": "--alpha",
         "configured": 10.0,
-        "grid": [1e8, 1e10],
+        "grid": [1e11],
     },
 }
 
@@ -84,10 +90,18 @@ class Run:
     method: str
     anchor_mode: str
     strength: float
+    # Extra main.py flags shared by every run in a campaign, e.g. the one-shot
+    # schedule. Part of the run identity so a short and a full campaign do not
+    # collide in the logs.
+    extra_args: Tuple[str, ...] = ()
+    suffix: str = ""
 
     @property
     def name(self) -> str:
-        return f"anchorbench_{self.method}_{self.anchor_mode}_{self.strength:g}"
+        return (
+            f"anchorbench{self.suffix}_{self.method}_"
+            f"{self.anchor_mode}_{self.strength:g}"
+        )
 
     def command(self) -> List[str]:
         config = METHODS[self.method]["config"]
@@ -106,10 +120,13 @@ class Run:
             self.anchor_mode,
             str(METHODS[self.method]["flag"]),
             repr(self.strength),
+            *self.extra_args,
         ]
 
 
-def build_runs(stage: str) -> List[Run]:
+def build_runs(
+    stage: str, extra_args: Tuple[str, ...] = (), suffix: str = ""
+) -> List[Run]:
     """Assemble the run list for a stage.
 
     Args:
@@ -124,12 +141,14 @@ def build_runs(stage: str) -> List[Run]:
     runs: List[Run] = []
     if stage in ("baseline", "all"):
         for method, spec in METHODS.items():
-            runs.append(Run(method, "loss", float(spec["configured"])))
+            runs.append(
+                Run(method, "loss", float(spec["configured"]), extra_args, suffix)
+            )
     if stage in ("sweep", "all"):
         for method, spec in METHODS.items():
             for strength in spec["grid"]:
                 for mode in ("loss", "proximal"):
-                    runs.append(Run(method, mode, float(strength)))
+                    runs.append(Run(method, mode, float(strength), extra_args, suffix))
     return runs
 
 
@@ -247,6 +266,15 @@ def main() -> None:
     )
     argument_parser.add_argument("--jobs", type=int, default=2)
     argument_parser.add_argument("--methods", type=str, default="")
+    argument_parser.add_argument(
+        "--one-shot",
+        action="store_true",
+        help=(
+            "Short schedule: --n_epochs 1 --inner_steps 2, matching "
+            "scripts/full_experiments.sh --one-shot. Runs land under a distinct "
+            "'oneshot' experiment name so they never mix with full-schedule runs."
+        ),
+    )
     argument_parser.add_argument("--collect-only", action="store_true")
     argument_parser.add_argument(
         "--csv", type=str, default="scripts/logs/anchor_mode_benchmark.csv"
@@ -256,7 +284,12 @@ def main() -> None:
     )
     args = argument_parser.parse_args()
 
-    runs = build_runs(args.stage)
+    extra_args: Tuple[str, ...] = ()
+    suffix = ""
+    if args.one_shot:
+        extra_args = ("--n_epochs", "1", "--inner_steps", "2")
+        suffix = "-oneshot"
+    runs = build_runs(args.stage, extra_args, suffix)
     if args.methods:
         wanted = {name.strip() for name in args.methods.split(",") if name.strip()}
         runs = [run for run in runs if run.method in wanted]

@@ -8,7 +8,7 @@ on a 1D ResNet, with per-task DS heads and a MAS-style consolidation anchor.
 | file | what it is |
 |---|---|
 | `eucr-trainability.tex` / `.pdf` | The design note. Architecture, the measurement and numerical faults that were fixed, and an accounting of which parts of the method contribute. Start here. |
-| `preregistration.md` | Decision rules for Gate B0 and PR-E1, fixed before running, with amendments recorded. |
+| `preregistration.md` | Decision rules for Gate B0, PR-E1 and Gate B1, fixed before running, with amendments and results recorded. |
 | `initial_ideas.md` | Original sketch, superseded. |
 
 ## Headline
@@ -26,7 +26,7 @@ seeds 0/39/55, batch-statistic evaluation.
 EUCR beats EWC on final F1 and loses to LwF; its retention is the best on the
 table and its plasticity is its weakness.
 
-## Three things to know before running it
+## Four things to know before running it
 
 1. **Evaluation protocol.** Every `ResNet1D`-based model here evaluates with
    *batch* normalisation statistics, because `ResNet1D.forward` forces train mode
@@ -38,7 +38,13 @@ table and its plasticity is its weakness.
    gradient 60x and the global clip then scales the task signal to 1.6%).
    `--eucr_anchor_mode proximal` is now the config default. Its useful λ is
    ~1/(2·lr) upward, i.e. 50–5000, not 0.09.
-3. **The evidential content is not what makes it work.** Compared as frontiers, a
+3. **The normalisation sensitivity is not the head's.** Gate B1 held the
+   backbone fixed and swapped only the readout: a post-hoc linear probe on the
+   same post-LayerNorm features loses *slightly more* to running statistics than
+   the DS head does (gap 0.587 vs 0.556, 0/5 seeds favouring the head
+   hypothesis). Amendment 2's `<= 0.013` EWC figure confounds head with
+   backbone; do not cite it as evidence about heads.
+4. **The evidential content is not what makes it work.** Compared as frontiers, a
    fixed random linear readout on the same stage features traces the same
    trade-off curve as the DS readout. Per-coordinate weighting is worth +0.017
    over uniform Ω; none of it needs to be learned or evidential.
