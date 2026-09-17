@@ -3,7 +3,7 @@
 EUCR is the evidential analogue of EWC. A single evidential (Dempster-Shafer)
 1D-ResNet backbone with per-stage probes (:mod:`model.eucr_backbone`) is trained
 with an evidential classification loss plus deep evidential supervision on the
-probes. After each task, a Fisher-style *evidential importance* is read from the
+probes. After each task, a MAS-style *evidential importance* is read from the
 backbone probe uncertainty (:mod:`model.eucr_consolidation`) and a quadratic
 penalty anchors the shared backbone weights while later tasks are learned -- no
 pruning and no binary masks.
@@ -30,6 +30,7 @@ from model.replay_utils import (
 from model.eucr_backbone import EucrResNet1D
 from model.evidential_modules import EvidentialLoss, PignisticNLLLoss
 from utils import misc_utils
+from utils.class_weighted_loss import classification_cross_entropy
 from utils.training_metrics import macro_recall
 
 
@@ -59,6 +60,11 @@ class EucrConfig:
     importance_batches: Optional[int] = None
     grad_clip_norm: float = 5.0
     eucr_depth: int = 18
+    eucr_bn_stats: str = "batch"
+    eucr_anchor_mode: str = "loss"
+    eucr_ce_aux_weight: float = 0.0
+    eucr_ds_detach: bool = False
+    eucr_head_lr_scale: float = 0.25
 
     @staticmethod
     def from_args(args: object) -> "EucrConfig":
@@ -105,6 +111,11 @@ class Net(nn.Module):
             metric=str(getattr(args, "eucr_distance_metric", "cosine")),
             head=str(getattr(args, "eucr_head", "dm")),
             classes_per_task=self.classes_per_task,
+            belief_init=str(getattr(args, "eucr_belief_init", "random")),
+            temper=float(getattr(args, "eucr_temper", 0.0) or 0.0),
+            activation_norm=str(getattr(args, "eucr_activation_norm", "max")),
+            readout_scale=str(getattr(args, "eucr_readout_scale", "untemper")),
+            ds_detach=bool(getattr(args, "eucr_ds_detach", False)),
         )
 
         self.head_mode = str(getattr(args, "eucr_head", "dm")).lower()
@@ -135,6 +146,43 @@ class Net(nn.Module):
         self.importance: Optional[Dict[str, torch.Tensor]] = None
         self.theta_star: Optional[Dict[str, torch.Tensor]] = None
 
+        # BatchNorm running statistics are buffers, so consolidation cannot touch
+        # them and each task overwrites them wholesale. Measured (Gate B0): that
+        # accounts for ~84% of EUCR's end-of-sequence task-0 forgetting, and it is
+        # specific to this head -- an EWC control on the same backbone shows a
+        # running-vs-batch gap of <=0.013 F1. The cosine-prototype head reads
+        # feature *direction*, so a shift in the normalisation statistics rotates
+        # the whole feature cloud onto one prototype.
+        #   running  -- shipped behaviour.
+        #   freeze   -- stop updating the statistics after the first task.
+        #   per_task -- keep one set of statistics per task and select by task id.
+        #               Free in TIL, where the task id is given at test time.
+        # Direction G: auxiliary linear+CE head on the shared backbone.
+        self.ce_aux_weight = float(self.cfg.eucr_ce_aux_weight)
+        self.ds_detach = bool(self.cfg.eucr_ds_detach)
+        self.class_weighted_ce = bool(getattr(args, "class_weighted_ce", True))
+
+        # Anchor form. Explicit descent on lambda*Omega*(theta-theta*)^2 has
+        # curvature k = 2*lambda*Omega and is stable only while lr*k < 2. EUCR's
+        # Omega is normalised to unit MEAN but its median is 2.7e-4 and its max
+        # 1.7e4, so the mean is set entirely by the tail: at the shipped
+        # lambda=0.09 the largest coordinate sits at lr*k = 30.7, and the anchor
+        # gradient outweighs the task gradient 60x. Because clip_grad_norm_
+        # rescales by one global scalar, that drags the task signal down to 1.6%
+        # of its size. "proximal" keeps the anchor out of the backward pass and
+        # applies it in closed form after the step, where it cannot overshoot.
+        self.anchor_mode = str(self.cfg.eucr_anchor_mode).lower()
+        self.use_proximal_anchor = self.anchor_mode == "proximal"
+
+        self.bn_stats_mode = str(self.cfg.eucr_bn_stats).lower()
+        self._bn_modules = [
+            m
+            for m in self.backbone.modules()
+            if isinstance(m, nn.modules.batchnorm._BatchNorm)
+            and m.running_mean is not None
+        ]
+        self._bn_bank: Dict[int, list] = {}
+
     # ------------------------------------------------------------------
     def _split_parameters(self) -> Tuple[list, list]:
         """Partition backbone params into shared-backbone vs evidential-head groups.
@@ -159,22 +207,14 @@ class Net(nn.Module):
 
     def _build_optimizer(self) -> torch.optim.Optimizer:
         lr = float(self.cfg.lr)
+        head_lr = lr * float(self.cfg.eucr_head_lr_scale)
+        groups = [
+            {"params": self.backbone_params, "lr": lr},
+            {"params": self.evidential_params, "lr": head_lr},
+        ]
         if str(self.cfg.optimizer).lower() == "sgd":
-            return torch.optim.SGD(
-                [
-                    {"params": self.backbone_params, "lr": lr},
-                    {"params": self.evidential_params, "lr": lr * 0.25},
-                ],
-                momentum=0.9,
-            )
-        return torch.optim.Adam(
-            [
-                {"params": self.backbone_params, "lr": lr},
-                {"params": self.evidential_params, "lr": lr * 0.25},
-            ],
-            eps=1e-7,
-            amsgrad=True,
-        )
+            return torch.optim.SGD(groups, momentum=0.9)
+        return torch.optim.Adam(groups, eps=1e-7, amsgrad=True)
 
     def _device(self) -> torch.device:
         return next(self.backbone.parameters()).device
@@ -196,13 +236,74 @@ class Net(nn.Module):
             loader=self.incremental_loader_name,
         )
 
+    # ------------------------------------------------------------------
+    def _bn_snapshot(self, task: int) -> None:
+        self._bn_bank[int(task)] = [
+            (m.running_mean.detach().clone(), m.running_var.detach().clone())
+            for m in self._bn_modules
+        ]
+
+    def _bn_apply(self, task: int):
+        """Swap in task ``task``'s statistics; return the ones displaced."""
+        if not self._bn_bank:
+            return None
+        key = min(int(task), max(self._bn_bank))
+        if key not in self._bn_bank:
+            return None
+        prev = [
+            (m.running_mean.detach().clone(), m.running_var.detach().clone())
+            for m in self._bn_modules
+        ]
+        for m, (mean, var) in zip(self._bn_modules, self._bn_bank[key]):
+            m.running_mean.copy_(mean)
+            m.running_var.copy_(var)
+        return prev
+
+    def _bn_restore(self, prev) -> None:
+        if prev is None:
+            return
+        for m, (mean, var) in zip(self._bn_modules, prev):
+            m.running_mean.copy_(mean)
+            m.running_var.copy_(var)
+
     def forward(
         self,
         x: torch.Tensor,
         t: int,
         *,
         cil_all_seen_upto_task: int | None = None,
+        bn_training: bool | None = None,
     ) -> torch.Tensor:
+        if bn_training is None and self.bn_stats_mode == "batch":
+            # Match the harness. Every ResNet1D-based learner reaches its backbone
+            # through ResNet1D.forward, whose bn_training defaults to True, so the
+            # whole benchmark is scored with BATCH statistics. EUCR had no such
+            # wrapper and was silently scored with frozen running statistics --
+            # a different protocol from every model it is compared against, worth
+            # 0.31 final F1 and 0.37 BWT on a 4-task run.
+            bn_training = True
+        if bn_training is None:
+            return self._forward_inner(x, t, cil_all_seen_upto_task)
+        prev_mode = self.backbone.training
+        self.backbone.train(bn_training)
+        try:
+            return self._forward_inner(x, t, cil_all_seen_upto_task)
+        finally:
+            self.backbone.train(prev_mode)
+
+    def _forward_inner(
+        self, x: torch.Tensor, t: int, cil_all_seen_upto_task: int | None
+    ) -> torch.Tensor:
+        if self.bn_stats_mode == "per_task" and not self.backbone.training:
+            prev = self._bn_apply(t)
+            try:
+                eu = self.backbone(x, t, cil_all_seen_upto_task=cil_all_seen_upto_task)
+                logits = eu[:, : self.n_outputs]
+                return self._mask(
+                    logits, t, cil_all_seen_upto_task=cil_all_seen_upto_task
+                )
+            finally:
+                self._bn_restore(prev)
         eu = self.backbone(x, t, cil_all_seen_upto_task=cil_all_seen_upto_task)
         logits = eu[:, : self.n_outputs]
         return self._mask(logits, t, cil_all_seen_upto_task=cil_all_seen_upto_task)
@@ -227,11 +328,21 @@ class Net(nn.Module):
         amp_device = "cuda" if device.type == "cuda" else "cpu"
 
         for _ in range(self.inner_steps):
-            # Evidential heads use exp/normalise chains that are unstable in AMP.
+            # Keep the evidential head in fp32. Measured, not assumed: forcing
+            # autocast on here produces no non-finite loss at all (0 skipped
+            # steps over 9 four-task runs), so "unstable" is the wrong word --
+            # but it costs accuracy for no speed. Paired per-seed diagonal F1
+            # against fp32: bf16 -0.032 +/- 0.031 (not significant), fp16
+            # -0.085 +/- 0.012 (significant; fp16 also has no GradScaler here,
+            # which is likely the bulk of its penalty). AMP buys ~5% epoch time,
+            # because this model is dominated by small kernel launches rather
+            # than matmul FLOPs. main.py disables AMP for eucr as well; this
+            # guard makes the model safe to call from anywhere.
             with torch.autocast(device_type=amp_device, enabled=False):
-                eu, _features, _omegas, beliefs, probe_outs = self.backbone(
-                    x, t, return_probes=True
-                )
+                want_ce = self.ce_aux_weight > 0.0
+                out = self.backbone(x, t, return_probes=True, return_ce=want_ce)
+                eu, _features, _omegas, beliefs, probe_outs = out[:5]
+                ce_logits = out[5] if want_ce else None
                 head_eu = eu[:, : self.n_outputs].float()
                 head_loss = self.criterion(head_eu, y_cls, beliefs, epoch)
 
@@ -243,10 +354,26 @@ class Net(nn.Module):
                 if probe_outs:
                     probe_loss = probe_loss / len(probe_outs)
 
-                reg = cons.penalty(self.backbone, self.importance, self.theta_star)
+                ce_loss = torch.zeros((), device=head_loss.device)
+                if ce_logits is not None:
+                    offset1, offset2 = self.compute_offsets(t)
+                    ce_loss = classification_cross_entropy(
+                        ce_logits[:, offset1:offset2],
+                        y_cls - offset1,
+                        class_weighted_ce=self.class_weighted_ce,
+                    )
+
+                reg = (
+                    torch.zeros((), device=head_loss.device)
+                    if self.use_proximal_anchor
+                    else cons.penalty(
+                        self.backbone, self.importance, self.theta_star
+                    )
+                )
                 loss = (
                     head_loss
                     + self.probe_loss_weight * probe_loss
+                    + self.ce_aux_weight * ce_loss
                     + self.reg_lambda * reg
                 )
 
@@ -270,6 +397,8 @@ class Net(nn.Module):
                 torch.nn.utils.clip_grad_norm_(self.backbone_params, self.clipgrad)
                 torch.nn.utils.clip_grad_norm_(self.evidential_params, self.clipgrad)
             self.opt.step()
+            if self.use_proximal_anchor:
+                self._apply_proximal_anchor()
 
             with torch.no_grad():
                 masked = self._mask(head_eu.detach(), t, cil_all_seen_upto_task=t)
@@ -279,6 +408,37 @@ class Net(nn.Module):
             loss_value = float(loss.item())
 
         return loss_value, float(cls_tr_rec), metric_logits
+
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def _apply_proximal_anchor(self) -> None:
+        """Apply the quadratic anchor as a closed-form post-step update.
+
+        Backward-Euler on the anchor evaluates its gradient at the *new* point,
+        ``theta_new = theta+ - lr*2*lambda*Omega*(theta_new - theta*)``, which
+        solves to a convex combination::
+
+            b = 2 * lr * lambda * Omega
+            theta_new = (theta+ + b * theta*) / (1 + b)
+
+        The mixing weight ``b/(1+b)`` saturates at 1 for any Omega, so the update
+        can never overshoot: Omega -> 0 leaves the parameter free, Omega -> inf
+        pins it to theta*. No-op on the first task, where there is no anchor yet.
+
+        Note the useful lambda is far larger than the loss form's, because b is
+        scaled by lr: b = 1 at unit Omega needs lambda = 1/(2*lr) = 50 at lr 0.01.
+        """
+        if not self.importance or not self.theta_star:
+            return
+        scale = 2.0 * float(self.opt.param_groups[0]["lr"]) * self.reg_lambda
+        if scale == 0.0:
+            return
+        for name, param in cons._named_consolidatable_params(self.backbone):
+            if name not in self.importance or name not in self.theta_star:
+                continue
+            b = self.importance[name].to(param.device) * scale
+            anchor = self.theta_star[name].to(param.device)
+            param.copy_((param + b * anchor) / (1.0 + b))
 
     # ------------------------------------------------------------------
     def finalize_task_after_training(self, train_loader) -> None:
@@ -296,6 +456,14 @@ class Net(nn.Module):
             new_importance = cons.to_channel(self.backbone, new_importance)
         self.importance = cons.accumulate(self.importance, new_importance)
         self.theta_star = cons.snapshot(self.backbone)
+
+        task = int(self.current_task or 0)
+        if self.bn_stats_mode == "per_task":
+            self._bn_snapshot(task)
+        elif self.bn_stats_mode == "freeze":
+            # momentum 0 leaves running = (1-0)*running + 0*batch, i.e. frozen.
+            for m in self._bn_modules:
+                m.momentum = 0.0
 
 
 __all__ = ["Net", "EucrConfig"]

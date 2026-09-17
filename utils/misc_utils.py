@@ -131,6 +131,47 @@ def compute_offsets(task, nc_per_task):
     return int(offset1), int(offset2)
 
 
+def current_task_class_indices(
+    task,
+    nc_per_task,
+    n_outputs: int,
+    global_noise_label: int | None = None,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """Output columns owned by ``task`` itself, as an index tensor.
+
+    The column span ``[offset1, offset2)`` of a single task, plus the global
+    noise label when one is configured -- matching the classes
+    :func:`apply_task_incremental_logit_mask` leaves unmasked under TIL, so any
+    penalty built on these columns charges exactly what the head predicts over.
+    Unlike the cumulative "seen so far" span, this excludes earlier tasks'
+    classes, which is what a penalty on the *current* task's outputs needs in
+    CIL as well as TIL.
+
+    Args:
+        task: Task index.
+        nc_per_task: Per-task class counts (list) or a scalar count.
+        n_outputs: Total width of the head; ``offset2`` is clamped to it.
+        global_noise_label: Always-active noise column, if the dataset has one.
+        device: Device for the returned tensor.
+
+    Returns:
+        Sorted ``torch.long`` index tensor of the task's output columns.
+
+    Usage:
+        >>> current_task_class_indices(1, [3, 3], 6).tolist()
+        [3, 4, 5]
+    """
+    offset1, offset2 = compute_offsets(task, nc_per_task)
+    offset2 = min(int(n_outputs), offset2)
+    indices = list(range(offset1, offset2))
+    if global_noise_label is not None:
+        noise = int(global_noise_label)
+        if 0 <= noise < int(n_outputs) and noise not in indices:
+            indices.append(noise)
+    return torch.tensor(sorted(set(indices)), dtype=torch.long, device=device)
+
+
 def _effective_cil_upto_for_loader(
     *,
     loader: str | None,

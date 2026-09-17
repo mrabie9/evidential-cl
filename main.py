@@ -2061,11 +2061,14 @@ def save_results(
                 state_dict_bytes / (1024 * 1024), val_t_bytes / 1024, val_a_bytes / 1024
             ),
         )
-    if hasattr(args, "get_samples_per_task"):
-        try:
-            delattr(args, "get_samples_per_task")
-        except AttributeError:
-            args.get_samples_per_task = None
+    # Bound loader methods must not reach the pickle: they drag the whole
+    # IncrementalLoader (every task's arrays, ~GB) into results.pt, or fail.
+    for _loader_attr in ("get_samples_per_task", "get_task_train_loader"):
+        if hasattr(args, _loader_attr):
+            try:
+                delattr(args, _loader_attr)
+            except AttributeError:
+                setattr(args, _loader_attr, None)
 
     torch.save(
         (result_val_t, result_val_a, state_dict, val_stats, one_liner, args),
@@ -2534,6 +2537,11 @@ def main():
     n_inputs, n_outputs, n_tasks = loader.get_dataset_info()
     args.n_tasks = n_tasks
     args.get_samples_per_task = getattr(loader, "get_samples_per_task", None)
+    # Bound `IncrementalLoader.get_tasks`, for learners that need a task's *full*
+    # data outside the training stream (WoE-SI's frozen-mu pre-pass, PR-3).
+    # `get_tasks` rebuilds loaders from the retained per-task arrays and does not
+    # advance the one-way `new_task()` cursor, so it is safe to call mid-run.
+    args.get_task_train_loader = getattr(loader, "get_tasks", None)
     args.classes_per_task = getattr(loader, "classes_per_task", None)
     print("Classes per task:", args.classes_per_task)
     if args.classes_per_task is None or len(args.classes_per_task) == 0:

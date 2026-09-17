@@ -86,11 +86,12 @@ def test_reservoir_buffer_sample_shapes_and_bounds() -> None:
     buffer.add(torch.randn(6, 2, 8), torch.arange(6), task_id=2)
     draw = buffer.sample(16)  # request more than stored
     assert draw is not None
-    inputs, labels, tasks = draw
-    assert inputs.shape == (6, 2, 8)
-    assert labels.shape == (6,)
-    assert tasks.shape == (6,)
-    assert torch.all(tasks == 2)
+    assert draw["inputs"].shape == (6, 2, 8)
+    assert draw["labels"].shape == (6,)
+    assert draw["tasks"].shape == (6,)
+    assert torch.all(draw["tasks"] == 2)
+    # Snapshot keys are absent unless the buffer was built to hold them.
+    assert "evidence_plus" not in draw and "logits" not in draw
 
 
 def test_reservoir_retains_all_items_with_equal_probability() -> None:

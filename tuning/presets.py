@@ -779,15 +779,7 @@ TUNING_PRESETS: Dict[str, TuningPreset] = {
                     "factors": (0.5, 1.0, 2.0),
                     "min": 1.0,
                     "fallback": 1000.0,
-                    "values": [
-                        100.0,
-                        300.0,
-                        1000.0,
-                        3000.0,
-                        10000.0,
-                        30000.0,
-                        100000.0,
-                    ],
+                    "values": [1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8],
                 },
                 "woe_xi": {
                     "kind": "float",

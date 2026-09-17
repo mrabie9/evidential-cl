@@ -9,4 +9,9 @@ si_c: 10000.0
 #               let the optimiser descend it (the original behaviour).
 # The two modes do NOT share a useful penalty strength; sweep each separately
 # (scripts/run_anchor_mode_benchmark.py).
+#
+# Proximal is the standing default for si as of 2026-09-03: the loss form is the
+# pathological one (it diverges on Omega outliers), and the loss-mode arm at
+# si_c=0.4 came back with BWT ~ -0.35 against a healthy 0.65-0.69 diagonal --
+# i.e. the anchor was not holding at all.
 anchor_mode: proximal

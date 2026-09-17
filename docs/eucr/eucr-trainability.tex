@@ -1,0 +1,754 @@
+\documentclass{article}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+
+\title{EUCR: An Evidential Continual Learner, and an Accounting of
+Which of Its Parts Do the Work}
+\author{EUCR design note}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+EUCR is the evidential analogue of EWC: a Dempster--Shafer (DS) prototype head on
+a 1D ResNet, with per-stage evidential probes whose uncertainty supplies a
+MAS-style consolidation importance. It works as a continual learner --- on a
+four-task IQ radar sequence it reaches a final F1 of $0.596$ against EWC's
+$0.427$, though it trails Learning-without-Forgetting's $0.660$ --- but reaching
+that number required fixing two measurement faults and one numerical fault, and
+the accounting of \emph{which} of its parts produce it is largely negative.
+
+Three findings carry the note. First, EUCR was being scored on a different
+evaluation protocol from every model it was compared against: every
+\texttt{ResNet1D}-based learner reaches its backbone through a \texttt{forward}
+whose \texttt{bn\_training} defaults to \texttt{True}, so the benchmark uses
+\emph{batch} normalisation statistics, while EUCR --- lacking that wrapper ---
+used frozen running statistics. That asymmetry alone was worth $0.31$ final F1.
+Second, the consolidation anchor's loss form is outside its stability window at
+every $\lambda$ tested: $\Omega$ is normalised to unit mean but has median
+$2.7\times10^{-4}$ and maximum $1.7\times10^{4}$, so a few tail coordinates make
+the anchor gradient outweigh the task gradient $60\times$ and the global
+gradient clip then attenuates the task signal to $1.6\%$ of its size. A
+closed-form proximal anchor removes this, worth a further $+0.07$ final F1 and a
+$14\times$ reduction in seed variance. Third, and least comfortably for the
+method's premise: comparing importance \emph{frontiers} rather than points, a
+fixed random linear readout on the same stage features traces the same
+trade-off curve as the evidential one, reparameterised by a constant. The
+per-coordinate weighting contributes ($+0.017$ over uniform $\Omega$); nothing
+about it needs to be learned, and nothing about it needs to be evidential.
+
+We also record the closed-form Dempster fusion that makes the head affordable
+(40--90$\times$ on that layer, $6.6\times$ end-to-end, outputs matching the
+sequential loop to $2\times10^{-6}$), a construction-level pathology in which the
+ignorance mass is identically zero, a pre-registered gate in which neither the
+ignorance nor the conflict readout beats a softmax baseline at novelty
+detection, and a set of measured claims that the code previously asserted
+without evidence.
+\end{abstract}
+
+\section{Structure of the model}
+
+\subsection{Where the code lives}
+
+Four modules, in dependency order:
+
+\begin{itemize}
+  \item \texttt{model/evidential\_modules.py} --- the Dempster--Shafer
+        primitives: \texttt{Distance\_layer},
+        \texttt{DistanceActivation\_layer}, \texttt{Belief\_layer},
+        \texttt{Omega\_layer}, \texttt{Dempster\_layer},
+        \texttt{DempsterNormalize\_layer}, assembled into
+        \texttt{Dempster\_Shafer\_module}; plus the two readouts (\texttt{DM},
+        \texttt{pignistic\_probability}) and the two losses
+        (\texttt{EvidentialLoss}, \texttt{PignisticNLLLoss}).
+  \item \texttt{model/eucr\_backbone.py} --- \texttt{EucrResNet1D}, a ResNet-18
+        style 1D backbone whose linear \texttt{fc} head is replaced by per-task
+        DS heads, with an \texttt{EvidentialProbe} hanging off each of the four
+        residual stages.
+  \item \texttt{model/eucr\_consolidation.py} --- importance estimation
+        (\texttt{compute\_importance}), channel pooling (\texttt{to\_channel}),
+        cross-task accumulation (\texttt{accumulate}), the weight anchor
+        (\texttt{snapshot}) and the quadratic \texttt{penalty}.
+  \item \texttt{model/eucr.py} --- the learner \texttt{Net} that the La-MAML
+        harness drives: \texttt{observe} for a training step,
+        \texttt{finalize\_task\_after\_training} for the end-of-task
+        consolidation.
+\end{itemize}
+
+\subsection{Data and backbone}
+
+Inputs are 1024-sample flat IQ vectors, reshaped to two channels
+$(2,512)$ (I and Q), min--max scaled per feature using training-split
+statistics. The backbone is the standard ResNet-18 arrangement in 1D:
+\texttt{conv1}/BatchNorm/ReLU/maxpool, then four stages of two
+\texttt{BasicBlock1D} each at widths $64,128,256,512$, global average pooling,
+and a \texttt{LayerNorm} on the pooled 512-d feature. Dropout ($p=0.2$) sits
+between stages.
+
+An important property of the data: roughly half of every task's samples carry
+the label $-1$, meaning \emph{noise} rather than any emitter class (48\% for
+\texttt{t2-rcn}, exactly 50\% for the \texttt{deeprad} files). The task-incremental
+loader remaps each task's labels into a contiguous block and, in the default
+(non-collapsed) mode, appends noise as the \emph{last} class of that block:
+\texttt{neg\_label = labels\_offset + unique\_labels.size}. Evaluation macro
+recall then excludes that class. This matters for reading results: a model that
+predicts the noise class for every sample scores exactly $0.000$, because every
+counted class has zero recall. The alarming zeros in the June logs are that
+degenerate state, not a numerical failure.
+
+\subsection{The Dempster--Shafer head}
+
+A DS module maps a feature vector $f \in \mathbb{R}^{F}$ to a mass function over
+the singleton classes plus the frame $\Theta$ (``ignorance''), i.e.\ a vector in
+$\mathbb{R}^{C+1}$. It does so through $P$ prototypes, $P = C \cdot
+\texttt{proto\_factor}$:
+
+\begin{enumerate}
+  \item \textbf{Distance.} $d_p = 1 - \cos(f, w_p)$ for each prototype $w_p$
+        (cosine is the default; the pooled features are \texttt{LayerNorm}'d, so
+        their norm is near-constant and squared-Euclidean distance is dominated
+        by that constant).
+  \item \textbf{Activation.} $s_p = \alpha_p \exp(-\gamma_p d_p)$ with
+        $\gamma_p=\eta_p^2$ and $\alpha_p=\sigma(\xi_p)$, followed by a division
+        by $\max_p s_p$.
+  \item \textbf{Belief.} Prototype $p$ splits its activation over classes with
+        weights $u_{cp} = \beta_{cp}^2 / \sum_{c'}\beta_{c'p}^2$, giving a mass
+        function $m_p(c) = u_{cp}s_p$ and $\omega_p = 1 - s_p$.
+  \item \textbf{Fusion.} The $P$ prototype mass functions are combined by
+        Dempster's rule and normalised.
+\end{enumerate}
+
+For singleton-plus-ignorance masses, Dempster's rule for two sources is
+\begin{equation}
+m(c) \;\propto\; m_1(c)m_2(c) + m_1(c)\omega_2 + \omega_1 m_2(c),
+\qquad
+\omega \;\propto\; \omega_1\omega_2 .
+\label{eq:dempster}
+\end{equation}
+
+Two readouts sit on top. \texttt{DM} produces per-class expected utilities
+$m(c) + (1-\nu)\omega$ with $\nu\omega$ retained in the last column, trained by
+\texttt{EvidentialLoss} (per-class BCE plus a gated KL warm-up).
+\texttt{pignistic\_probability} produces the Smets transform
+$\mathrm{BetP}_c = m(c) + \omega/C$, a genuine distribution, trained by
+\texttt{PignisticNLLLoss}. The task-incremental configuration uses the pignistic
+head.
+
+\subsection{Per-task heads, shared probes}
+
+\texttt{EucrResNet1D} owns one DS head per task, each over only that task's class
+count, and routes \texttt{forward(x, t)} through head $t$, scattering its scores
+into the global logit vector at the task's offsets. A head is trained only
+during its own task and receives no gradient afterwards, so it is frozen by
+construction; the shared backbone is what consolidation has to protect.
+
+The four stage \emph{probes} are the opposite: they are shared across tasks and
+built at the \emph{global} class width $n_{\text{outputs}}$, and their loss is
+not masked to the current task. Each probe average-pools its stage feature map,
+\texttt{LayerNorm}s it, and runs its own DS module. Their combined loss enters
+the objective at weight \texttt{probe\_loss\_weight}.
+
+\subsection{Consolidation}
+
+After task $t$, \texttt{compute\_importance} differentiates the mean backbone DS
+uncertainty --- selectable as nonspecificity ($\omega$), discord
+($H(\mathrm{BetP})/\log C$), or their sum --- with respect to every shared
+backbone parameter, accumulating $\lVert\nabla\rVert^2$ over the task's data.
+The result is optionally pooled to one score per convolution output channel,
+normalised to unit mean, and summed across tasks. During task $t+1$ the loss
+gains $\lambda\sum_i \Omega_i(\theta_i - \theta_i^{\star})^2$. No pruning, no
+masks. Despite the shape of the formula this is \emph{not} a Fisher
+approximation: there is no Laplace / log-likelihood-curvature story behind it.
+Squaring the gradient of a scalar \emph{output functional} over effectively
+unlabelled data is Memory Aware Synapses (Aljundi et al., ECCV 2018,
+$\nabla\lVert F(x)\rVert^2$), with a DS uncertainty substituted for MAS's output
+norm. It should be described as a MAS variant and benchmarked against MAS.
+
+\subsection{The training step}
+
+\texttt{Net.observe} runs one forward pass with the probes, forms
+\begin{equation}
+\mathcal{L} \;=\; \mathcal{L}_{\text{head}}
+\;+\; w_{\text{probe}}\,\overline{\mathcal{L}_{\text{probe}}}
+\;+\; \lambda \, \mathcal{R}_{\text{consolidation}},
+\end{equation}
+and steps two parameter groups separately: the shared backbone at \texttt{lr},
+and the evidential parameters (heads, probes, and the distance-activation
+$\eta,\xi$) at a fraction of it. Each group is gradient-clipped against its own
+budget so the high-gradient head cannot scale the backbone's update to nothing.
+Mixed precision is disabled in three independent places --- \texttt{amp: false}
+in the config, a hard override in \texttt{main.py}, and an
+\texttt{autocast(enabled=False)} guard inside the step --- on the stated grounds
+that the DS head's exponential and normalisation chains are unstable in reduced
+precision. Section~\ref{sec:amp} tests that claim.
+
+
+\subsection{Knobs added during this study}
+
+Five options were added while establishing the results below. All default to the
+previous behaviour except where stated.
+
+\begin{itemize}
+  \item \texttt{--eucr\_anchor\_mode \{loss, proximal\}} --- the anchor's form
+        (Section~\ref{sec:anchor}). Default \texttt{loss}, but \texttt{proximal}
+        is the recommended setting and the shipped config now uses it.
+  \item \texttt{--eucr\_bn\_stats \{batch, running, freeze, per\_task\}} ---
+        the normalisation-statistics protocol (Section~\ref{sec:protocol}).
+        \textbf{Default changed} to \texttt{batch}, which matches the harness.
+  \item \texttt{--eucr\_uncertainty \{...,\ uniform, random\_proj\}} --- two
+        ablation controls on the importance readout (Section~\ref{sec:frontier}).
+  \item \texttt{--eucr\_belief\_init \{random, class\}} --- round-robin
+        prototype-to-class initialisation of $\beta$.
+  \item \texttt{--eucr\_ce\_aux\_weight}, \texttt{--eucr\_ds\_detach} --- an
+        auxiliary per-task linear cross-entropy head sharing the backbone, and
+        an option to stop the DS head's gradient at the pooled feature.
+  \item \texttt{--eucr\_temper}, \texttt{--eucr\_activation\_norm},
+        \texttt{--eucr\_readout\_scale} --- the cautious-combination family used
+        to revive the ignorance mass in Section~\ref{sec:gate}.
+\end{itemize}
+
+\section{Two measurement faults and one numerical fault}
+
+\subsection{EUCR was scored on a different protocol from its baselines}
+\label{sec:protocol}
+
+\texttt{ResNet1D.forward} carries a \texttt{bn\_training} parameter defaulting to
+\texttt{True}, and its body is
+
+\begin{verbatim}
+prev = self.model.training
+self.model.train(bn_training)
+try:    ...
+finally: self.model.train(prev)
+\end{verbatim}
+
+so it forces its inner module into training mode on \emph{every} call. Verified
+directly: after \texttt{model.eval()}, a forward still reports
+\texttt{bn1.training == True}. Every \texttt{ResNet1D}-based learner in the
+repository --- EWC, SI, ER, GEM, LwF --- therefore evaluates with \emph{batch}
+normalisation statistics, transductively. No evaluation path passes
+\texttt{bn\_training=False}; the 21 call sites that do are importance passes,
+replay encoding and distillation inside \texttt{woe\_si}. This is a known and
+deliberate property: the \texttt{--eval-bn} help text in
+\texttt{scripts/confusion\_from\_run.py} already records that ``every reported
+number in this project uses batch statistics''.
+
+\texttt{EucrResNet1D} had no such wrapper, so EUCR inherited whatever
+\texttt{model.eval()} set --- frozen running statistics carried over from the
+last task trained. It was the only model in the table on that protocol. Since
+consecutive tasks are different radar datasets, the two protocols differ a great
+deal. Re-scoring existing checkpoints, with no retraining (three seeds):
+
+\begin{center}
+\begin{tabular}{lcccccc}
+\toprule
+ & \multicolumn{3}{c}{EUCR} & \multicolumn{3}{c}{EWC} \\
+\cmidrule(lr){2-4}\cmidrule(lr){5-7}
+protocol & diag & final & BWT & diag & final & BWT \\
+\midrule
+\texttt{batch} (harness) & $0.645$ & $\mathbf{0.600}$ & $-0.060$ & $0.713$ & $0.428$ & $-0.380$ \\
+\texttt{running} (frozen) & $0.616$ & $0.293$ & $-0.432$ & $0.678$ & $0.339$ & $-0.452$ \\
+per-task buffers          & $0.616$ & $0.365$ & $-0.335$ & $0.678$ & $0.198$ & $-0.639$ \\
+AdaBN recalibration       & $0.647$ & $0.599$ & $-0.063$ & $0.681$ & $0.434$ & $-0.330$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+For EWC the protocol barely matters ($0.428$ against $0.434$); for EUCR it is
+worth $0.31$ final F1 and $0.37$ BWT. \texttt{EucrResNet1D.forward} and
+\texttt{Net.forward} now take \texttt{bn\_training}, and
+\texttt{--eucr\_bn\_stats} defaults to \texttt{batch}.
+
+Two caveats belong with this. Lifting task $j$'s \emph{stored} buffers is not a
+valid per-task protocol --- they were estimated under task $j$'s weights, so
+pairing them with later weights describes a different network, which is why that
+row is the worst for EWC. AdaBN recalibration (re-estimating statistics on task
+$j$'s data with the current weights, forward passes only) is the correct version,
+but it requires retaining data from each past task, which is a replay assumption
+a regularisation-only method rejects. And \texttt{batch} is transductive: a
+sample's prediction depends on the others in its evaluation batch. Swept over
+test batch sizes $32/64/128/512$, the effect is real but mild (task-0 recovery
+$0.731/0.742/0.748/0.769$ on one seed). There is no option here that is both
+non-transductive and storage-free.
+
+\subsection{The anchor's loss form is numerically unstable}
+\label{sec:anchor}
+
+Explicit descent on $\lambda\,\Omega\,(\theta-\theta^\star)^2$ has curvature
+$k = 2\lambda\Omega$ and is stable only while $\mathrm{lr}\cdot k < 2$.
+\texttt{compute\_importance} normalises $\Omega$ to unit \emph{mean}, but the
+distribution is extremely heavy tailed, so the mean is set entirely by the tail:
+
+\begin{center}
+\begin{tabular}{lcccccc}
+\toprule
+ & p50 & p90 & p99 & p99.9 & p99.99 & max \\
+\midrule
+$\Omega$ & $2.7\times10^{-4}$ & $3.5\times10^{-3}$ & $0.42$ & $23.7$ & $1809$ & $1.7\times10^{4}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The median is $3600\times$ below the mean. At the shipped $\lambda=0.09$ and
+$\mathrm{lr}=0.01$, 490 coordinates sit outside the stability window with
+$\mathrm{lr}\cdot k = 30.7$ at the maximum. Measured on a batch perturbed
+$0.01$ from $\theta^\star$:
+
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+$\lambda$ & $\lVert g_{\text{task}}\rVert$ & $\lVert g_{\text{anchor}}\rVert$ & ratio & clip factor \\
+\midrule
+$0.09$ & $5.13$ & $311$              & $61$              & $0.0158$ \\
+$1$    & $5.24$ & $4.6\times10^{3}$  & $886$             & $1.1\times10^{-3}$ \\
+$10$   & $5.00$ & $5.8\times10^{4}$  & $1.2\times10^{4}$ & $8.6\times10^{-5}$ \\
+$1000$ & $4.59$ & $6.5\times10^{6}$  & $1.4\times10^{6}$ & $7.7\times10^{-7}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Because \texttt{clip\_grad\_norm\_} rescales by one global scalar, a handful of
+tail coordinates drag the whole network's effective learning rate down: at the
+shipped $\lambda$ the task gradient reaches the optimiser at $1.6\%$ of its size.
+This explains a result that otherwise makes no sense --- raising $\lambda$ made
+\emph{both} diagonal and final F1 worse, rather than trading one for the other.
+
+The fix is the proximal (backward-Euler) form, which evaluates the anchor
+gradient at the new point and solves in closed form to a convex combination:
+\begin{equation}
+b = 2\,\mathrm{lr}\,\lambda\,\Omega,
+\qquad
+\theta_{\text{new}} = \frac{\theta^{+} + b\,\theta^\star}{1+b}.
+\label{eq:prox}
+\end{equation}
+The mixing weight $b/(1+b)$ saturates at $1$ for any $\Omega$, so the update can
+never overshoot. Applied after the optimiser step, with the penalty removed from
+the backward pass entirely.
+
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+ & diagonal F1 & final F1 & BWT \\
+\midrule
+no anchor                  & $0.7173 \pm 0.0068$ & $0.3261 \pm 0.0193$ & $-0.391$ \\
+loss form, $\lambda=0.09$  & $0.6265 \pm 0.0145$ & $0.5231 \pm 0.0533$ & $-0.103$ \\
+proximal, $\lambda=500$    & $0.6317 \pm 0.0058$ & $0.5695 \pm 0.0179$ & $-0.062$ \\
+proximal, $\lambda=5000$   & $0.6019 \pm 0.0042$ & $\mathbf{0.5932 \pm 0.0038}$ & $-0.009$ \\
+proximal, $\lambda=50000$  & $0.5674 \pm 0.0032$ & $0.5679 \pm 0.0028$ & $+0.001$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Three things change at once. Final F1 rises $+0.070$; the $\lambda$ sweep becomes
+\emph{monotone}, tracing a proper stability--plasticity frontier instead of
+degrading at both ends; and the seed spread falls $14\times$, from $\pm0.0533$ to
+$\pm0.0038$. That last point retires a claim made repeatedly in earlier drafts of
+this note --- that EUCR's large seed variance was a coherent property of
+prototype-based evidential heads. It was substantially this bug. Note that
+proximal's useful $\lambda$ is far larger than the loss form's, because $b$
+carries a factor of $\mathrm{lr}$: unit $\Omega$ gives $b=1$ at
+$\lambda = 1/(2\,\mathrm{lr}) = 50$.
+
+\section{What the consolidation signal actually is}
+\label{sec:frontier}
+
+With a stable anchor the question ``does the evidential weighting contribute
+anything'' becomes answerable for the first time. It could not be asked under the
+loss form, because the clip factor depends on $\lVert g_{\text{anchor}}\rVert$
+and hence on $\Omega$'s tail --- a uniform $\Omega$ has no tail, so the two arms
+were being attenuated by different amounts and the comparison was confounded.
+
+Four importance sources were swept over $\lambda$ and compared as
+\emph{frontiers}, because matched $\lambda$ is not matched pull when the $\Omega$
+distributions differ:
+
+\begin{itemize}
+  \item \textbf{evidential} --- the shipped readout.
+  \item \textbf{uniform} --- $\Omega_i = 1$ everywhere, i.e.\ plain L2-SP.
+  \item \textbf{frozen probes} --- probes never trained (\texttt{probe\_loss\_weight 0}
+        gives them no gradient at all; verified, drift $=0.0000$ across the
+        sequence), still read through the DS fusion.
+  \item \textbf{random projection} --- MAS with a random head: the gradient of
+        $\lVert Wf_s\rVert^2$ for a fixed random Gaussian $W$ on the same pooled,
+        normalised stage features. Everything the probes do is kept except the DS
+        fusion and its learned parameters.
+\end{itemize}
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+importance source & peak final F1 & at diagonal \\
+\midrule
+random projection & $\mathbf{0.5962 \pm 0.0015}$ & $0.604$ \\
+evidential        & $0.5932 \pm 0.0038$ & $0.602$ \\
+frozen probes     & $0.5901 \pm 0.0065$ & $0.596$ \\
+uniform $\Omega$  & $0.5791 \pm 0.0011$ & $0.577$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The evidential and random-projection frontiers are not merely close at their
+peaks: they are \emph{the same curve, shifted one decade in $\lambda$}.
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+position on frontier & evidential (diag / final) & random proj.\ (diag / final) \\
+\midrule
+high plasticity & $\lambda{=}5$: $0.697 / 0.390$ & $\lambda{=}0.5$: $0.703 / 0.386$ \\
+mid             & $\lambda{=}500$: $0.632 / 0.570$ & $\lambda{=}50$: $0.641 / 0.569$ \\
+optimum         & $\lambda{=}5000$: $0.602 / 0.593$ & $\lambda{=}500$: $0.604 / 0.596$ \\
+saturated       & $\lambda{=}50000$: $0.567 / 0.568$ & $\lambda{=}5000$: $0.566 / 0.567$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Every paired row matches to within $\pm0.01$ on both axes. The decade offset is
+predicted by the $\Omega$ statistics: the random readout's median $\Omega$ is
+$57\times$ the evidential median, so the same pull $b = 2\,\mathrm{lr}\,\lambda\,\Omega$
+arrives at roughly $1/57$ the $\lambda$. And this is not a relabelling: the two
+$\Omega$ vectors have Spearman correlation $0.546$, so about half the coordinate
+ranking differs --- yet the frontier is identical.
+
+The conclusion has three parts, and only the first is positive.
+
+\begin{enumerate}
+  \item \textbf{The anchor does the work.} $+0.15$ final F1 over no anchor at all.
+  \item \textbf{Per-coordinate weighting adds a little.} $+0.017$ over uniform
+        $\Omega$ ($0.5962$ against $0.5791$, $\sigma \approx 0.001$--$0.002$;
+        separable).
+  \item \textbf{None of that weighting need be learned, and none of it need be
+        evidential.} Evidential, frozen-DS and random-projection are mutually
+        indistinguishable (within $\pm0.003$ against $\sigma \approx
+        0.002$--$0.007$). $\Omega$ is a layer-and-channel sensitivity measure that
+        any random readout recovers.
+\end{enumerate}
+
+This agrees with the per-coordinate result in Section~\ref{sec:pre1}, where a
+displacement control beat every importance measure on a restoration test.
+
+\section{The evidential content}
+
+\subsection{The fusion admits a closed form}
+
+\texttt{Dempster\_layer} applied Dempster's rule in a Python loop, fusing
+prototypes one at a time: $P-1$ sequential iterations with $P$ as large as $138$.
+Adding the ignorance column to a class column gives the commonality
+$q_k(c) = m_k(c) + \omega_k$, and the rule is then exactly
+$q(c) = q_1(c)q_2(c)$ alongside $\omega = \omega_1\omega_2$. Both are products,
+so fusing $P$ sources is two reductions:
+\begin{equation}
+\log q(c) = \sum_{p} \log\!\big(m_p(c) + \omega_p\big),
+\qquad
+\log \omega = \sum_{p} \log \omega_p,
+\qquad
+m(c) = q(c) - \omega .
+\label{eq:closedform}
+\end{equation}
+The loop's per-step renormalisation is a positive per-sample scalar the recursion
+carries through linearly, so it only rescales the result --- this is not an
+approximation. Outputs agree with the loop to $2\times10^{-6}$ and gradients to
+$5\times10^{-13}$; the layer is $9.6\times$ faster at $P=18$, $46\times$ at
+$P=81$ and $78\times$ at $P=138$, and an epoch falls from $8.9$\,s to $1.35$\,s,
+matching EWC's per-epoch cost. Working in logs with a max-shift also removes the
+underflow that $P$-fold products invite.
+
+\subsection{The ignorance mass is zero by construction}
+
+The measured $\omega$ is $\sim10^{-16}$ at the head and $10^{-14}$ to $10^{-25}$
+at the probes. Three independent constructions cause this, not one.
+(i) \texttt{DistanceActivation\_layer} ends with
+$s \leftarrow s/(\max_p s_p + 10^{-4})$, pinning the best prototype at
+$s\approx1$ and its ignorance at the $4.2\times10^{-4}$ rounding artefact.
+(ii) The $P$-fold product $\omega = \prod_p(1-s_p)$.
+(iii) Cosine distance is bounded in $[0,2]$, so with $\gamma\approx1$ and
+$\alpha=\sigma(0)=0.5$ activations live in $[0.068, 0.5]$ and no input, however
+novel, can drive $s_p \to 0$. Denoeux's ENN relies on unbounded Euclidean
+distance precisely so novel inputs send mass to $\Theta$.
+
+Measurement makes (iii) worse than the bound suggests. After training,
+$\gamma \in [0.95, 1.08]$ and $\alpha \in [0.498, 0.502]$ --- essentially
+unmoved from initialisation --- and this is \emph{not} gradient starvation:
+gradient norms on $\eta$ and $\xi$ ($1.9$--$5.6\times10^{-2}$,
+$1.1$--$2.0\times10^{-2}$) are the same order as on the prototypes and belief
+weights ($4.8$--$7.2\times10^{-2}$, $3.6$--$7.5\times10^{-2}$). The layer gets a
+normal gradient and does not move. Observed cosine distances span only
+$[0.60, 1.34]$, so no prototype ever approaches a feature and
+$\prod_p(1-s_p)$ is nearly constant in the input.
+
+Two consequences follow, both verified. \texttt{eucr\_uncertainty=both} is
+\emph{bit-identical} to \texttt{discord} ($\max|\text{both}-\text{discord}| = 0$),
+so that flag has two live settings, not three. And with $\omega\approx0$,
+$\mathrm{BetP}_c = q(c) - \omega(C{-}1)/C$ reduces to $q(c)$, so by
+Eq.~\eqref{eq:closedform} the normalised output is \emph{exactly}
+\begin{equation}
+\mathrm{BetP} \;=\; \mathrm{softmax}\Big(\textstyle\sum_p \log\big(1 - s_p(1-u_{cp})\big)\Big),
+\label{eq:softmax}
+\end{equation}
+measured to $\max|\mathrm{BetP}-\mathrm{softmax}| = 1.8\times10^{-7}$ with argmax
+agreement $1.0000$. In its shipped configuration the DS head \emph{is} a softmax
+classifier over an unusual, saturating, non-negatively-weighted log-linear score.
+
+An important distinction, since an earlier draft of this note got it wrong:
+$\nabla\omega \propto \omega$, so although $\omega$'s \emph{value} is
+$\sim10^{-14}$, its relative sensitivity \emph{pattern} is well defined and
+survives the unit-mean normalisation. \texttt{nonspecificity} is dead as a
+\emph{value} (novelty detection) but alive as an \emph{importance pattern}, and
+performs the same as \texttt{discord} in that role.
+
+\subsection{A pre-registered gate: does the formalism earn its place?}
+\label{sec:gate}
+
+Given Eq.~\eqref{eq:softmax}, EUCR has a claim to be more than a softmax only if
+the $\omega$ and $K$ columns can be revived \emph{and} then carry information a
+softmax does not. Pre-registered as a gate; both halves came back negative.
+
+\paragraph{Revival works.} Three changes together: drop the max-division
+(\texttt{--eucr\_activation\_norm none}); temper the fusion by dividing both
+log-sums by $P^{\tau}$ (\texttt{--eucr\_temper}), the geometric mean of
+commonalities at $\tau=1$, which stops $P$ prototypes reading \emph{one} feature
+vector being counted as $P$ independent sources; and rescale the decision logits
+by $P^{\tau}$ (\texttt{--eucr\_readout\_scale untemper}). Median $\omega$ rises
+from $10^{-20}$ to $0.78$. The third change is essential rather than cosmetic:
+tempering shrinks the readout logits by $P^\tau$, and without undoing that on the
+decision, $\tau=1$ trains to macro recall $0.000$ against $0.710$ with it.
+Tempering appeared untrainable; it was only cold. $q_p(c)\ge\omega_p$ survives
+geometric means, so $m(c)\ge0$ holds for any $\tau$.
+
+\paragraph{A confound had to be removed first.} Every task is $\sim$50\% noise,
+and although the in-distribution set excluded noise \emph{rows}, the head still
+had a noise \emph{output} that absorbs anything unfamiliar. Noise-prediction
+rates on cross-file OOD were $0.04/0.64/0.76$ across seeds against
+$0.02/0.11/0.18$ in-distribution. Retraining with noise dropped entirely roughly
+doubles every score on the held-out-class test and \emph{annihilates} the
+cross-file column (all scores $0.46$--$0.56$, the noise floor). Cross-file
+novelty was never being detected; the noise class was.
+
+\paragraph{It buys nothing.} Held-out-class novelty (train on three of
+\texttt{t2-rcn}'s signal classes, score the other two), noise-free, signed AUROC,
+three seeds at matched accuracy:
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+score & held-out-class & $|{\cdot}-0.5|$ \\
+\midrule
+$\log\omega$ (DS)   & $0.274\pm0.035$ & $0.226$ \\
+$\log K$ (DS)        & $0.721\pm0.044$ & $0.221$ \\
+max BetP (softmax)   & $0.230\pm0.027$ & $\mathbf{0.270}$ \\
+entropy (softmax)    & $0.227\pm0.025$ & $\mathbf{0.273}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The softmax baselines are the strongest scores on the table. Under a true null
+the $|\mathrm{AUROC}-0.5|$ statistic has expectation $\approx 0.8\sigma$, so for
+the observed per-seed $\sigma$ the floor is $0.02$--$0.12$. Signed AUROC is
+reported because almost every score is \emph{anti}-correlated with novelty:
+unseen emitters are classified \emph{more} confidently and with \emph{less}
+ignorance than seen ones. $\log K$ is the only correctly-signed score --- its
+magnitude ties rather than beats, but a score thresholdable in the natural
+direction is operationally worth more than an equally strong one that must be
+inverted. That is the one thread of the formalism that survives, and it is thin.
+
+\paragraph{And it costs accuracy.} On the four-task benchmark, tempering with
+$\omega$ revived gives final F1 $0.329$ (\texttt{nonspecificity}) and $0.386$
+(\texttt{discord}) against $0.51$--$0.53$ with $\omega$ dead. The configuration in
+which the evidential quantity is meaningful is the worst-performing one.
+
+\subsection{PR-E1: a displacement control beats every importance measure}
+\label{sec:pre1}
+
+Pre-registered. On task-0 held-out data at end of sequence, restore the top-$k\%$
+of shared backbone coordinates by a measure's rank to their task-0 values and
+measure the fraction of the loss recovered, relative to a
+statistics-restored baseline. At the primary $k=1\%$, three seeds:
+
+\begin{center}
+\begin{tabular}{lc}
+\toprule
+measure & $R(1\%)$ \\
+\midrule
+$|\Delta\theta|$ \textbf{(control)} & $\mathbf{+0.699 \pm 0.104}$ \\
+Fisher $\times\,\Delta\theta^2$     & $+0.682 \pm 0.161$ \\
+MAS-entropy $\times\,\Delta\theta^2$ & $+0.579 \pm 0.020$ \\
+Fisher                              & $+0.515 \pm 0.073$ \\
+MAS-entropy (shipped)               & $+0.334 \pm 0.222$ \\
+$|\Delta\theta \cdot g|$            & $+0.318 \pm 0.248$ \\
+$|\theta_0^\star|$ (control)        & $+0.103 \pm 0.152$ \\
+random (control)                    & $+0.006 \pm 0.007$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The gate passes ($R_{\text{MAS}} - R_{\text{random}} \ge 0.10$ in 3/3 seeds,
+sanity kill not triggered), but it was the wrong comparison: forgetting is
+localisable --- 1\% of coordinates restores 70\% of it --- yet the coordinates
+are identified by \emph{how far they moved}, not by any importance functional.
+Multiplying either importance by $\Delta\theta^2$ moves it most of the way to
+$|\Delta\theta|$ and neither product beats it, so the $\Delta\theta^2$ factor
+carries the signal. One caveat that cuts against the headline: $R(k)$ rewards L2
+proximity to $\theta_0^\star$, which $|\Delta\theta|$ maximises by construction,
+so the products rather than the control are the fair test --- and they say the
+importance term buys nothing.
+
+\section{Other measured properties}
+
+\subsection{Mixed precision: lossy, not unstable}
+\label{sec:amp}
+
+The comment justifying the \texttt{autocast(enabled=False)} guard asserted the
+head is ``unstable in AMP''. Neutralising the guard and training for real:
+\textbf{zero} non-finite losses and zero skipped steps across nine four-task runs
+and three single-task runs, in both bf16 and fp16. Paired per-seed diagonal F1
+against fp32: bf16 $-0.032 \pm 0.031$ (not significant), fp16
+$-0.085 \pm 0.012$ (significant, but these runs use no \texttt{GradScaler}, so an
+unknown share is missing loss scaling). AMP buys $\sim$5\% epoch time
+($6.19$\,s $\to$ $5.89$\,s), because after the Dempster fix the model is dominated
+by small kernel launches rather than matmul FLOPs. \textbf{Keep the guard, for the
+cost/benefit reason, not the stability one.} Note that layer-level precision
+diagnostics rank the dtypes the \emph{opposite} way from the end-to-end result
+(bf16 gradient cosine to fp32 is $0.32$--$0.50$ against fp16's $0.976$--$0.998$),
+so they did not predict end-to-end damage here.
+
+\subsection{Two architectural choices that are load-bearing}
+
+\begin{itemize}
+  \item \textbf{Euclidean distance destroys the model}: diagonal and final F1
+        both $0.0974 \pm 0.0001$ with BWT exactly $0.000$ on all three seeds --- it
+        never learns. The pooled features are \texttt{LayerNorm}'d, so their L2
+        norm is near-constant and squared-Euclidean distance is dominated by that
+        constant. Cosine is not a tuning choice.
+  \item \textbf{GroupNorm destroys the model}: $0.0981 \pm 0.0001$, training
+        accuracy $0.00$, loss pinned at $2.23$. BatchNorm's batch statistics are
+        load-bearing for the cosine-prototype head.
+\end{itemize}
+
+\subsection{Ablations at the corrected protocol}
+
+Three seeds, loss-form anchor at $\lambda=0.09$, so these sit below the proximal
+numbers but are internally comparable:
+
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+ & diagonal F1 & final F1 & BWT \\
+\midrule
+default                          & $0.6265 \pm 0.0145$ & $0.5231 \pm 0.0533$ & $-0.103$ \\
+\texttt{probe\_loss\_weight 0}   & $0.6245 \pm 0.0152$ & $\mathbf{0.5515 \pm 0.0150}$ & $-0.073$ \\
+\texttt{eucr\_head dm}           & $0.6292 \pm 0.0082$ & $0.5031 \pm 0.0519$ & $-0.126$ \\
+CE aux head, $w=0.3$             & $0.6313 \pm 0.0113$ & $0.5471 \pm 0.0216$ & $-0.084$ \\
+CE aux head, $w=1$               & $0.6486 \pm 0.0093$ & $0.5248 \pm 0.0400$ & $-0.124$ \\
+CE aux head, $w=1$, DS detached  & $\mathbf{0.7440 \pm 0.0078}$ & $0.4132 \pm 0.0254$ & $-0.331$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Two entries deserve comment. Removing the probe loss \emph{improves} final F1 ---
+and it does more than stop training the probes, it freezes them at random
+initialisation entirely (verified: drift $0.0000$ across the sequence, against
+$0.6225$ when trained), because nothing else feeds them. The training loss traces
+are indistinguishable, so the probe loss was not contributing to representation
+learning either. And detaching the DS head so cross-entropy alone shapes the
+backbone lifts the diagonal to $0.744$, \emph{above} EWC's $0.711$: the DS head
+does reach control-level plasticity when it does not have to shape the
+representation itself. It pays for that in retention.
+
+\section{Results}
+
+Four tasks (\texttt{t2-rcn}, \texttt{t0-rcn}, \texttt{t0-deeprad},
+\texttt{t1-deeprad}), 10 epochs, 10\,000 samples per task, three seeds
+(0, 39, 55), all on the \texttt{batch} protocol.
+
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+ & diagonal F1 & final F1 & BWT \\
+\midrule
+LwF                              & $0.7069 \pm 0.0055$ & $\mathbf{0.6602 \pm 0.0170}$ & $-0.047$ \\
+EWC                              & $0.7113 \pm 0.0034$ & $0.4270 \pm 0.0251$ & $-0.284$ \\
+\midrule
+EUCR, no anchor                  & $0.7173 \pm 0.0068$ & $0.3261 \pm 0.0193$ & $-0.391$ \\
+EUCR, loss anchor $\lambda=0.09$ & $0.6265 \pm 0.0145$ & $0.5231 \pm 0.0533$ & $-0.103$ \\
+EUCR, proximal $\lambda=5000$    & $0.6019 \pm 0.0042$ & $0.5932 \pm 0.0038$ & $-0.009$ \\
+EUCR, proximal + random $\Omega$ & $0.6039 \pm 0.0070$ & $\mathbf{0.5962 \pm 0.0015}$ & $-0.008$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+EUCR sits clearly above EWC on final F1 ($+0.17$) and clearly below LwF
+($-0.06$), and is behind both on diagonal. It has the flattest BWT of any method
+here, which is the axis its consolidation targets.
+
+\section{Positioning the method}
+
+\subsection{What EUCR is, stated honestly}
+
+An evidential prototype head with per-task DS heads and a MAS-style importance
+anchor. On this benchmark it is a working continual learner that beats EWC
+comfortably and loses to LwF. Its retention is excellent and its plasticity is
+its weakness --- diagonal $0.60$ against $0.71$ for both baselines.
+
+The parts that demonstrably contribute are: the quadratic anchor ($+0.15$),
+applied in proximal form ($+0.07$ on top, plus a $14\times$ variance reduction),
+with \emph{some} per-coordinate weighting ($+0.017$), and per-task heads that are
+frozen by construction. The parts that do not contribute, on measurement, are the
+Dempster--Shafer fusion as a source of that weighting, the deep evidential
+supervision on the probes, and both uncertainty readouts as novelty signals.
+
+That is a narrower method than the original framing, but it is a defensible one,
+and the accounting is more useful to a reader than the claim would have been.
+
+\subsection{Report the evaluation protocol}
+
+The single most consequential number in this note was produced by neither the
+model nor the data but by which normalisation statistics the evaluation used.
+Any paper using this harness should state that its numbers are computed with
+batch statistics, and therefore transductively, and should report at least one
+alternative. The three options are set out in Section~\ref{sec:protocol}; none is
+both non-transductive and storage-free.
+
+\subsection{Calibrate $\lambda$ against the stability window, not by search}
+
+$\Omega$'s heavy tail means the effective anchor strength is set by a few
+coordinates. Under the loss form, check $\max_i \mathrm{lr} \cdot 2\lambda\Omega_i
+< 2$ before trusting any $\lambda$; under the proximal form this is unnecessary by
+construction, which is the main argument for preferring it. Reporting the ratio
+$\lVert g_{\text{anchor}}\rVert / \lVert g_{\text{task}}\rVert$ alongside
+$\lambda$ would have made this visible immediately.
+
+\subsection{Compare importance schemes as frontiers}
+
+Matched $\lambda$ is not matched pull when the $\Omega$ distributions differ ---
+uniform $\Omega$'s median is $3600\times$ the evidential median. Every
+point-comparison of importance schemes in earlier drafts of this note was
+therefore uninterpretable. Sweep $\lambda$ and compare the (diagonal, final)
+trade-off curves.
+
+\subsection{Where the remaining plasticity is}
+
+The detached CE arm reaches diagonal $0.744$, so the representation the DS head
+needs is reachable; the head simply does not shape it well on its own. That, plus
+the $\gamma/\alpha$ layer never training despite receiving normal gradients,
+localises the plasticity deficit in the distance-to-activation parameterisation
+rather than in the evidential formalism. It is the most promising remaining
+direction and the one this note does not settle.
+
+\section{Reproducing}
+
+\begin{verbatim}
+main.py --config configs/base.yaml --config configs/models/til/eucr.yaml \
+  --task-order-files "t2-rcn,t0-rcn,t0-deeprad,t1-deeprad" \
+  --samples_per_task 10000 --n_epochs 10 --expt_name <arm>
+\end{verbatim}
+
+About two minutes per arm; several fit on one A6000 concurrently. Every
+invocation is a three-seed sweep --- read all three per-seed
+\texttt{results.txt}, never seed 0 alone. Decision rules and amendments for the
+pre-registered gates are in \texttt{docs/eucr/preregistration.md}.
+
+\end{document}

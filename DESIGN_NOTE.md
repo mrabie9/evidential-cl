@@ -77,9 +77,32 @@ The offsets $\alpha_{jk}$ are fixed by the Least Commitment Principle.
 All reported runs use \texttt{centered\_uniform}: features are centred by the
 per-task running mean $\mu_j$ and the offset is the uniform split
 $\alpha_{jk}=\beta_{0k}/J$, which satisfies the constraint
-$\sum_j\alpha_{jk}=\beta_{0k}$ in \eqref{eq:woe} and is the multi-category
-generalisation of Denoeux's binary Least-Commitment solution
-(\textsection~4.1). We prefer it to the uncentred variant
+$\sum_j\alpha_{jk}=\beta_{0k}$ as written in \eqref{eq:woe}.
+
+\paragraph{Correction (2026-08-28).}
+This was previously described as ``the multi-category generalisation of
+Denoeux's binary Least-Commitment solution (\textsection~4.1)''. It is not.
+Denoeux does the algebra in the \emph{centred} parameterisation: writing
+$w_{jk}=\beta_{jk}\phi'_j+\alpha'_{jk}$ forces
+$\sum_j\alpha'_{jk}=\beta'_{0k}=\beta_{0k}+\sum_q\beta_{qk}\mu_q$, so the
+uniform split is $\beta'_{0k}/J$, and Proposition~2 Eq.~(38) is the
+multi-category form of exactly that. The difference is structural: under
+Eq.~(38) $\sum_j w_{jk}=z_k$ \emph{exactly}---the total weight of evidence is
+the logit---whereas under \texttt{centered\_uniform} it is
+$z_k-\bm{\beta}_k^\top\bm{\mu}$. Measured on the PR-3 \texttt{ema} task-9
+checkpoint the omitted $\sum_q\beta^*_{qk}\mu_q$ is $20$--$106\times$ larger
+than $\beta^*_{0k}$. \texttt{centering\_mode="prop2\_uniform"} now implements
+Eq.~(38); \texttt{centered\_uniform} remains the default \emph{for training} only
+because every recorded result in \texttt{docs/woe-cl/README.md} was measured under
+it, and should be described as this project's own convention rather than as
+Denoeux's. \textbf{Since 2026-09-03 the offline DS readouts
+(\texttt{ds\_ignorance\_conflict.py}, \texttt{vacuous\_mass\_distribution.py})
+default to \texttt{prop2\_uniform}}, so DS quantities are quoted against Denoeux
+even though the trained anchor is not. The two are not interchangeable: the
+per-task ordering of every readout changes between conventions (Spearman $+0.70$
+to $+0.77$, inside PR-4's own fail band).
+Note also that neither the \texttt{woe\_lc\_*} objectives nor the default path
+row-centre $\bm{B}$ across classes, which is Proposition~2's other half. We prefer it to the uncentred variant
 (\texttt{raw\_uniform}) because centring removes the arbitrary additive
 activation offset, so a weight of evidence reflects a feature's deviation from
 its task-mean rather than its absolute scale; this keeps $\Ic(m)$ near zero for

@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model.resnet1d import AdcIqAdapter, BasicBlock1D
+from model.resnet1d import AdcIqAdapter, BasicBlock1D, build_norm_factory
 from model.evidential_modules import DM, Dempster_Shafer_module, pignistic_probability
 from utils.iq_features import append_iq_augmented_features
 
@@ -38,9 +38,14 @@ class EvidentialProbe(nn.Module):
         proto_factor: int = 20,
         metric: str = "cosine",
         head: str = "dm",
+        belief_init: str = "random",
+        temper: float = 0.0,
+        activation_norm: str = "max",
+        readout_scale: float = 1.0,
     ) -> None:
         super().__init__()
         self.n_channels = n_channels
+        self.readout_scale = float(readout_scale)
         self.n_classes = n_classes
         self.head = str(head).lower()
         self.norm = nn.LayerNorm(n_channels)
@@ -49,6 +54,9 @@ class EvidentialProbe(nn.Module):
             n_classes=n_classes,
             n_prototypes=max(1, n_classes) * proto_factor,
             metric=metric,
+            belief_init=belief_init,
+            temper=temper,
+            activation_norm=activation_norm,
         )
         self.dm_layer = DM(num_class=n_classes, nu=float(nu))
 
@@ -59,7 +67,7 @@ class EvidentialProbe(nn.Module):
         pooled = self.norm(pooled)
         mass = self.ds_module(pooled)
         readout = (
-            pignistic_probability(mass)
+            pignistic_probability(mass, scale=self.readout_scale)
             if self.head == "pignistic"
             else self.dm_layer(mass)
         )
@@ -89,13 +97,27 @@ class EucrResNet1D(nn.Module):
         metric: str = "cosine",
         head: str = "dm",
         classes_per_task: Sequence[int] | None = None,
+        belief_init: str = "random",
+        temper: float = 0.0,
+        activation_norm: str = "max",
+        readout_scale: str | float = "untemper",
+        ds_detach: bool = False,
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
+        # Direction G: with ds_detach, the evidential path sees a detached feature,
+        # so cross-entropy alone shapes the backbone and the DS head/probes are a
+        # pure readout on top of it.
+        self.ds_detach = bool(ds_detach)
+        self.belief_init = str(belief_init).lower()
+        self.temper = float(temper)
+        self.activation_norm = str(activation_norm).lower()
+        self._readout_scale_spec = readout_scale
         self.probe_stages = tuple(sorted(set(int(s) for s in probe_stages)))
         self.in_planes = 64
         self.metric = str(metric).lower()
         self.head = str(head).lower()
+        self.proto_factor = int(proto_factor)
 
         # Per-task evidential heads: each task owns a Dempster-Shafer head over
         # only its own classes. Routing forward(x, t) through head t decouples
@@ -125,10 +147,17 @@ class EucrResNet1D(nn.Module):
 
         self.input_adapter = AdcIqAdapter()
 
+        # Honour --use_groupnorm / --norm_type like ResNet1D. The evidential head
+        # reads feature *direction* (cosine distance to prototypes), so it is
+        # unusually sensitive to the train/eval gap BatchNorm's running statistics
+        # introduce: measured directional coherence of the pooled features swings
+        # 0.16-0.42 under running stats against a steady 0.07 under batch stats,
+        # which is enough to sweep every sample onto one prototype at eval time.
+        self._norm_factory = build_norm_factory(args)
         self.conv1 = nn.Conv1d(
             effective_in_channels, 64, kernel_size=7, stride=2, padding=1, bias=False
         )
-        self.bn1 = nn.BatchNorm1d(64)
+        self.bn1 = self._norm_factory(64)
         self.maxpool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
 
         self.layer1 = self._make_layer(64, num_blocks[0], stride=1)
@@ -147,7 +176,23 @@ class EucrResNet1D(nn.Module):
                     n_classes=count,
                     n_prototypes=count * proto_factor,
                     metric=self.metric,
+                    belief_init=self.belief_init,
+                    temper=self.temper,
+                    activation_norm=self.activation_norm,
                 )
+                for task_index, count in enumerate(self.classes_per_task)
+            }
+        )
+        # Auxiliary per-task LINEAR heads. The DS head needs ~4x the steps of a
+        # linear+CE head to reach the same accuracy, which at a fixed epoch budget
+        # is indistinguishable from catastrophic forgetting. These give the shared
+        # backbone a fast route to good features; the DS head then forms a readout
+        # on top of them instead of having to shape them itself. Predictions at
+        # evaluation still come from the DS head, so any gain is a statement about
+        # the DS head, not about the linear one.
+        self.ce_heads = nn.ModuleDict(
+            {
+                str(task_index): nn.Linear(feat_dim, count)
                 for task_index, count in enumerate(self.classes_per_task)
             }
         )
@@ -173,13 +218,31 @@ class EucrResNet1D(nn.Module):
                     proto_factor=proto_factor,
                     metric=self.metric,
                     head=self.head,
+                    belief_init=self.belief_init,
+                    temper=self.temper,
+                    activation_norm=self.activation_norm,
+                    readout_scale=self._scale_for(num_classes),
                 )
                 for stage in self.probe_stages
             }
         )
 
+    def _scale_for(self, n_classes: int) -> float:
+        """Readout rescale that cancels tempering for the decision only.
+
+        ``"untemper"`` returns ``P**temper`` for this head's prototype count, so
+        temper=0 is a no-op and any temper>0 keeps the logits at their untempered
+        scale. A float overrides it; ``"none"`` disables it.
+        """
+        spec = self._readout_scale_spec
+        if isinstance(spec, (int, float)):
+            return float(spec)
+        if str(spec).lower() != "untemper" or self.temper == 0.0:
+            return 1.0
+        return float(max(1, n_classes) * self.proto_factor) ** self.temper
+
     def _make_layer(self, planes: int, blocks: int, stride: int) -> nn.Sequential:
-        norm_layer = nn.BatchNorm1d
+        norm_layer = self._norm_factory
         downsample = None
         if stride != 1 or self.in_planes != planes * BasicBlock1D.expansion:
             downsample = nn.Sequential(
@@ -253,11 +316,21 @@ class EucrResNet1D(nn.Module):
         """Run task ``task``'s head; return (local class scores, mass)."""
         mass = self.ds_heads[str(task)](features)
         if self.head == "pignistic":
-            scores = pignistic_probability(mass)
+            scores = pignistic_probability(
+                mass, scale=self._scale_for(mass.size(-1) - 1)
+            )
         else:
             n_classes = mass.size(-1) - 1
             scores = self.dm_heads[str(task)](mass)[:, :n_classes]
         return scores, mass
+
+    def ce_logits(self, features: torch.Tensor, task: int) -> torch.Tensor:
+        """Auxiliary linear-head logits for ``task``, scattered to global width."""
+        scores = self.ce_heads[str(int(task))](features)
+        start, end = self._task_offsets[int(task)]
+        out = features.new_full((features.size(0), self.num_classes), -1e9)
+        out[:, start:end] = scores
+        return out
 
     def forward(
         self,
@@ -267,7 +340,34 @@ class EucrResNet1D(nn.Module):
         cil_all_seen_upto_task: int | None = None,
         return_features: bool = False,
         return_probes: bool = False,
+        return_ce: bool = False,
+        bn_training: bool | None = None,
     ):
+        """``bn_training`` mirrors :meth:`model.resnet1d.ResNet1D.forward`.
+
+        Every ResNet1D-based learner in this repo reaches its backbone with that
+        method's default ``bn_training=True``, so the harness scores them with
+        *batch* statistics. EUCR had no such parameter and therefore inherited
+        whatever ``model.eval()`` set, i.e. frozen running statistics -- a
+        different evaluation protocol from every model it is compared against.
+        Passing it explicitly puts EUCR on whichever protocol the caller wants.
+        ``None`` keeps the module's current mode (the previous behaviour).
+        """
+        if bn_training is not None:
+            prev_mode = self.training
+            self.train(bn_training)
+            try:
+                return self.forward(
+                    x,
+                    task,
+                    cil_all_seen_upto_task=cil_all_seen_upto_task,
+                    return_features=return_features,
+                    return_probes=return_probes,
+                    return_ce=return_ce,
+                )
+            finally:
+                self.train(prev_mode)
+
         x = self._prepare_input(x)
         out = self.maxpool(F.relu(self.bn1(self.conv1(x))))
 
@@ -288,6 +388,8 @@ class EucrResNet1D(nn.Module):
         # are scattered into a global ``[B, num_classes]`` tensor at the task's
         # class offsets, so callers keep working in the global label space. CIL
         # runs every seen head; TIL runs only the queried task's head.
+        ds_features = features.detach() if self.ds_detach else features
+
         eu = omegas = beliefs = None
         if task is not None:
             if cil_all_seen_upto_task is not None:
@@ -296,7 +398,7 @@ class EucrResNet1D(nn.Module):
                 tasks_to_run = [int(task)]
             eu = features.new_zeros((features.size(0), self.num_classes))
             for task_index in tasks_to_run:
-                scores, mass = self._task_readout(features, task_index)
+                scores, mass = self._task_readout(ds_features, task_index)
                 start, end = self._task_offsets[task_index]
                 eu[:, start:end] = scores
                 if task_index == int(task):
@@ -304,10 +406,25 @@ class EucrResNet1D(nn.Module):
                     beliefs = mass[:, :-1]
 
         if return_probes:
-            stage_feats = {1: s1, 2: s2, 3: s3, 4: s4}
+            stage_feats = (
+                {1: s1.detach(), 2: s2.detach(), 3: s3.detach(), 4: s4.detach()}
+                if self.ds_detach
+                else {1: s1, 2: s2, 3: s3, 4: s4}
+            )
             probe_outs: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
             for stage in self.probe_stages:
                 probe_outs.append(self.probes[str(stage)](stage_feats[stage]))
+            if return_ce:
+                # Appended last only when asked, so compute_importance's out[-1]
+                # (which requests probes alone) keeps meaning probe_outs.
+                return (
+                    eu,
+                    features,
+                    omegas,
+                    beliefs,
+                    probe_outs,
+                    self.ce_logits(features, task) if task is not None else None,
+                )
             return eu, features, omegas, beliefs, probe_outs
 
         if return_features:
