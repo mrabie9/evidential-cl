@@ -1,4 +1,4 @@
 model: bcl_dual
 loader: class_incremental_loader
-memory_strength: 1
-beta: 1.0
+memory_strength: 10
+beta: 0.9

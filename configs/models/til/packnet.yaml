@@ -1,4 +1,4 @@
 model: packnet
 loader: task_incremental_loader
 prune_perc: 0.8
-post_prune_epochs: 2
+post_prune_epochs: 1
