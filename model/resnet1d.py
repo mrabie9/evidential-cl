@@ -8,6 +8,7 @@ raw IQ sample classification tasks.
 
 from __future__ import annotations
 
+import os
 
 import torch
 import torch.nn as nn
@@ -17,6 +18,44 @@ from utils.iq_features import append_iq_augmented_features
 
 # Ceiling for AdaB1N's per-task concentration logits, not an exact task count.
 ADAB1N_MAX_TASKS = 20
+
+# Trunk dropout probabilities for drop1..drop4, overridable from the environment
+# so an arm can be run without editing this file -- which also guarantees two
+# arms differ in nothing else.
+#
+#   RESNET1D_DROPOUT="0.2,0.2,0.2,0.2"  -- the historical flat schedule
+#   RESNET1D_DROPOUT="0.5,0.4,0.3,0.2"  -- the decreasing schedule (tried
+#                                          2026-09-02: -0.0489 on WoE-SI, all of
+#                                          it plasticity, BWT flat)
+#   RESNET1D_DROPOUT="0"                -- no trunk dropout (the default here)
+#
+# A single value is broadcast to all four stages, and a stage at p=0 becomes an
+# ``nn.Identity`` so it draws no RNG at all.
+_DEFAULT_DROPOUT = (0.0, 0.0, 0.0, 0.0)
+
+
+def trunk_dropout_schedule() -> tuple[float, ...]:
+    """Return the four trunk dropout probabilities, honouring the env override."""
+    raw = os.environ.get("RESNET1D_DROPOUT")
+    if not raw:
+        return _DEFAULT_DROPOUT
+    parts = [float(v) for v in raw.replace(" ", "").split(",") if v != ""]
+    if len(parts) == 1:
+        parts = parts * 4
+    if len(parts) != 4:
+        raise ValueError(
+            f"RESNET1D_DROPOUT must be 1 or 4 comma-separated floats; got {raw!r}"
+        )
+    for value in parts:
+        if not 0.0 <= value < 1.0:
+            raise ValueError(
+                f"RESNET1D_DROPOUT probabilities must be in [0, 1); got {raw!r}"
+            )
+    return tuple(parts)
+
+
+def _dropout(p: float) -> nn.Module:
+    return nn.Dropout(p=p) if p > 0.0 else nn.Identity()
 
 
 class BasicBlock1D(nn.Module):
@@ -257,10 +296,15 @@ class _ResNet1D(nn.Module):
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
 
+        p1, p2, p3, p4 = trunk_dropout_schedule()
         self.layer1 = self._make_layer(block, 64, layers[0])
+        self.drop1 = _dropout(p1)
         self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
+        self.drop2 = _dropout(p2)
         self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
+        self.drop3 = _dropout(p3)
         self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
+        self.drop4 = _dropout(p4)
 
         self.avgpool = nn.AdaptiveAvgPool1d(1)
         out_dim = 512 * block.expansion
@@ -332,9 +376,13 @@ class _ResNet1D(nn.Module):
             x = self.maxpool(x)
 
             x = self.layer1(x)
+            x = self.drop1(x)
             x = self.layer2(x)
+            x = self.drop2(x)
             x = self.layer3(x)
+            x = self.drop3(x)
             x = self.layer4(x)
+            x = self.drop4(x)
 
             if return_h4:
                 return x
@@ -584,4 +632,35 @@ class ResNet1D(nn.Module):
         return adab1n_factory
 
 
-__all__ = ["ResNet1D"]
+def build_norm_factory(args):
+    """Return a ``channels -> norm module`` factory honouring ``args``.
+
+    Module-level so backbones other than :class:`ResNet1D` (e.g.
+    :class:`model.eucr_backbone.EucrResNet1D`) can respect ``--use_groupnorm``
+    / ``--norm_type`` with the same grouping rule.
+    """
+    if args is None:
+        return lambda channels: nn.BatchNorm1d(channels)
+
+    use_groupnorm = bool(getattr(args, "use_groupnorm", False))
+    norm_type = str(getattr(args, "norm_type", "batchnorm")).lower()
+    if norm_type in {"groupnorm", "group_norm", "gn"}:
+        use_groupnorm = True
+
+    if use_groupnorm:
+        min_channels_per_group = max(
+            1, int(getattr(args, "groupnorm_min_channels", 64))
+        )
+
+        def gn_factory(channels: int):
+            groups = max(1, channels // min_channels_per_group)
+            while groups > 1 and channels % groups != 0:
+                groups -= 1
+            return nn.GroupNorm(groups, channels)
+
+        return gn_factory
+
+    return lambda c: nn.BatchNorm1d(c)
+
+
+__all__ = ["ResNet1D", "build_norm_factory", "trunk_dropout_schedule"]

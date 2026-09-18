@@ -4,6 +4,14 @@ This is the anti-forgetting machinery for EUCR. It replaces the Fisher-informati
 diagonal of EWC with an *evidential* importance signal read out from the
 Dempster-Shafer uncertainty the backbone probes assign to each stage.
 
+Note on lineage: despite the shape of the formula this is **not** a Fisher
+approximation -- there is no Laplace / log-likelihood-curvature story behind it.
+Squaring the gradient of a scalar *output functional*, accumulated over
+(effectively unlabelled) data, is Memory Aware Synapses (Aljundi et al., ECCV
+2018), which uses ``grad ||F(x)||^2``. EUCR substitutes a Dempster-Shafer
+uncertainty for MAS's output norm. Call it a MAS variant, not a Fisher analogue,
+and benchmark it against MAS.
+
 Pipeline per task ``t``:
   1. :func:`compute_importance` -- run over the task's data and accumulate the
      squared gradient of the mean backbone DS uncertainty w.r.t. each shared
@@ -11,9 +19,11 @@ Pipeline per task ``t``:
      the DS component: ``nonspecificity`` (the ignorance mass ``omega``),
      ``discord`` (entropy of the pignistic probability), or ``both`` (their sum,
      the DS total). Parameters whose perturbation most changes the backbone's
-     uncertainty are deemed important (evidential analogue of the Fisher
-     diagonal). Note ``nonspecificity`` alone weakens as the long Dempster chain
-     drives ``omega`` -> 0; ``discord`` / ``both`` stay informative.
+     uncertainty are deemed important (a MAS-style sensitivity measure, see the
+     lineage note above). ``nonspecificity`` is a dead readout: ``omega`` is ~0 by
+     construction (see ``DistanceActivation_layer``), which also makes ``both``
+     *bit-identical* to ``discord`` -- measured max|both - discord| = 0.0. There
+     are two live settings here, not three.
   2. :func:`to_channel` (optional) -- collapse per-weight importance to one score
      per convolution output channel, then broadcast it back across the filter.
   3. :func:`accumulate` -- online (running-sum) accumulation across tasks.
@@ -32,12 +42,12 @@ from typing import Dict, Iterable, Optional
 import torch
 import torch.nn as nn
 
-_UNCERTAINTY_MODES = ("nonspecificity", "discord", "both")
+_UNCERTAINTY_MODES = ("nonspecificity", "discord", "both", "uniform", "random_proj")
 
 # Per-task evidential heads / probes are NOT shared across tasks, so they are
 # excluded from consolidation. Everything else (conv1, layer1..layer4, the
 # feature LayerNorm, BatchNorm params, input adapter) is the shared backbone.
-_EXCLUDE_SUBSTRINGS = ("ds_head", "dm_head", "probes")
+_EXCLUDE_SUBSTRINGS = ("ds_head", "dm_head", "ce_head", "probes")
 
 
 def is_consolidatable(name: str) -> bool:
@@ -93,6 +103,48 @@ def _backbone_uncertainty(probe_outs, mode: str) -> torch.Tensor:
     return torch.stack(per_stage, dim=0).mean(dim=0)
 
 
+def _random_projection_scalar(backbone, inputs, generator) -> torch.Tensor:
+    """MAS with a random head: grad of ||W f_s||^2 on the same stage features.
+
+    The tightest control on whether the Dempster-Shafer path contributes anything
+    to the importance signal. Everything the evidential probes do -- which stages,
+    global average pooling, normalisation, a readout of ``num_classes`` width -- is
+    kept; only the DS fusion and its learned parameters are replaced by a FIXED
+    random linear map. If this recovers the same importance, Omega is a measure of
+    layer and channel sensitivity that any random readout finds, and the
+    evidential machinery is decorative.
+    """
+    feats: Dict[int, torch.Tensor] = {}
+    handles = [
+        getattr(backbone, f"layer{s}").register_forward_hook(
+            lambda _m, _i, out, s=s: feats.__setitem__(s, out)
+        )
+        for s in backbone.probe_stages
+    ]
+    try:
+        backbone(inputs)
+    finally:
+        for h in handles:
+            h.remove()
+
+    if not hasattr(backbone, "_mas_random_heads"):
+        backbone._mas_random_heads = {}
+    per_stage = []
+    for stage, feat in feats.items():
+        pooled = torch.nn.functional.adaptive_avg_pool1d(feat, 1).flatten(1)
+        pooled = torch.nn.functional.layer_norm(pooled, (pooled.size(-1),))
+        key = (stage, pooled.size(-1))
+        if key not in backbone._mas_random_heads:
+            w = torch.empty(
+                backbone.num_classes, pooled.size(-1), device=pooled.device
+            )
+            torch.nn.init.normal_(w, std=pooled.size(-1) ** -0.5, generator=generator)
+            backbone._mas_random_heads[key] = w
+        readout = pooled @ backbone._mas_random_heads[key].t()
+        per_stage.append(readout.pow(2).sum(dim=-1))
+    return torch.stack(per_stage, dim=0).mean(dim=0)
+
+
 @torch.enable_grad()
 def compute_importance(
     backbone: nn.Module,
@@ -102,7 +154,20 @@ def compute_importance(
     normalize: bool = True,
     uncertainty_mode: str = "both",
 ) -> Dict[str, torch.Tensor]:
-    """Estimate evidential importance (Fisher-style diagonal of uncertainty).
+    """Estimate evidential importance (a MAS-style sensitivity diagonal).
+
+    Two known weaknesses, both unfixed:
+
+    * This runs under ``backbone.eval()``, i.e. with BatchNorm running statistics
+      -- the exact regime the cosine-distance head is least stable in (pooled
+      feature directional coherence swings 0.16-0.42 under running stats against
+      a steady 0.061-0.080 under batch stats). The importance is measured in the
+      one regime we have shown we cannot trust.
+    * For ``nonspecificity`` the *estimator* degenerates as well as the value:
+      ``grad E[omega] = E[omega grad log omega]``, so when omega spans orders of
+      magnitude the effective sample size collapses onto a few inputs.
+      Differentiating ``log omega`` is scale-free; the closed-form
+      ``Dempster_layer`` already computes it.
 
     For each batch we differentiate the mean backbone DS uncertainty
     (``uncertainty_mode`` selects nonspecificity / discord / both) and accumulate
@@ -114,6 +179,18 @@ def compute_importance(
     unit mean so ``lambda`` stays interpretable across datasets and uncertainty
     modes.
     """
+    if uncertainty_mode == "uniform":
+        # Ablation control: Omega_i = 1 for every coordinate, so the penalty
+        # becomes plain L2 pull toward theta_star with no evidential weighting.
+        # If this matches the evidential readouts, the DS uncertainty is
+        # contributing nothing and only the quadratic anchor is doing work --
+        # which is what PR-E1 found at the per-coordinate level, where a
+        # displacement control beat every importance measure.
+        return {
+            name: torch.ones_like(param)
+            for name, param in _named_consolidatable_params(backbone)
+        }
+
     was_training = backbone.training
     backbone.eval()
     importance: Dict[str, torch.Tensor] = {
@@ -126,6 +203,7 @@ def compute_importance(
         return importance
 
     n_seen = 0
+    generator = None
     for batch_idx, batch in enumerate(loader):
         if max_batches is not None and batch_idx >= max_batches:
             break
@@ -137,12 +215,17 @@ def compute_importance(
             continue
         bsz = inputs.size(0)
 
-        out = backbone(inputs, return_probes=True)
-        probe_outs = out[-1]
-        if not probe_outs:
-            break
-        uncertainty = _backbone_uncertainty(probe_outs, uncertainty_mode)
-        scalar = uncertainty.mean()
+        if uncertainty_mode == "random_proj":
+            if generator is None:
+                generator = torch.Generator(device=device)
+                generator.manual_seed(0)
+            scalar = _random_projection_scalar(backbone, inputs, generator).mean()
+        else:
+            out = backbone(inputs, return_probes=True)
+            probe_outs = out[-1]
+            if not probe_outs:
+                break
+            scalar = _backbone_uncertainty(probe_outs, uncertainty_mode).mean()
 
         backbone.zero_grad(set_to_none=True)
         scalar.backward()

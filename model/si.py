@@ -89,6 +89,7 @@ class Net(ReplayInputMixin, LwfDistillationMixin, nn.Module):
 
         self.si_c = float(self.cfg.si_c)
         self.epsilon = float(self.cfg.si_epsilon)
+        self.omega_uniform = bool(getattr(args, "anchor_omega_uniform", False))
         self.anchor_mode = resolve_anchor_mode(args)
         self.use_proximal_anchor = self.anchor_mode == "proximal"
         self._init_lwf_distillation(args, "si")
@@ -240,7 +241,14 @@ class Net(ReplayInputMixin, LwfDistillationMixin, nn.Module):
             omega = getattr(self, f"{key}_si_omega")
             W_buf = getattr(self, f"{key}_si_W")
             delta = param.detach() - prev
-            omega.add_(W_buf / (delta.pow(2) + self.epsilon))
+            if self.omega_uniform:
+                # A9's control, ported from woe_si: every parameter gets the
+                # same per-task importance, so Omega counts tasks and nothing
+                # else. Deliberately not `ones / (delta^2 + eps)`, which would
+                # smuggle the displacement back in as the ranking.
+                omega.add_(torch.ones_like(omega))
+            else:
+                omega.add_(W_buf / (delta.pow(2) + self.epsilon))
             prev.copy_(param.detach())
             W_buf.zero_()
             getattr(self, f"{key}_si_p_old").copy_(param.detach())

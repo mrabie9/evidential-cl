@@ -62,6 +62,7 @@ def _make_args(loader: str, **overrides) -> object:
     o.woe_evidence_belief_tau = overrides.get("woe_evidence_belief_tau", 1.0)
     o.woe_evidence_asymmetric = overrides.get("woe_evidence_asymmetric", False)
     o.woe_importance_scalar = overrides.get("woe_importance_scalar", "i2")
+    o.woe_omega_transform = overrides.get("woe_omega_transform", "relu")
     o.woe_lwf_lambda = overrides.get("woe_lwf_lambda", 0.0)
     o.woe_evidence_distill_lambda = overrides.get("woe_evidence_distill_lambda", 0.0)
     o.woe_lwf_temperature = overrides.get("woe_lwf_temperature", 5.0)
@@ -1094,3 +1095,89 @@ def test_ce_scalar_is_negated_so_improvement_is_positive() -> None:
     y = torch.randint(0, 3, (6,))
     scalar = model._importance_scalar(x, y, 0)
     assert float(scalar.item()) < 0.0  # -CE, and CE > 0 on an untrained net
+
+
+# ----------------------------------------------------------------------
+# Omega projection (woe_omega_transform)
+# ----------------------------------------------------------------------
+def test_omega_transform_defaults_to_relu() -> None:
+    model = Net(1, 6, 2, _make_args("task_incremental_loader"))
+    assert model.omega_transform == "relu"
+
+
+def test_omega_transform_rejects_unknown() -> None:
+    try:
+        Net(1, 6, 2, _make_args("task_incremental_loader", woe_omega_transform="sign"))
+    except ValueError:
+        return
+    raise AssertionError("woe_omega_transform should reject unknown values")
+
+
+def _omega_after_a_task(transform: str) -> float:
+    torch.manual_seed(21)
+    model = Net(
+        1,
+        6,
+        2,
+        _make_args("task_incremental_loader", woe_omega_transform=transform),
+    )
+    x = torch.randn(6, 2, 1024)
+    y = torch.randint(0, 3, (6,))
+    for _ in range(4):
+        model.observe(x, y, 0)
+    model._consolidate_current_task()
+    return _cumulative_omega(model)
+
+
+def test_abs_recovers_the_mass_relu_discards() -> None:
+    """abs >= relu everywhere, strictly so when any path integral went negative."""
+    relu_omega = _omega_after_a_task("relu")
+    abs_omega = _omega_after_a_task("abs")
+    assert abs_omega > relu_omega
+
+
+def test_both_transforms_keep_omega_non_negative() -> None:
+    """Non-negativity is the point: a negative Omega breaks both anchor forms."""
+    for transform in ("relu", "abs"):
+        torch.manual_seed(22)
+        model = Net(
+            1,
+            6,
+            2,
+            _make_args("task_incremental_loader", woe_omega_transform=transform),
+        )
+        x = torch.randn(6, 2, 1024)
+        y = torch.randint(0, 3, (6,))
+        for _ in range(4):
+            model.observe(x, y, 0)
+        model._consolidate_current_task()
+        for name in model._tracked_names:
+            omega = getattr(model, f"{model._param_to_key[name]}_woe_omega")
+            assert bool((omega >= 0).all()), f"{transform}: negative Omega in {name}"
+
+
+def test_abs_anchors_parameters_relu_leaves_free() -> None:
+    """The behavioural difference: parameters with negative omega get protected."""
+    relu_model_omega, abs_model_omega = {}, {}
+    for transform, store in (("relu", relu_model_omega), ("abs", abs_model_omega)):
+        torch.manual_seed(23)
+        model = Net(
+            1,
+            6,
+            2,
+            _make_args("task_incremental_loader", woe_omega_transform=transform),
+        )
+        x = torch.randn(6, 2, 1024)
+        y = torch.randint(0, 3, (6,))
+        for _ in range(4):
+            model.observe(x, y, 0)
+        model._consolidate_current_task()
+        for name in model._tracked_names:
+            store[name] = getattr(
+                model, f"{model._param_to_key[name]}_woe_omega"
+            ).reshape(-1)
+    zeroed_by_relu = sum(
+        int(((relu_model_omega[n] == 0) & (abs_model_omega[n] > 0)).sum())
+        for n in relu_model_omega
+    )
+    assert zeroed_by_relu > 0
