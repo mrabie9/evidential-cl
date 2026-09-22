@@ -477,7 +477,9 @@ class BayesianClassifier(nn.Module):
         )
         if not self.split:
             last_conv = self.feature_net.layer4[-1].conv2
-            feeding = next(i for i, (layer, _) in enumerate(chain) if layer is last_conv)
+            feeding = next(
+                i for i, (layer, _) in enumerate(chain) if layer is last_conv
+            )
             chain.append((self.output, feeding))
         return chain
 
@@ -490,8 +492,7 @@ class BayesianClassifier(nn.Module):
                     "Expected even sequence length for 3-channel interleaved IQ "
                     f"input; got shape {tuple(x.shape)}."
                 )
-            sequence_length = x.size(2) // 2
-            x = x.view(x.size(0), 3, 2, sequence_length)
+            x = misc_utils.deinterleave_iq_last_axis(x)
             x = self.input_adapter(x)
         elif x.dim() == 4 and x.size(1) == 3 and x.size(2) == 2:
             x = self.input_adapter(x)
@@ -903,12 +904,13 @@ class Net(nn.Module):
 
             weight_sigma = trainer_weight_sigma.pow(2) / saver_weight_sigma.pow(2)
             normal_weight_sigma = trainer_weight_sigma.pow(2)
-            sigma_weight_reg = sigma_weight_reg + (
-                weight_sigma - torch.log(weight_sigma)
-            ).sum()
-            sigma_weight_normal_reg = sigma_weight_normal_reg + (
-                normal_weight_sigma - torch.log(normal_weight_sigma)
-            ).sum()
+            sigma_weight_reg = (
+                sigma_weight_reg + (weight_sigma - torch.log(weight_sigma)).sum()
+            )
+            sigma_weight_normal_reg = (
+                sigma_weight_normal_reg
+                + (normal_weight_sigma - torch.log(normal_weight_sigma)).sum()
+            )
 
         loss = base_loss
         loss = loss + alpha * mu_reg / (2 * batch_size)

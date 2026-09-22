@@ -5,6 +5,8 @@ from typing import Dict, Tuple, Union
 import torch
 import torch.nn as nn
 
+from utils.misc_utils import deinterleave_iq_last_axis
+
 
 def classification_loss_zero_stub(cls_logits: torch.Tensor) -> torch.Tensor:
     """Scalar zero loss tied to logits (keeps autograd on an empty CE minibatch).
@@ -77,7 +79,7 @@ class ReplayInputMixin:
         if x.dim() == 2:
             batch, features = x.shape
             if features % 2 == 0 and features % 3 != 0:
-                x = x.view(batch, 2, features // 2)
+                x = deinterleave_iq_last_axis(x)
             return x
 
         if x.dim() == 3 and x.size(1) == 3:
@@ -85,7 +87,7 @@ class ReplayInputMixin:
             batch, _, sequence_length = x.shape
             if sequence_length % 2 != 0:
                 return x
-            x = x.view(batch, 3, 2, sequence_length // 2)
+            x = deinterleave_iq_last_axis(x)
             # fall through to 4D adapter path
 
         if x.dim() == 4 and x.size(1) == 3 and x.size(2) == 2:

@@ -39,7 +39,9 @@ from utils.training_metrics import macro_recall
 class GemRConfig:
     """Hyperparameters for GEM-R, populated from the global args namespace."""
 
-    gamma: float = 0.0  # margin added to the dual QP constraint (gamma in the GEM paper)
+    gamma: float = (
+        0.0  # margin added to the dual QP constraint (gamma in the GEM paper)
+    )
     memory_loss_lambda: float = 1.0
     ema_decay: float = 0.0
     inner_steps: int = 1
@@ -227,6 +229,10 @@ class Net(ReplayInputMixin, nn.Module):
 
     def _ensure_iq_shape(self, x: torch.Tensor) -> torch.Tensor:
         """Ensure ``x`` is shaped ``(B, 2, L)`` for IQ mode."""
+        if x.dim() == 4 and x.size(1) == 3 and x.size(2) == 2:
+            # 3-ADC layout; ResNet1D._prepare_input passes it through and the
+            # ADC adapter reduces it to 2 channels.
+            return x
         if x.dim() == 3:
             return x
         if x.dim() == 2:
@@ -234,7 +240,7 @@ class Net(ReplayInputMixin, nn.Module):
             assert (
                 feature_dim % 2 == 0
             ), f"Feature dim {feature_dim} not divisible by 2 for (2, L) reshape."
-            return x.view(batch_size, 2, feature_dim // 2)
+            return misc_utils.deinterleave_iq_last_axis(x)
         raise ValueError(
             f"Unexpected IQ input shape {tuple(x.shape)}; expected (B, 2, L) or (B, 2L)."
         )
@@ -257,8 +263,7 @@ class Net(ReplayInputMixin, nn.Module):
                 raise ValueError(
                     f"Expected even length for 3-ADC IQ input; got shape {tuple(adapted_x.shape)}."
                 )
-            sequence_length = adapted_x.size(2) // 2
-            adapted_x = adapted_x.view(adapted_x.size(0), 3, 2, sequence_length)
+            adapted_x = misc_utils.deinterleave_iq_last_axis(adapted_x)
             adapted_x = self.net.model.input_adapter(adapted_x)
         else:
             adapted_x = self._ensure_iq_shape(adapted_x)

@@ -438,7 +438,7 @@ class IncrementalLoader:
             self.test_dataset[self._current_task][2][p_te],
         )
 
-        train_loader = self._get_loader(x_train, y_train, mode="train")
+        train_loader = self._get_loader(x_train, y_train, shuffle=True, mode="train")
         test_loader = self._get_loader(x_test, y_test, mode="test")
 
         task_name = None

@@ -589,3 +589,31 @@ def proximal_anchor_(
     rate = step_size * stiffness
     param.add_(rate * anchor).div_(1.0 + rate)
     return penalty
+
+
+def deinterleave_iq_last_axis(x: torch.Tensor) -> torch.Tensor:
+    """Split an interleaved I/Q final axis into separate I and Q channels.
+
+    Args:
+        x: Tensor whose last axis interleaves I and Q as
+            ``[i0, q0, i1, q1, ...]``, for example ``(B, 2 * L)`` or
+            ``(B, 3, 2 * L)``.
+
+    Returns:
+        Tensor with the last axis replaced by ``(2, L)``, holding I at index 0
+        and Q at index 1.
+
+    Raises:
+        ValueError: If the last axis has an odd length.
+
+    Usage:
+        >>> deinterleave_iq_last_axis(torch.arange(8.0).view(1, 8)).shape
+        torch.Size([1, 2, 4])
+    """
+    length = x.shape[-1]
+    if length % 2 != 0:
+        raise ValueError(
+            "Expected an even final axis to split interleaved I/Q; "
+            f"got shape {tuple(x.shape)}."
+        )
+    return x.reshape(*x.shape[:-1], length // 2, 2).transpose(-1, -2).contiguous()

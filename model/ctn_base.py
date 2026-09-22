@@ -10,6 +10,7 @@ import torch.nn as nn
 from torch.nn.functional import relu, normalize
 from itertools import chain
 from model.resnet1d import _ResNet1D, BasicBlock1D, AdcIqAdapter
+from utils.misc_utils import deinterleave_iq_last_axis
 
 
 class ContextInputAdapter(nn.Module):
@@ -26,8 +27,7 @@ class ContextInputAdapter(nn.Module):
                     "Expected even sequence length for 3-channel interleaved IQ "
                     f"input; got shape {tuple(x.shape)}."
                 )
-            sequence_length = x.size(2) // 2
-            x = x.view(x.size(0), 3, 2, sequence_length)
+            x = deinterleave_iq_last_axis(x)
             return self.adapter(x)
         if x.dim() == 4 and x.size(1) == 3 and x.size(2) == 2:
             return self.adapter(x)

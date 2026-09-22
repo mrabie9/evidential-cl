@@ -45,8 +45,7 @@ class HatInputAdapter(nn.Module):
                     "Expected even sequence length for 3-channel interleaved IQ "
                     f"input; got shape {tuple(x.shape)}."
                 )
-            sequence_length = x.size(2) // 2
-            x = x.view(x.size(0), 3, 2, sequence_length)
+            x = misc_utils.deinterleave_iq_last_axis(x)
             return self._adapter(x)
         if x.dim() == 4 and x.size(1) == 3 and x.size(2) == 2:
             return self._adapter(x)
@@ -399,6 +398,8 @@ class HatBackbone(nn.Module):
         if self.in_channels == 1:
             return x
         if x.dim() == 2:
+            if self.in_channels == 2:
+                return misc_utils.deinterleave_iq_last_axis(x)
             return x.view(x.size(0), self.in_channels, self.seq_len)
         return x
 

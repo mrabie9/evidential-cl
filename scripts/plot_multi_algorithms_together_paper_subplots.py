@@ -43,8 +43,8 @@ LINEWIDTHS = [2.4, 1.8, 1.8, 1.5, 1.5]
 PANEL_YLIM_OVERRIDES: Dict[str, tuple[float, float] | None] = {
     "train": None,
     "final_validation": None,
-    "mean_val": (0, 0.9),
-    "average_forgetting": (-0.7, 0.3),
+    "mean_val": (0.2, 0.82),
+    "average_forgetting": (-0.4, 0.2),
     "val_per_task": None,
 }
 
@@ -71,6 +71,18 @@ AXES_BOX_LEFT: float = 0.11
 AXES_BOX_RIGHT: float = 0.99
 AXES_BOX_BOTTOM: float = 0.16
 AXES_BOX_TOP: float = 0.78
+
+# Baseline reference runs (joint/IID upper bound, naive fine-tuning lower
+# bound) always sort last in legends and share one color family, split only
+# by linestyle: iid2 solid, ft dashed.
+BASELINE_RUN_LEGEND_ORDER: Dict[str, int] = {"iid2": 0, "ft": 1}
+# Dedicated color for iid2/ft so they never collide with an algorithm group's
+# color (the "ungrouped" bucket would otherwise wrap around and reuse the
+# first group's color).
+BASELINE_RUN_COLOR: str = "#000000"
+
+# Hard cap on legend rows; ncol is widened as needed to respect this.
+MAX_LEGEND_ROWS: int = 3
 
 
 def parse_args() -> argparse.Namespace:
@@ -121,8 +133,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--include-iid2",
-        action="store_true",
-        help="Include iid2 runs (by default they are excluded for clarity).",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Include iid2 runs (included by default; pass --no-include-iid2 "
+            "to exclude)."
+        ),
     )
     parser.add_argument(
         "--algo",
@@ -214,13 +230,17 @@ def _case_insensitive_detect_style_key(runs: Sequence[Any]) -> str:
 
 
 def _build_export_legend_kwargs(
-    base_legend_kwargs: Dict[str, Any], panel_key: str
+    base_legend_kwargs: Dict[str, Any], panel_key: str, run_count: int
 ) -> Dict[str, Any]:
     """Build legend kwargs for subplot export."""
     legend_kwargs = dict(base_legend_kwargs)
     manual_ncol = PANEL_LEGEND_NCOL_OVERRIDES.get(panel_key)
     if manual_ncol is not None:
         legend_kwargs["ncol"] = int(manual_ncol)
+    legend_kwargs["ncol"] = max(
+        int(legend_kwargs.get("ncol", 1)),
+        _min_ncol_for_max_rows(run_count, MAX_LEGEND_ROWS),
+    )
     if LEGEND_ABOVE_PLOT and panel_key in {"train", "mean_val", "average_forgetting"}:
         legend_kwargs["loc"] = "lower center"
         legend_kwargs["bbox_to_anchor"] = (0.5, LEGEND_ABOVE_BBOX_Y)
@@ -260,9 +280,10 @@ def _build_task_index_to_dataset_name(runs: Sequence[Any]) -> Dict[int, str]:
                 if run_task_names is not None and task_index < len(run_task_names)
                 else str(task.get("task_name", f"t{task_index}"))
             )
-            task_index_to_dataset_name[task_index] = _format_task_dataset_label(
-                task_name, task_index
-            )
+            task_index_to_dataset_name[task_index] = task_index
+            # _format_task_dataset_label(
+            #     task_name, task_index
+            # )
     return task_index_to_dataset_name
 
 
@@ -280,8 +301,8 @@ def _set_task_axis_like_fwt(
     axis.set_xticks(tick_positions)
     axis.set_xticklabels(
         [
-            f"{task_position}\n"
-            f"{task_index_to_dataset_name.get(task_position, 'unknown')}"
+            f"{task_position}"
+            # f"{task_index_to_dataset_name.get(task_position, 'unknown')}"
             for task_position in tick_positions
         ]
     )
@@ -579,6 +600,49 @@ def _line_style_for_index(index: int) -> Dict[str, Any]:
     }
 
 
+def _resolve_line_style_index(run_name: str, default_index: int) -> int:
+    """Force baseline runs (iid2, ft) onto solid/dashed; leave others as-is.
+
+    Usage:
+        >>> _resolve_line_style_index("iid2", default_index=4)
+        0
+    """
+    return BASELINE_RUN_LEGEND_ORDER.get(run_name.strip().lower(), default_index)
+
+
+def _min_ncol_for_max_rows(item_count: int, max_rows: int) -> int:
+    """Return the smallest legend ``ncol`` keeping ``item_count`` within ``max_rows``.
+
+    Usage:
+        >>> _min_ncol_for_max_rows(20, 3)
+        7
+    """
+    if item_count <= 0:
+        return 1
+    return -(-item_count // max_rows)
+
+
+def _final_run_sort_key(run_name: str) -> tuple[int, int, int, str]:
+    """Sort runs by algorithm group, pushing baseline runs (iid2, ft) last.
+
+    Usage:
+        >>> _final_run_sort_key("iid2") > _final_run_sort_key("agem")
+        True
+    """
+    from scripts.plot_algorithm_group_styles import group_sort_key
+
+    normalized_run_name = run_name.strip().lower()
+    if normalized_run_name in BASELINE_RUN_LEGEND_ORDER:
+        return (
+            1,
+            0,
+            BASELINE_RUN_LEGEND_ORDER[normalized_run_name],
+            normalized_run_name,
+        )
+    group_index, position_in_group, normalized_name = group_sort_key(run_name)
+    return (0, group_index, position_in_group, normalized_name)
+
+
 def _build_algorithm_to_fwt_panel_line_member_index(
     algorithm_names: Sequence[str],
 ) -> Dict[str, int]:
@@ -658,7 +722,6 @@ def main() -> None:
         load_metrics,
         plot_series,
     )
-    from scripts.plot_algorithm_group_styles import group_sort_key
     from scripts.plot_style_overrides import resolve_legend_kwargs
 
     plt.rcParams.update(
@@ -705,10 +768,7 @@ def main() -> None:
 
     requested_algorithm_names = _parse_requested_algorithm_names(args.algo)
     excluded_run_name_set = {"saved_models", "models", "plots", "figures"}
-    iid2_requested_explicitly = (
-        requested_algorithm_names is not None and "iid2" in requested_algorithm_names
-    )
-    if not args.include_iid2 and not iid2_requested_explicitly:
+    if not args.include_iid2:
         excluded_run_name_set.add("iid2")
     runs = [
         run for run in runs if run.name.strip().lower() not in excluded_run_name_set
@@ -719,7 +779,7 @@ def main() -> None:
             "Pass --include-iid2 to include iid2."
         )
     runs = _filter_runs_by_algorithm(runs, requested_algorithm_names)
-    runs = sorted(runs, key=lambda run: group_sort_key(run.name))
+    runs = sorted(runs, key=lambda run: _final_run_sort_key(run.name))
 
     print("Algorithms and metrics directories:")
     for run in runs:
@@ -790,6 +850,9 @@ def main() -> None:
         [run.name for run in runs],
         fwt_group_colors,
     )
+    for run in runs:
+        if run.name.strip().lower() in BASELINE_RUN_LEGEND_ORDER:
+            algorithm_colors[run.name] = BASELINE_RUN_COLOR
     algorithm_line_member_index = _build_algorithm_to_fwt_panel_line_member_index(
         [run.name for run in runs]
     )
@@ -809,7 +872,9 @@ def main() -> None:
         )
         run_color = algorithm_colors.get(run.name, f"C{run_idx % 10}")
         line_style = _line_style_for_index(
-            algorithm_line_member_index.get(run.name, run_idx)
+            _resolve_line_style_index(
+                run.name, algorithm_line_member_index.get(run.name, run_idx)
+            )
         )
         seed_tasks_list = algo_seed_tasks.get(run.name, [run.tasks])
         if len(seed_tasks_list) > 1:
@@ -880,6 +945,7 @@ def main() -> None:
                 run_count=len(runs),
             ),
             "train",
+            len(runs),
         )
         axis_train.legend(handles_train, labels_train, **export_legend_kwargs)
     manual_ylim_train = PANEL_YLIM_OVERRIDES.get("train")
@@ -963,7 +1029,9 @@ def main() -> None:
     for run_idx, run in enumerate(runs):
         run_color = algorithm_colors.get(run.name, f"C{run_idx % 10}")
         line_style = _line_style_for_index(
-            algorithm_line_member_index.get(run.name, run_idx)
+            _resolve_line_style_index(
+                run.name, algorithm_line_member_index.get(run.name, run_idx)
+            )
         )
         seed_tasks_list = algo_seed_tasks.get(run.name, [run.tasks])
         if len(seed_tasks_list) > 1:
@@ -1025,6 +1093,7 @@ def main() -> None:
                 run_count=len(runs),
             ),
             "mean_val",
+            len(runs),
         )
         axis_mean.legend(handles_mean, labels_mean, **export_legend_kwargs)
     manual_ylim_mean = PANEL_YLIM_OVERRIDES.get("mean_val")
@@ -1043,7 +1112,9 @@ def main() -> None:
         val_metric_key, _ = _resolve_val_metric_for_run(args.val_metric, run)
         run_color = algorithm_colors.get(run.name, f"C{run_idx % 10}")
         line_style = _line_style_for_index(
-            algorithm_line_member_index.get(run.name, run_idx)
+            _resolve_line_style_index(
+                run.name, algorithm_line_member_index.get(run.name, run_idx)
+            )
         )
         seed_tasks_list = algo_seed_tasks.get(run.name, [run.tasks])
         if len(seed_tasks_list) > 1:
@@ -1109,6 +1180,7 @@ def main() -> None:
                 run_count=len(runs),
             ),
             "average_forgetting",
+            len(runs),
         )
         axis_forgetting.legend(
             handles_forgetting, labels_forgetting, **export_legend_kwargs
@@ -1126,7 +1198,9 @@ def main() -> None:
     task_names_for_colors = getattr(runs[0], "task_names", None)
     for run_idx, run in enumerate(runs):
         val_metric_key, _ = _resolve_val_metric_for_run(args.val_metric, run)
-        run_linestyle = LINESTYLES[run_idx % len(LINESTYLES)]
+        run_linestyle = LINESTYLES[
+            _resolve_line_style_index(run.name, run_idx) % len(LINESTYLES)
+        ]
         seed_tasks_list = algo_seed_tasks.get(run.name, [run.tasks])
         task_count = min(len(seed_tasks) for seed_tasks in seed_tasks_list)
         for task_index in range(task_count):
@@ -1186,7 +1260,9 @@ def main() -> None:
             [],
             [],
             color="black",
-            linestyle=LINESTYLES[run_idx % len(LINESTYLES)],
+            linestyle=LINESTYLES[
+                _resolve_line_style_index(runs[run_idx].name, run_idx) % len(LINESTYLES)
+            ],
             linewidth=1.6,
             label=run_labels[run_idx],
         )
@@ -1202,6 +1278,7 @@ def main() -> None:
                 run_count=len(runs),
             ),
             "mean_val",
+            len(runs),
         ),
     )
     manual_ylim_per_task = PANEL_YLIM_OVERRIDES.get("val_per_task")

@@ -20,6 +20,10 @@ ALGORITHM_GROUPS: Dict[str, list[str]] = {
     "meta_learning": ["agem", "gem", "lamaml", "cmaml", "smaml"],
     "hybrid": ["la-er", "bcl_dual", "ctn"],
     "architectural": ["hat", "packnet"],
+    # Reference baselines (joint/IID upper bound, naive fine-tuning lower
+    # bound), not CL algorithms — always sorted last, one shared color,
+    # split only by linestyle (iid2 solid, ft dashed).
+    "baseline": ["iid2", "ft"],
 }
 
 # Group marker mapping used for line plots.
@@ -29,6 +33,7 @@ GROUP_MARKERS: Dict[str, str] = {
     "meta_learning": "^",
     "hybrid": "D",
     "architectural": "P",
+    "baseline": "*",
     "ungrouped": "X",
 }
 
@@ -39,6 +44,7 @@ GROUP_LINESTYLES: Dict[str, Any] = {
     "meta_learning": ":",
     "hybrid": "-.",
     "architectural": (0, (5, 1)),  # densely dashed
+    "baseline": "-",
     "ungrouped": "-",
 }
 
@@ -49,6 +55,7 @@ GROUP_COLOR_FAMILIES: Dict[str, str] = {
     "meta_learning": "Oranges",
     "hybrid": "Greens",
     "architectural": "Greys",
+    "baseline": "Greys",
     "ungrouped": "Greys",
 }
 
@@ -60,6 +67,7 @@ GROUP_SHADE_RANGES: Dict[str, tuple[float, float]] = {
 _UNGROUPED: str = "ungrouped"
 
 # Canonical group display order for sorting algorithm runs in plots.
+# "baseline" (iid2, ft) is last so reference runs always trail the legend.
 GROUP_ORDER: list[str] = [
     "regularization",
     "replay",
@@ -67,6 +75,7 @@ GROUP_ORDER: list[str] = [
     "hybrid",
     "architectural",
     "ungrouped",
+    "baseline",
 ]
 
 

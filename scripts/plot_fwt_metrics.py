@@ -55,8 +55,16 @@ MetricRecord = Dict[str, Any]
 SeriesPoint = Tuple[int, Optional[float], str]
 PlotStyle = Dict[str, Any]
 # GROUP_COLORS = ["#4477AA", "#EE6677", "#228833", "#66CCEE", "#AA3377"]
-GROUP_COLORS = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00"]
+# Cycled by the *filtered* position among groups actually present (empty
+# groups, e.g. "ungrouped" when nothing is unclassified, are skipped), so a
+# group's index here isn't stable across runs; index 5 covers any leftover
+# ungrouped algorithm.
+GROUP_COLORS = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#999999"]
 # GROUP_COLORS = ['#4E79A7', '#F28E2B', '#E15759', '#76B7B2', '#59A14F']
+# Explicit per-group-name color overrides, applied before the GROUP_COLORS
+# cycling above. Use this for a group whose color must stay fixed regardless
+# of which/how-many other groups are present, e.g. reference baselines.
+GROUP_COLOR_OVERRIDES: Dict[str, str] = {"baseline": "#000000"}
 LINESTYLES = ["-", "--", ":", "-.", (0, (5, 1))]
 LINEWIDTHS = [2.4, 1.8, 1.8, 1.5, 1.5]
 MAX_GROUPS_SINGLE_AXIS = 5
@@ -100,10 +108,11 @@ ALGORITHM_DISPLAY_NAMES: Dict[str, str] = {
     "eralg4": "Res-ER",
     "er_ring": "Ring-ER",
     "ewc": "EWC",
+    "ft": "FT",
     "gem": "GEM",
     "hat": "HAT",
     "icarl": "iCaRL",
-    "iid2": "IID2",
+    "iid2": "JT",
     "la-er": "La-ER",
     "lamaml": "La-MAML",
     "lwf": "LwF",
@@ -435,8 +444,6 @@ def build_series_by_algo(
     series_by_algorithm: Dict[str, List[SeriesPoint]] = {}
     for record in records:
         algorithm_name = str(record.get("algo", "unknown"))
-        if algorithm_name.strip().lower() == "iid2":
-            continue
         task_index = int(record.get("task_index", -1))
         task_name = str(record.get("task_name", f"task_{task_index}"))
         raw_metric_value = extract_metric(record, metric_name)
@@ -506,7 +513,9 @@ def plot_series(
             axes = [axes]
         for group_index, (group_name, group_algorithms) in enumerate(ordered_groups):
             axis = axes[group_index]
-            group_color = GROUP_COLORS[group_index % len(GROUP_COLORS)]
+            group_color = GROUP_COLOR_OVERRIDES.get(
+                group_name, GROUP_COLORS[group_index % len(GROUP_COLORS)]
+            )
             for member_index, algorithm_name in enumerate(
                 group_algorithms[:MAX_MEMBERS_PER_GROUP]
             ):
@@ -545,8 +554,10 @@ def plot_series(
         axes[-1].set_xlabel("Task")
     else:
         figure, axis = plt.subplots(figsize=plot_style["figsize"])
-        for group_index, (_, group_algorithms) in enumerate(ordered_groups):
-            group_color = GROUP_COLORS[group_index % len(GROUP_COLORS)]
+        for group_index, (group_name, group_algorithms) in enumerate(ordered_groups):
+            group_color = GROUP_COLOR_OVERRIDES.get(
+                group_name, GROUP_COLORS[group_index % len(GROUP_COLORS)]
+            )
             for member_index, algorithm_name in enumerate(group_algorithms):
                 series = series_by_algorithm[algorithm_name]
                 x_positions = [point[0] for point in series]

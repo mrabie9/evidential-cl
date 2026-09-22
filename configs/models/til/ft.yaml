@@ -1,3 +1,2 @@
 model: ft
 loader: task_incremental_loader
-lr: 0.01
