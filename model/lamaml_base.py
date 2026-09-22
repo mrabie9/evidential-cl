@@ -212,9 +212,17 @@ class BaseNet(torch.nn.Module):
         avoids the O(len(MEM) * osize) reshuffling. Replay tensors (already
         tensors in the buffer) are stacked directly and the current batch is
         concatenated on-device, removing the per-element numpy round-trip.
+
+        With ``use_old_task_memory`` the pool is ``self.M``, the snapshot taken
+        at the last task boundary, so replay never contains rows from the task
+        being trained. ``self.M`` is empty during task 0, which leaves that task
+        on its own data alone and makes its accuracy comparable with the gated
+        replay baselines (``er_ring``, ``agem``, ``gem``). Without the flag the
+        pool is the live ``self.M_new``, which replays the current task's own
+        rows from its second batch onwards.
         """
 
-        if self.cfg.use_old_task_memory and t > 0:
+        if self.cfg.use_old_task_memory:
             MEM = self.M
         else:
             MEM = self.M_new

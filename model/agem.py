@@ -10,8 +10,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-import random
-
 from model.resnet1d import ResNet1D
 from model.replay_utils import (
     ReplayInputMixin,
@@ -157,9 +155,6 @@ class Net(ReplayInputMixin, nn.Module):
         self.n_memories = int(self.cfg.memories / n_tasks)
         self.gpu = self.cfg.cuda
 
-        self.age = 0
-        self.M = []
-        self.memories = self.cfg.memories
         self.grad_align = []
         self.grad_task_align = {}
         self.current_task = None
@@ -506,20 +501,6 @@ class Net(ReplayInputMixin, nn.Module):
 
             self.opt.step()
             metric_logits = logits_full.detach()
-
-        x_for_storage = self._input_for_replay(x)
-        xi = x_for_storage.data.cpu().numpy()
-        yi = y_work.data.cpu().numpy()
-        for i in range(0, x.size()[0]):
-            self.age += 1
-            # Reservoir sampling memory update:
-            if len(self.M) < self.memories:
-                self.M.append([xi[i], yi[i], t])
-
-            else:
-                p = random.randint(0, self.age)
-                if p < self.memories:
-                    self.M[p] = [xi[i], yi[i], t]
 
         avg_cls_tr_rec = sum(cls_tr_rec) / len(cls_tr_rec) if cls_tr_rec else 0.0
         return loss.item(), avg_cls_tr_rec, metric_logits

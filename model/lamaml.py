@@ -84,7 +84,7 @@ class Net(BaseNet):
             self.zero_grads()
 
             if t != self.current_task:
-                self.M = self.M_new
+                self.M = self.M_new.copy()
                 self.current_task = t
                 self._reset_velocity()
 

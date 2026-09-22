@@ -10,7 +10,7 @@ The table below lists the hyperparameters that are explicitly defined for each m
 | `bcl_dual` | `memory_strength` (1.0), `temperature` (2.0), `alpha_init` (0.001), `lr` (0.001), `beta` (1.0), `n_memories` (2000), `replay_batch_size` (20), `inner_steps` (5), `adapt_inner_steps` (5) | `model/bcl_dual.py` |
 | `ctn` | `memory_strength` (0.5), `temperature` (5.0), `task_emb` (64), `lr` (0.01), `ctx_lr` (0.05), `n_memories` (50), `replay_batch_size` (20), `inner_steps` (2) | `model/ctn.py` |
 | `er_ring` | `memory_strength` (1.0), `temperature` (2.0), `alpha_init` (0.001), `lr` (0.001), `n_memories` (2000), `n_memories` (0), `replay_batch_size` (20), `inner_steps` (5) | `model/er_ring.py` |
-| `eralg4` | `alpha_init` (0.001), `lr` (0.001), `opt_lr` (0.1), `learn_lr` (false), `inner_steps` (1), `memories` (5120), `replay_batch_size` (20), `second_order` (false), `cifar_batches` (3) | `model/eralg4.py` |
+| `eralg4` | `alpha_init` (0.001), `lr` (0.001), `opt_lr` (0.1), `learn_lr` (false), `inner_steps` (1), `memories` (5120), `replay_batch_size` (20), `second_order` (false), `use_old_task_memory` (false), `cifar_batches` (3) | `model/eralg4.py` |
 | `ewc` | `inner_steps` (1), `lr` (0.03), `optimizer` (sgd), `momentum` (0.0), `weight_decay` (0.0), `lamb` (1.0), `clipgrad` (100.0) | `model/ewc.py` |
 | `ft` | inherits `iid2` (`inner_steps` (1), `lr` (0.001)); trains each task on its own data only | `model/ft.py` |
 | `gem` | `gamma` (0.0), `inner_steps` (1), `lr` (0.001), `n_memories` (0), `alpha_init` (0.001) | `model/gem.py` |

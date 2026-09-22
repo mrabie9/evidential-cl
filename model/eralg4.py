@@ -82,6 +82,7 @@ class ErAlgConfig:
     woe_lc_p: int = 2
     woe_centering_mode: str = "centered_uniform"
     woe_mu_momentum: float = 0.9
+    use_old_task_memory: bool = False
 
     arch: str = "resnet1d"
     dataset: str = "tinyimagenet"
@@ -170,6 +171,9 @@ class Net(ReplayInputMixin, LwfDistillationMixin, nn.Module):
 
         # allocate buffer
         self.M = []
+        # Snapshot of ``M`` taken at the last task boundary; the pool replay is
+        # drawn from when ``use_old_task_memory`` is set. Empty during task 0.
+        self.M_old = []
         self.age = 0
 
         # handle gpus if specified
@@ -251,6 +255,28 @@ class Net(ReplayInputMixin, LwfDistillationMixin, nn.Module):
             )
         return output
 
+    def replay_pool(self) -> list:
+        """Return the buffer that replay minibatches are drawn from.
+
+        With ``use_old_task_memory`` the pool is ``M_old``, the snapshot of the
+        reservoir taken at the last task boundary, so replay never contains rows
+        from the task being trained. That snapshot is empty during task 0, which
+        leaves that task on its own data alone and makes its accuracy comparable
+        with the gated replay baselines (``er_ring``, ``agem``, ``gem``).
+
+        Without the flag the pool is the live reservoir ``M``, reproducing
+        Algorithm 4's task-free replay, which starts drawing the current task's
+        own rows from its second batch onwards.
+
+        Returns:
+            The list of ``[x, y, task_id]`` entries eligible for replay.
+
+        Usage:
+            >>> pool = model.replay_pool()
+            >>> indices = random.choices(range(len(pool)), k=8) if pool else []
+        """
+        return self.M_old if self.cfg.use_old_task_memory else self.M
+
     def getBatch(self, x, y, t):
         if x is not None:
             mxi = np.array(x)
@@ -268,13 +294,14 @@ class Net(ReplayInputMixin, LwfDistillationMixin, nn.Module):
         current_y = []
         current_t = []
 
-        if len(self.M) > 0:
-            osize = min(self.batchSize, len(self.M))
+        pool = self.replay_pool()
+        if len(pool) > 0:
+            osize = min(self.batchSize, len(pool))
             # The original loop reshuffled the full index list once per draw and
             # took position ``j`` — uniform sampling-with-replacement, which
             # ``random.choices`` reproduces without O(N * osize) shuffling.
-            for k in random.choices(range(len(self.M)), k=osize):
-                x, y, t = self.M[k]
+            for k in random.choices(range(len(pool)), k=osize):
+                x, y, t = pool[k]
                 xi = np.array(x)
                 yi_scalar = int(torch.as_tensor(y).long().flatten()[0].item())
                 ti = np.array(t)
@@ -414,6 +441,11 @@ class Net(ReplayInputMixin, LwfDistillationMixin, nn.Module):
             # previous task's feature mean into a new radar dataset would measure
             # the evidence against the wrong origin.
             self.lc_feature_mean = None
+            # Freeze what the reservoir holds at the boundary so the task about
+            # to start replays only rows from the tasks before it. Shallow copy:
+            # reservoir writes rebind slots rather than mutating entries, so the
+            # snapshot keeps its own view without duplicating any sample tensor.
+            self.M_old = self.M.copy()
             self.current_task = t
 
         if self.cfg.learn_lr:
@@ -519,25 +551,26 @@ class Net(ReplayInputMixin, LwfDistillationMixin, nn.Module):
         )
 
     def _sample_replay(self, device):
-        """Sample a replay minibatch from the reservoir buffer ``M``.
+        """Sample a replay minibatch from the pool returned by ``replay_pool``.
 
         Returns pre-canonicalized ``(N, 2, L)`` GPU tensors plus their global
         labels and task ids, or ``None`` when no eligible samples exist. No
         gradient flows through the adapter for replayed (pre-adapted) rows.
         """
-        if len(self.M) == 0:
+        pool = self.replay_pool()
+        if len(pool) == 0:
             return None
-        osize = min(self.batchSize, len(self.M))
+        osize = min(self.batchSize, len(pool))
         # The original loop reshuffled the full index list once per draw and took
         # position ``j``; that is uniform sampling-with-replacement of ``osize``
         # indices. ``random.choices`` reproduces it without the O(N * osize)
         # Python shuffling that dominated the replay hot path.
-        indices = random.choices(range(len(self.M)), k=osize)
+        indices = random.choices(range(len(pool)), k=osize)
         replay_x = []
         replay_y = []
         replay_t = []
         for k in indices:
-            xi, yi, ti = self.M[k]
+            xi, yi, ti = pool[k]
             yi_scalar = int(torch.as_tensor(yi).long().flatten()[0].item())
             replay_x.append(torch.as_tensor(xi))
             replay_y.append(yi_scalar)

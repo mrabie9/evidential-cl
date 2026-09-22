@@ -2,7 +2,7 @@ model: lamaml_cifar
 loader: task_incremental_loader
 learn_lr: false
 sync_update: true
-use_old_task_memory: false
+use_old_task_memory: true
 second_order: false
 opt_wt: 0.01
 alpha_init: 0.003

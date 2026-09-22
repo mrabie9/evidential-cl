@@ -2,3 +2,4 @@ model: eralg4
 loader: task_incremental_loader
 learn_lr: false
 memory_loss_lambda: 1.0
+use_old_task_memory: true

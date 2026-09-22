@@ -3,3 +3,4 @@ loader: class_incremental_loader
 learn_lr: true
 meta_batches: 3
 opt_lr: 0.1
+use_old_task_memory: true
