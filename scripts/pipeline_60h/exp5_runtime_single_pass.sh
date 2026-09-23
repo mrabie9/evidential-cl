@@ -13,12 +13,12 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib_queue.sh"
 MAX_JOBS=1
 DONE_FILE="${PIPELINE_LOG_ROOT}/done_runtime.txt"
 RUNTIME_SEED=0
-TIL_MODELS="agem bcl_dual cmaml ctn eralg4 er_ring ewc ft gem hat icarl iid2 la-er lamaml lwf packnet rwalk si smaml ucl"
+TIL_MODELS="${TIL_MODELS:-agem bcl_dual cmaml ctn eralg4 er_ring ewc ft gem hat icarl iid2 la-er lamaml lwf packnet rwalk si smaml ucl}"
 
 emit_runtime_jobs() {
     local model
     for model in $TIL_MODELS; do
-        echo "runtime_1e_til_${model}|til|${model}|--seeds ${RUNTIME_SEED} ${EPOCHS_1E}"
+        echo "runtime_1e_til_${model}|til|${model}|--seeds ${RUNTIME_SEED} ${EPOCHS_1E} --log_dir $(group_log_dir "runtime_1e_TIL")"
     done
 }
 
