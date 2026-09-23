@@ -347,13 +347,16 @@ class Net(ReplayInputMixin, nn.Module):
         Ensure x is (B, 2, L) for IQ mode.
         Accepts (B, 2, L) or (B, 2L).
         """
+        if x.dim() == 4 and x.size(1) == 3 and x.size(2) == 2:
+            # 3-ADC layout; ResNet1D._prepare_input passes it through and the
+            # ADC adapter reduces it to 2 channels.
+            return x
         if x.dim() == 3:
             return x
         elif x.dim() == 2:
             B, F = x.shape
             assert F % 2 == 0, f"Feature dim {F} not divisible by 2 for (2, L) reshape."
-            L = F // 2
-            return x.view(B, 2, L)
+            return misc_utils.deinterleave_iq_last_axis(x)
         else:
             raise ValueError(
                 f"Unexpected IQ input shape {tuple(x.shape)}; expected (B, 2, L) or (B, 2L)."
@@ -377,8 +380,7 @@ class Net(ReplayInputMixin, nn.Module):
                 raise ValueError(
                     f"Expected even length for 3-ADC IQ input; got shape {tuple(adapted_x.shape)}."
                 )
-            sequence_length = adapted_x.size(2) // 2
-            adapted_x = adapted_x.view(adapted_x.size(0), 3, 2, sequence_length)
+            adapted_x = misc_utils.deinterleave_iq_last_axis(adapted_x)
             adapted_x = self.net.model.input_adapter(adapted_x)
         else:
             adapted_x = self._ensure_iq_shape(adapted_x)
