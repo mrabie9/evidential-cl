@@ -94,7 +94,8 @@ SMOKE="${SMOKE:-0}"
 N_EPOCHS="${N_EPOCHS:-5}"
 TAG="${TAG:-nrm}"
 DRIVER_LOGDIR="${DRIVER_LOGDIR:-$REPO/scripts/logs/ablations_noise_removed}"
-RUN_LOGROOT="logs/ablations_noise_removed"
+# RUN_LOGROOT is relative to REPO; override it to keep a campaign in its own tree.
+RUN_LOGROOT="${RUN_LOGROOT:-logs/ablations_noise_removed}"
 
 # id|mode|config_stem|extra_cli_args
 ROWS=(

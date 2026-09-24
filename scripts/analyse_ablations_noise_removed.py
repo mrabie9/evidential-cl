@@ -42,7 +42,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from results_txt import f1_stats
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LOGS = os.path.join(REPO, "logs", "ablations_noise_removed")
+# ABLATION_LOG_ROOT (relative to REPO, or absolute) points the reader at another run tree,
+# matching the driver's RUN_LOGROOT.
+LOGS = os.path.join(REPO, os.environ.get("ABLATION_LOG_ROOT", "logs/ablations_noise_removed"))
 DELTA = 1.0  # smallest effect of interest, F1 points
 
 # mode -> family -> [(row_id, mechanism, config stem, driver row id = pool key), ...]
