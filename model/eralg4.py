@@ -82,7 +82,7 @@ class ErAlgConfig:
     woe_lc_p: int = 2
     woe_centering_mode: str = "centered_uniform"
     woe_mu_momentum: float = 0.9
-    use_old_task_memory: bool = False
+    use_old_task_memory: bool = True
 
     arch: str = "resnet1d"
     dataset: str = "tinyimagenet"

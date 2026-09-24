@@ -734,10 +734,17 @@ def get_parser():
     )
     parser.add_argument(
         "--use_old_task_memory",
-        default=False,
         action="store_true",
-        help="Use only old task samples for replay buffer data",
+        help="Use only old task samples for replay buffer data. Now the "
+        "DEFAULT; this flag is kept for script compatibility.",
     )
+    parser.add_argument(
+        "--no_use_old_task_memory",
+        dest="use_old_task_memory",
+        action="store_false",
+        help="Replay from the live buffer, including the current task's samples.",
+    )
+    parser.set_defaults(use_old_task_memory=True)
     parser.add_argument(
         "--second_order",
         default=False,

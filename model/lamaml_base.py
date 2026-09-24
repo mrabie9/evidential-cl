@@ -18,7 +18,7 @@ class LamamlBaseConfig:
     use_ring_buffer: bool = False
     replay_batch_size: int = 20
     cuda: bool = True
-    use_old_task_memory: bool = False
+    use_old_task_memory: bool = True
     learn_lr: bool = False
     second_order: bool = False
     sync_update: bool = False
