@@ -1,0 +1,14 @@
+# CIL "C1": Res-ER + KL distillation, the CIL counterpart of TIL's gem_bob C1.
+# Res-ER is the CIL replay baseline (E0) and distillation is the one peripheral mechanism
+# that proved load-bearing in CIL (B1 -3.12 to remove it), so this combines them.
+#
+# er_distill's KL weight is --memory_strength (NOT distill_lambda, which eralg4 ignores),
+# and the parser's default for it is 0 -- so it must be set here or distillation runs
+# inert. 1.0 matches the weight gem_bob C1 uses, at the shared temperature 5.
+model: eralg4
+loader: class_incremental_loader
+learn_lr: false
+memory_loss_lambda: 1.0
+er_distill: true
+memory_strength: 1.0
+temperature: 5.0

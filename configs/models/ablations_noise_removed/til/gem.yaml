@@ -1,0 +1,5 @@
+# Snapshot for the post-noise-removal ablation grid (scripts/run_ablations_noise_removed.sh).
+# Baseline: verbatim copy of configs/models/til/gem.yaml as of 2026-09-17 (amp key dropped; the driver forces --amp).
+model: gem
+loader: task_incremental_loader
+gamma: 0.3

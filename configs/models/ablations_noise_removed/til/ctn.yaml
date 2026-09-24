@@ -1,0 +1,8 @@
+# Snapshot for the post-noise-removal ablation grid (scripts/run_ablations_noise_removed.sh).
+# Baseline: verbatim copy of configs/models/til/ctn.yaml as of 2026-09-17 (amp key dropped; the driver forces --amp).
+model: ctn
+loader: task_incremental_loader
+ctx_lr: 0.01
+task_emb: 64
+memory_strength: 1
+validation: 0.3

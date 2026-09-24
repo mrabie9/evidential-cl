@@ -1,0 +1,5 @@
+# Snapshot for the post-noise-removal ablation grid (scripts/run_ablations_noise_removed.sh).
+# GEM-BOB A0: every mechanism gate OFF; must reproduce plain GEM (G0) at the same seed.
+model: gem_bob
+loader: task_incremental_loader
+memory_strength: 0.3

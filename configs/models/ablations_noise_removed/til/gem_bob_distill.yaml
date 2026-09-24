@@ -1,0 +1,8 @@
+# Snapshot for the post-noise-removal ablation grid (scripts/run_ablations_noise_removed.sh).
+# GEM-BOB A2: + KL distillation on frozen per-task soft targets.
+model: gem_bob
+loader: task_incremental_loader
+memory_strength: 0.3
+gembob_distill: true
+distill_lambda: 1
+temperature: 5.0

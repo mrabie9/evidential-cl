@@ -1,0 +1,8 @@
+# Snapshot for the post-noise-removal ablation grid (scripts/run_ablations_noise_removed.sh).
+# Regenerated 2026-09-18 from the re-tuned baseline (commit 7d1028c7). B5: baseline + no_bilevel (one fused step per round; beta unused).
+# B5a runs --inner_steps 1 (half budget), B5b --inner_steps 2 (matched).
+model: bcl_dual
+loader: class_incremental_loader
+memory_strength: 10
+beta: 0.9
+no_bilevel: true

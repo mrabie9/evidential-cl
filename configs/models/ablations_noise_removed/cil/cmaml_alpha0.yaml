@@ -1,0 +1,10 @@
+# Snapshot for the post-noise-removal ablation grid (scripts/run_ablations_noise_removed.sh).
+# M4: cmaml baseline with alpha_init 0 (no inner adaptation; clean because sync_update and learn_lr false).
+model: lamaml_cifar
+loader: class_incremental_loader
+learn_lr: false
+sync_update: true
+use_old_task_memory: false
+second_order: false
+opt_wt: 0.01
+alpha_init: 0.0

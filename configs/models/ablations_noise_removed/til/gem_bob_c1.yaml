@@ -1,0 +1,9 @@
+# Snapshot for the post-noise-removal ablation grid (scripts/run_ablations_noise_removed.sh).
+# GEM-BOB C1: A1 + A2, the two mechanisms under study combined.
+model: gem_bob
+loader: task_incremental_loader
+memory_strength: 0.3
+gembob_dynamic_ring: true
+gembob_distill: true
+distill_lambda: 1
+temperature: 5.0

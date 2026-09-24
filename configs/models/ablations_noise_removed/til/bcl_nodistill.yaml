@@ -1,0 +1,6 @@
+# Snapshot for the post-noise-removal ablation grid (scripts/run_ablations_noise_removed.sh).
+# Regenerated 2026-09-18 from the re-tuned baseline (commit 7d1028c7). B1: baseline with memory_strength 0 (KL distillation off).
+model: bcl_dual
+loader: task_incremental_loader
+beta: 0.8
+memory_strength: 0

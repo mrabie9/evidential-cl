@@ -1,0 +1,6 @@
+# Snapshot for the post-noise-removal ablation grid (scripts/run_ablations_noise_removed.sh).
+# Baseline: verbatim copy of configs/models/til/eralg4.yaml as of 2026-09-17 (amp key dropped; the driver forces --amp).
+model: eralg4
+loader: task_incremental_loader
+learn_lr: false
+memory_loss_lambda: 1.0

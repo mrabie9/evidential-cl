@@ -1,0 +1,9 @@
+# Snapshot for the post-noise-removal ablation grid (scripts/run_ablations_noise_removed.sh).
+# T2: ctn baseline + ctn_disable_distill.
+model: ctn
+loader: task_incremental_loader
+ctx_lr: 0.01
+task_emb: 64
+memory_strength: 1
+validation: 0.3
+ctn_disable_distill: true

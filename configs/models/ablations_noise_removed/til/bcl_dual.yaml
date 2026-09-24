@@ -1,0 +1,6 @@
+# Snapshot for the post-noise-removal ablation grid (scripts/run_ablations_noise_removed.sh).
+# Regenerated 2026-09-18 from the re-tuned baseline (commit 7d1028c7). Baseline: verbatim copy of configs/models/til/bcl_dual.yaml.
+model: bcl_dual
+loader: task_incremental_loader
+memory_strength: 1
+beta: 0.8
