@@ -25,7 +25,7 @@ logs/ablations_noise_removed_stale_bclcfg/, and all ten BCL rows were rerun).
 Metric: the HEADLINE macro F1 (macro over every class seen so far) from the results.txt
 metric block -- identical to the row mean in TIL, ~7 points lower in CIL. The row mean
 ("Final F1") is printed beside it as a secondary column. Deltas and tests use the
-headline. Seed protocol: n=6 in both modes, topped up to n=9 for underpowered rows.
+headline. Seed protocol: n=6 in both modes, topped up once to n=12 for INC rows.
 
 Usage:
   la-maml_env/bin/python scripts/analyse_ablations_noise_removed.py [--tag nrm|nrm1e] [--stats] [--csv]
@@ -41,7 +41,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from results_txt import f1_stats
 
-REPO = "/home/lunet/wsmr11/repos/evidential-cl"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOGS = os.path.join(REPO, "logs", "ablations_noise_removed")
 DELTA = 1.0  # smallest effect of interest, F1 points
 
@@ -178,13 +178,44 @@ def paired_stats(diffs):
     return mean, mean - half, mean + half, p_t, p_perm
 
 
-def verdict(lo, hi):
-    """Load-bearing / inert / inconclusive against the smallest effect of interest."""
-    if lo > DELTA or hi < -DELTA:
-        return "load-bearing"
+def verdict(lo, hi, p_holm, p_perm):
+    """Paper protocol (sec:stat_protocol) against the smallest effect of interest DELTA.
+
+    SS: CI excludes 0 and p_Holm, p_perm < 0.05. MS: CI excludes 0 but a test misses 0.05.
+    NS: CI inside +/-DELTA. INC: CI spans 0 and reaches past +/-DELTA.
+    """
+    if lo > 0 or hi < 0:
+        return "SS" if (p_holm < 0.05 and p_perm < 0.05) else "MS"
     if lo > -DELTA and hi < DELTA:
-        return "inert"
-    return "inconclusive"
+        return "NS"
+    return "INC"
+
+
+def family_stats(rows, pools, min_n=5):
+    """{row_id: (n, mean, lo, hi, p_holm, p_perm, verdict)} for every tested row.
+
+    Paired against the family baseline (first row) over the seeds the two share; Holm is
+    applied across the family's tested rows only.
+    """
+    base = pools[rows[0][0]]
+    raw = {}
+    for rid, _label, _stem, _pid in rows[1:]:
+        data = pools[rid]
+        common = [s_ for s_ in sorted(data) if s_ in base]
+        if len(common) < min_n:
+            continue
+        diffs = [data[s_][0] - base[s_][0] for s_ in common]
+        raw[rid] = (len(common),) + paired_stats(diffs)
+    order = sorted(raw, key=lambda r: raw[r][4])  # ascending paired-t p
+    m = len(order)
+    holm, running = {}, 0.0
+    for i, rid in enumerate(order):
+        running = max(running, min(1.0, (m - i) * raw[rid][4]))
+        holm[rid] = running
+    out = {}
+    for rid, (n, mean, lo, hi, _p_t, p_perm) in raw.items():
+        out[rid] = (n, mean, lo, hi, holm[rid], p_perm, verdict(lo, hi, holm[rid], p_perm))
+    return out
 
 
 def main():
@@ -196,37 +227,32 @@ def main():
                     help="restrict the report to these seeds (e.g. 0,39,55,100,390,550); "
                          "pools keep every seed on disk, this only filters the view")
     ap.add_argument("--topup", action="store_true",
-                    help="list the driver row ids needing n=9 (inconclusive rows plus the "
-                         "family baselines their paired deltas are measured against)")
+                    help="list the driver row ids needing the n=12 top-up (INC rows plus "
+                         "the family baselines their paired deltas are measured against)")
+    ap.add_argument("--modes", default="til,cil", help="comma list of modes to report")
     args = ap.parse_args()
 
+    modes = [m_ for m_ in args.modes.split(",") if m_ in GRIDS]
+
     if args.topup:
-        for mode, families in GRIDS.items():
+        for mode in modes:
             need = []
-            for family, rows in families.items():
+            for family, rows in GRIDS[mode].items():
                 pools = {rid: pool(mode, stem, pid, args.tag) for rid, _l, stem, pid in rows}
-                base = pools[rows[0][0]]
-                hits = []
-                for rid, _label, _stem, pid in rows[1:]:
-                    data = pools[rid]
-                    common = [x for x in sorted(data) if x in base]
-                    if len(common) < 5:
-                        continue
-                    diffs = [data[x][0] - base[x][0] for x in common]
-                    _m, lo, hi, _pt, _pp = paired_stats(diffs)
-                    if verdict(lo, hi) == "inconclusive":
-                        hits.append(pid)
+                fstats = family_stats(rows, pools)
+                hits = [pid for rid, _l, _s, pid in rows[1:]
+                        if rid in fstats and fstats[rid][-1] == "INC"]
                 if hits:
                     need.extend([rows[0][3]] + hits)
             uniq = sorted(set(need))
-            if uniq:
-                print("{} {}: ROWS_ONLY={}".format(args.tag, mode, ",".join(uniq)))
+            print("{} {}: ROWS_ONLY={}".format(args.tag, mode, ",".join(uniq)))
         return
 
     if args.csv:
         print("mode,family,row,mechanism,n,seeds,headline_mean,headline_sd,rowmean_mean,bwt_mean,delta_headline,delta_n")
 
-    for mode, families in GRIDS.items():
+    for mode in modes:
+        families = GRIDS[mode]
         if not args.csv:
             print("\n=== {} [{}] ===".format(mode.upper(), args.tag))
         for family, rows in families.items():
@@ -237,13 +263,14 @@ def main():
                          for rid, d in pools.items()}
             base_id = rows[0][0]
             base = pools[base_id]
+            fstats = family_stats(rows, pools)
             if not args.csv:
                 print("\n{}  (baseline {}; F1 and BWT in points; Delta = paired vs {})".format(
                     family, base_id, base_id))
                 header = ("  row  mechanism                                   n  seeds        "
                           "Headline F1       row-mean     BWT        Delta F1")
                 if args.stats:
-                    header += "      95% CI            p_perm  verdict"
+                    header += "      95% CI            p_Holm  p_perm  verdict"
                 print(header)
             for rid, label, _stem, _pid in rows:
                 data = pools[rid]
@@ -275,10 +302,10 @@ def main():
                 line = "  {:4s} {:42s} {:2d}  {:12s} {}  {:6.2f}  {:7.2f}  {}".format(
                     rid, label[:42], len(seeds), ",".join(str(s) for s in seeds),
                     fmt(f1), float(np.mean(rowmean)), float(np.mean(bwt)), delta_txt)
-                if args.stats and delta_n >= 5:
-                    mean, lo, hi, _p_t, p_perm = paired_stats(diffs)
-                    line += "   [{:+5.2f},{:+5.2f}]  {:6.3f}  {}".format(
-                        lo, hi, p_perm, verdict(lo, hi))
+                if args.stats and rid in fstats:
+                    _n, _mean, lo, hi, p_holm, p_perm, verd = fstats[rid]
+                    line += "   [{:+5.2f},{:+5.2f}]  {:6.3f}  {:6.3f}  {}".format(
+                        lo, hi, p_holm, p_perm, verd)
                 elif args.stats and delta_n:
                     line += "   (n={} < 5: no test)".format(delta_n)
                 print(line)

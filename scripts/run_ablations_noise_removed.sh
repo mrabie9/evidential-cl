@@ -77,9 +77,9 @@
 #   SMOKE=1 bash scripts/run_ablations_noise_removed.sh               # 2 tasks, 512 samples
 set -uo pipefail
 
-REPO="/home/lunet/wsmr11/repos/evidential-cl"
+REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "$REPO" || exit 1   # main.py resolves data_path and logs/ against cwd
-PY="/home/lunet/wsmr11/repos/La-MAML/la-maml_env/bin/python"
+PY="${PY:-$REPO/la-maml_env/bin/python}"
 BASE="$REPO/configs/base.yaml"
 CFG="$REPO/configs/models/ablations_noise_removed"
 
