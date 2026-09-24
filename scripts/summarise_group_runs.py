@@ -291,13 +291,24 @@ def render_latex(rows: list[dict], group_label: str) -> str:
         " & ".join(headers) + r" \\",
         r"\midrule",
     ]
-    for row in rows:
+    n_rows = len(rows)
+    has_pinned_top = any(row["model"] == PINNED_TOP for row in rows)
+    has_pinned_bottom = any(row["model"] == PINNED_BOTTOM for row in rows)
+    midrule_after_indices = set()
+    if has_pinned_top and n_rows > 1:
+        midrule_after_indices.add(0)
+    if has_pinned_bottom and n_rows > 1:
+        midrule_after_indices.add(n_rows - 2)
+
+    for row_index, row in enumerate(rows):
         display_name = ALGORITHM_DISPLAY_NAMES.get(row["model"], row["model"])
         cells = [display_name.replace("_", r"\_")]
         for _, key in LATEX_COLUMNS:
             mean, std = row["stats"][key]
             cells.append(_fmt_pmv(mean, std))
         lines.append(" & ".join(cells) + r" \\")
+        if row_index in midrule_after_indices:
+            lines.append(r"\midrule")
     lines += [r"\bottomrule", r"\end{tabular}%", "}", r"\end{table}"]
     return "\n".join(lines)
 

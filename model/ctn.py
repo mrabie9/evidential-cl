@@ -13,6 +13,9 @@ import torch
 from model.ctn_base import ContextNet18
 from model.replay_utils import (
     ReplayInputMixin,
+    build_task_offsets_table,
+    mask_padded_class_logits,
+    task_class_gather_index,
     unpack_y_to_class_labels,
 )
 from model.task_bn import frozen_running_stats
@@ -191,6 +194,10 @@ class Net(ReplayInputMixin, torch.nn.Module):
         self.task_val_filled = torch.zeros(
             n_tasks, dtype=torch.long, device=self.memx.device
         )
+        self.task_offsets_table = build_task_offsets_table(
+            [self.compute_offsets(task_index) for task_index in range(n_tasks)],
+            device=self.memx.device,
+        )
         self.bsz = self.cfg.batch_size
 
         self.n_outputs = n_outputs
@@ -292,29 +299,19 @@ class Net(ReplayInputMixin, torch.nn.Module):
             device=self.memx.device, dtype=torch.long
         )
 
-        offsets = torch.tensor(
-            [self.compute_offsets(int(task_index)) for task_index in t_idx.tolist()],
-            device=self.memx.device,
-            dtype=torch.long,
+        mask, sizes = task_class_gather_index(
+            t_idx, self.task_offsets_table, self.nc_per_task
         )
+        task_start_offsets = self.task_offsets_table[t_idx, 0]
         if valid:
             xx = self.valx[t_idx, s_idx]
-            yy = self.valy[t_idx, s_idx] - offsets[:, 0]
+            yy = self.valy[t_idx, s_idx] - task_start_offsets
             feat = torch.zeros(xx.size(0), self.nc_per_task, device=self.memx.device)
         else:
             xx = self.memx[t_idx, s_idx]
-            yy = self.memy[t_idx, s_idx] - offsets[:, 0]
+            yy = self.memy[t_idx, s_idx] - task_start_offsets
             feat = self.mem_feat[t_idx, s_idx]
-        mask = torch.zeros(xx.size(0), self.nc_per_task, device=self.memx.device)
-        for row_index in range(mask.size(0)):
-            class_size = offsets[row_index][1] - offsets[row_index][0]
-            mask[row_index, :class_size] = torch.arange(
-                offsets[row_index][0],
-                offsets[row_index][1],
-                device=self.memx.device,
-            )
-        sizes = (offsets[:, 1] - offsets[:, 0]).long()
-        return xx, yy, feat, mask.long(), t_idx.tolist(), sizes
+        return xx, yy, feat, mask, t_idx, sizes
 
     def observe(self, x, y, t):
         raw_x_train = x
@@ -436,10 +433,9 @@ class Net(ReplayInputMixin, torch.nn.Module):
                     # current task's BatchNorm running statistics.
                     with frozen_running_stats(self):
                         pred_ = self.net(xx, list_t)
-                    replay_pred = torch.gather(pred_, 1, mask)
-                    for row, size in enumerate(class_sizes):
-                        if size < replay_pred.size(1):
-                            replay_pred[row, size:] = -1e9
+                    replay_pred = mask_padded_class_logits(
+                        torch.gather(pred_, 1, mask), class_sizes
+                    )
                     loss2 = classification_cross_entropy(
                         replay_pred, yy, class_weighted_ce=self.class_weighted_ce
                     )
@@ -465,16 +461,15 @@ class Net(ReplayInputMixin, torch.nn.Module):
                 with torch.no_grad():
                     param.add_(grad, alpha=-self.inner_lr)
 
-            # Fast-step `autograd.grad` freed the graph; rebuild before meta forward.
-            x_train = self._canonicalize_input(raw_x_train, detach=False)
-            if rotated_validation_sample_for_meta is not None:
-                x_train = torch.cat(
-                    [x_train, rotated_validation_sample_for_meta], dim=0
-                )
-            logits = self.forward(x_train, t, cil_all_seen_upto_task=t)
-
             sampled_validation = self.memory_sampling(t + 1, valid=True)
             if sampled_validation is None:
+                # Fast-step `autograd.grad` freed the graph; rebuild before meta forward.
+                x_train = self._canonicalize_input(raw_x_train, detach=False)
+                if rotated_validation_sample_for_meta is not None:
+                    x_train = torch.cat(
+                        [x_train, rotated_validation_sample_for_meta], dim=0
+                    )
+                logits = self.forward(x_train, t, cil_all_seen_upto_task=t)
                 outer_loss = classification_cross_entropy(
                     logits,
                     targets,
@@ -484,10 +479,9 @@ class Net(ReplayInputMixin, torch.nn.Module):
                 xval, yval, feat, mask, list_t, class_sizes_val = sampled_validation
                 with frozen_running_stats(self):
                     pred_ = self.net(xval, list_t)
-                pred = torch.gather(pred_, 1, mask)
-                for row, size in enumerate(class_sizes_val):
-                    if size < pred.size(1):
-                        pred[row, size:] = -1e9
+                pred = mask_padded_class_logits(
+                    torch.gather(pred_, 1, mask), class_sizes_val
+                )
                 outer_loss = classification_cross_entropy(
                     pred, yval, class_weighted_ce=self.class_weighted_ce
                 )

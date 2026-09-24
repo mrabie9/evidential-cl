@@ -10,6 +10,9 @@ import torch
 from model.resnet1d import ResNet1D
 from model.replay_utils import (
     ReplayInputMixin,
+    build_task_offsets_table,
+    mask_padded_class_logits,
+    task_class_gather_index,
     unpack_y_to_class_labels,
 )
 from model.task_bn import frozen_running_stats
@@ -200,6 +203,10 @@ class Net(ReplayInputMixin, torch.nn.Module):
         self.task_val_filled = torch.zeros(
             n_tasks, dtype=torch.long, device=self.valx.device
         )
+        self.task_offsets_table = build_task_offsets_table(
+            [self.compute_offsets(task_index) for task_index in range(n_tasks)],
+            device=self.memx.device,
+        )
         self.bsz = args.batch_size
         self.valid_id = []
         self.n_outputs = n_outputs
@@ -334,23 +341,13 @@ class Net(ReplayInputMixin, torch.nn.Module):
         t_idx = tk[sel]
         s_idx = sm[sel]
 
-        offsets = torch.tensor(
-            [self.compute_offsets(int(i)) for i in t_idx.tolist()],
-            device=mem_x.device,
-            dtype=torch.long,
+        mask, sizes = task_class_gather_index(
+            t_idx, self.task_offsets_table, self.nc_per_task
         )
         xx = mem_x[t_idx, s_idx]
         yy_global = mem_y[t_idx, s_idx]
-        yy = yy_global - offsets[:, 0]
+        yy = yy_global - self.task_offsets_table[t_idx, 0]
         feat = mem_feat[t_idx, s_idx]
-        mask = torch.zeros(xx.size(0), self.nc_per_task, device=xx.device)
-        for j in range(mask.size(0)):
-            cls_size = offsets[j][1] - offsets[j][0]
-            mask[j, :cls_size] = torch.arange(
-                offsets[j][0], offsets[j][1], device=xx.device
-            )
-        mask = mask.long()
-        sizes = (offsets[:, 1] - offsets[:, 0]).long()
         return xx, yy, feat, mask, t_idx, sizes, yy_global
 
     def _replay_ce(self, pred_full, gathered, yy, yy_global, t_idx, t):
@@ -620,10 +617,9 @@ class Net(ReplayInputMixin, torch.nn.Module):
                     # current task's BatchNorm running statistics.
                     with frozen_running_stats(self):
                         pred_ = self.net(xx)
-                    pred = torch.gather(pred_, 1, mask)
-                    for row, size in enumerate(class_sizes):
-                        if size < pred.size(1):
-                            pred[row, size:] = -1e9
+                    pred = mask_padded_class_logits(
+                        torch.gather(pred_, 1, mask), class_sizes
+                    )
                     loss2 = self._replay_ce(pred_, pred, yy, yy_global, t_idx, t)
                     loss3 = self.reg * self.kl(
                         F.log_softmax(pred / self.temp, dim=1), feat
@@ -655,10 +651,9 @@ class Net(ReplayInputMixin, torch.nn.Module):
                 ) = sampled_validation
                 with frozen_running_stats(self):
                     pred_ = self.net(xval)
-                pred = torch.gather(pred_, 1, mask_val)
-                for row, size in enumerate(class_sizes_val):
-                    if size < pred.size(1):
-                        pred[row, size:] = -1e9
+                pred = mask_padded_class_logits(
+                    torch.gather(pred_, 1, mask_val), class_sizes_val
+                )
                 outer_loss = self._replay_ce(
                     pred_, pred, yval, yval_global, t_idx_val, t
                 )
