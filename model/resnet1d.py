@@ -68,6 +68,15 @@ class AdcIqAdapter(nn.Module):
     """Reduce 3 (or more) channels into 2 IQ channels.
 
     Accepts either (B, 3, 2, L) [4D] or (B, 3, L) [3D] and returns (B, 2, L).
+
+    The ADC mix is a convex combination: the stored parameters are logits and
+    the applied coefficients are their softmax, so they are non-negative and
+    sum to 1. The earlier ``w / w.sum()`` form also summed to 1 but allowed
+    negative coefficients and is singular at ``w.sum() == 0``; early
+    large-loss steps could drive the sum through zero, leaving a mix such as
+    ``[+6.7, -9.4, +3.6]`` that cancels the common signal and amplifies
+    per-ADC noise. The default all-ones logits give the uniform 1/3 mix, and
+    the softmax has the same Jacobian as ``w / w.sum()`` at that point.
     """
 
     def __init__(self) -> None:
@@ -105,12 +114,14 @@ class AdcIqAdapter(nn.Module):
         on the default random initialization.
 
         Args:
-            weight_4d: Optional weight for the 4D path with shape (3,), shared
-                across the I and Q channels.
+            weight_4d: Optional mixing logits for the 4D path with shape (3,),
+                shared across the I and Q channels. The applied mix is their
+                softmax; pass ``torch.log(mix)`` to seed a specific mix.
             bias_4d: Optional bias for the 4D path with shape (2,).
-            weight_3d: Optional weight for the 3D Conv1d path. Accepts either
-                a tensor of shape (2, 3) or (2, 3, 1); the latter will be
-                used directly as ``proj_3ch.weight``.
+            weight_3d: Optional mixing logits for the 3D Conv1d path (softmax
+                over each row). Accepts either a tensor of shape (2, 3) or
+                (2, 3, 1); the latter will be used directly as
+                ``proj_3ch.weight``.
             bias_3d: Optional bias for the 3D Conv1d path with shape (2,).
             freeze: If True, disables gradient updates for the adapter
                 parameters after initialization.
@@ -171,36 +182,26 @@ class AdcIqAdapter(nn.Module):
             for param in (self.weight, self.bias, *self.proj_3ch.parameters()):
                 param.requires_grad = False
 
+    def mixing_weights(self) -> torch.Tensor:
+        """Convex ADC mix applied on the 4D path: ``softmax(weight)``, shape (3,)."""
+        return torch.softmax(self.weight, dim=0)
+
+    def conv_mixing_weights(self) -> torch.Tensor:
+        """Row-wise convex ADC mix applied on the 3D path, shape (2, 3)."""
+        return torch.softmax(self.proj_3ch.weight.squeeze(-1), dim=1)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Enforce a stochastic mix: the (shared) weight vector sums to 1.
-        weight_sum = self.weight.sum()
-        zero_sum_mask = weight_sum.abs() <= 1e-12
-        denom = torch.where(zero_sum_mask, torch.ones_like(weight_sum), weight_sum)
-        normalized_weight = self.weight / denom  # (3,)
-        uniform = torch.full_like(self.weight, 1.0 / self.weight.size(0))
-        normalized_weight = torch.where(zero_sum_mask, uniform, normalized_weight)
+        # Convex mix: coefficients are non-negative and sum to 1 (see class
+        # docstring for why this is a softmax rather than ``w / w.sum()``).
+        normalized_weight = self.mixing_weights()  # (3,)
 
         # Bias is always 0 (and does not receive gradients).
         self.bias.data.zero_()
 
         if x.dim() == 3 and x.size(1) == 3:
-            # Use proj_3ch parameters for the 3D path so gradients flow there.
-            # Enforce row-stochastic mixing for the effective conv weights.
-            conv_weight = self.proj_3ch.weight.squeeze(-1)  # (2, 3)
-            conv_row_sums = conv_weight.sum(dim=1, keepdim=True)
-            conv_zero_row_mask = conv_row_sums.abs() <= 1e-12
-            conv_denom = torch.where(
-                conv_zero_row_mask, torch.ones_like(conv_row_sums), conv_row_sums
-            )
-            normalized_conv_weight = conv_weight / conv_denom
-            conv_uniform = torch.full_like(
-                conv_weight, 1.0 / conv_weight.size(1)  # 1/3
-            )
-            normalized_conv_weight = torch.where(
-                conv_zero_row_mask.expand_as(normalized_conv_weight),
-                conv_uniform,
-                normalized_conv_weight,
-            )
+            # Use proj_3ch parameters for the 3D path so gradients flow there,
+            # with each output row a convex mix of the three ADCs.
+            normalized_conv_weight = self.conv_mixing_weights()
             y = torch.einsum("bcl,oc->bol", x, normalized_conv_weight)
             return y + self.bias.view(1, 2, 1)
         if x.dim() != 4 or x.size(1) != 3 or x.size(2) != 2:

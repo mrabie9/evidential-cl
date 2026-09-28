@@ -136,41 +136,25 @@ def format_linear_combination(
     return lines
 
 
-def normalize_weight_rows(weight: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-    """Normalize weight so each output channel's coefficients sum to 1.
+def normalize_weight_rows(weight: torch.Tensor) -> torch.Tensor:
+    """Map stored adapter logits to the mix ``AdcIqAdapter`` applies: a row softmax.
+
+    Checkpoints written before the adapter switched from ``w / w.sum()`` to a
+    softmax store weights with the old meaning; their softmax is close to the
+    old mix only while the weights stay near uniform.
 
     Args:
         weight: Tensor of shape (out_channels, in_channels), or (in_channels,)
             for a combination shared across output channels.
-        eps: Threshold for treating a row-sum as zero.
 
     Returns:
-        Row-normalized tensor with the same shape.
+        Non-negative tensor of the same shape whose rows sum to 1.
     """
-    if weight.dim() == 1:
-        weight_sum = weight.sum()
-        zero_sum = weight_sum.abs() <= eps
-        denom = torch.where(zero_sum, torch.ones_like(weight_sum), weight_sum)
-        normalized = weight / denom
-        uniform = torch.full_like(weight, 1.0 / weight.size(0))
-        return torch.where(zero_sum, uniform, normalized)
-    if weight.dim() != 2:
+    if weight.dim() not in (1, 2):
         raise ValueError(
             f"Expected rank-1 or rank-2 weight tensor, got shape {tuple(weight.shape)}"
         )
-
-    row_sums = weight.sum(dim=1, keepdim=True)
-    zero_row_mask = row_sums.abs() <= eps
-    denom = torch.where(zero_row_mask, torch.ones_like(row_sums), row_sums)
-    normalized = weight / denom
-
-    uniform = torch.full_like(weight, 1.0 / weight.size(1))
-    normalized = torch.where(
-        zero_row_mask.expand_as(normalized),
-        uniform,
-        normalized,
-    )
-    return normalized
+    return torch.softmax(weight.float(), dim=-1)
 
 
 def print_adapter_params(
@@ -401,7 +385,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--normalize-weights",
         action="store_true",
-        help="Row-normalize adapter weights before printing (each output row sums to 1).",
+        help="Print the applied mix, softmax(weight) per row, instead of the raw logits.",
     )
     return parser.parse_args()
 

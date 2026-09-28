@@ -451,6 +451,12 @@ class Net(ReplayInputMixin, torch.nn.Module):
                 loss = self.cls_lambda * loss1
             loss.backward()
             self.inner_opt.step()
+            # Clear the inner gradient before the outer step. Without this the
+            # outer step applied grad(inner loss at the pre-step weights) again
+            # on top of grad(outer loss) -- measured at 1.0-1.8x the outer
+            # gradient's norm -- so the "validation" step was mostly a second
+            # current-batch step.
+            self.zero_grad()
             sampled_validation = self.memory_sampling(tt, valid=True)
             if sampled_validation is not None:
                 (
