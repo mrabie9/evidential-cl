@@ -271,7 +271,7 @@ def render_latex(rows: list[dict], group_label: str) -> str:
     preamble.
     """
     caption = (
-        f"Continual learning performance for the {group_label} setting. "
+        f"Continual learning performance for the {group_label.replace("_"," ")} setting. "
         r"Results show the mean and sample standard deviation (in $\%$) "
         "over training seeds."
     )

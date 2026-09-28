@@ -45,7 +45,8 @@ def test_prepare_input_ambiguous_flat():
 def test_adapter_known_mix():
     adapter = AdcIqAdapter()
     with torch.no_grad():
-        adapter.weight.copy_(torch.tensor([1.0, 0.0, 0.0]))
+        # Logits: softmax([0, -inf, -inf]) selects ADC0 exactly.
+        adapter.weight.copy_(torch.tensor([0.0, float("-inf"), float("-inf")]))
         adapter.bias.zero_()
     b, l = 2, 16
     i = torch.randn(b, l)  # [b, l]
@@ -68,14 +69,15 @@ def test_adapter_shares_weights_across_iq():
     """The ADC mixing weights must be identical for the I and Q channels."""
     adapter = AdcIqAdapter()
     with torch.no_grad():
-        adapter.weight.copy_(torch.tensor([0.6, 0.3, 0.1]))
+        adapter.weight.copy_(torch.log(torch.tensor([0.6, 0.3, 0.1])))
         adapter.bias.zero_()
+    mix = torch.tensor([0.6, 0.3, 0.1])
     b, l = 3, 8
     x = torch.randn(b, 3, 2, l)
     y = adapter(x)
-    expected = torch.einsum("bal,a->bl", x[:, :, 0, :], adapter.weight)
+    expected = torch.einsum("bal,a->bl", x[:, :, 0, :], mix)
     assert torch.allclose(y[:, 0], expected, atol=1e-6)
-    expected_q = torch.einsum("bal,a->bl", x[:, :, 1, :], adapter.weight)
+    expected_q = torch.einsum("bal,a->bl", x[:, :, 1, :], mix)
     assert torch.allclose(y[:, 1], expected_q, atol=1e-6)
 
 
@@ -86,6 +88,53 @@ def test_adapter_grad_flow():
     y.backward()
     assert adapter.weight.grad is not None
     assert adapter.weight.grad.abs().sum().item() > 0
+
+
+def test_default_mix_is_uniform():
+    adapter = AdcIqAdapter()
+    assert torch.allclose(adapter.mixing_weights(), torch.full((3,), 1.0 / 3))
+
+
+def test_mix_stays_convex_where_the_old_sum_normalisation_blew_up():
+    """Regression for the CIL 1-epoch collapse (bcl_dual seed 9).
+
+    The old ``w / w.sum()`` mix turned these logged weights into
+    ``[+6.7, -9.4, +3.6]``: summing to 1 but subtractive and ~21x the noise
+    gain of the uniform mix. The softmax mix must stay a convex combination.
+    """
+    adapter = AdcIqAdapter()
+    for logged in ([1.61, -2.24, 0.87], [1.28, -2.34, 1.13], [1.0, -1.0, 0.0]):
+        with torch.no_grad():
+            adapter.weight.copy_(torch.tensor(logged))
+        mix = adapter.mixing_weights()
+        assert torch.all(mix >= 0)
+        assert torch.isclose(mix.sum(), torch.tensor(1.0))
+        # A convex mix is never noisier than using one ADC alone.
+        assert mix.norm() <= 1.0 + 1e-6
+
+
+def test_mix_gradient_is_bounded_near_zero_sum():
+    adapter = AdcIqAdapter()
+    with torch.no_grad():
+        adapter.weight.copy_(torch.tensor([1.0, -1.0 + 1e-6, 0.0]))
+    x = torch.randn(4, 3, 2, 8)
+    adapter(x).pow(2).mean().backward()
+    assert torch.isfinite(adapter.weight.grad).all()
+    assert adapter.weight.grad.abs().max() < 10.0
+
+
+def test_conv_path_rows_are_convex():
+    adapter = AdcIqAdapter()
+    with torch.no_grad():
+        adapter.proj_3ch.weight.copy_(
+            torch.tensor([[1.0, -1.0, 0.0], [2.0, -3.0, 1.0]]).view(2, 3, 1)
+        )
+    mix = adapter.conv_mixing_weights()
+    assert torch.all(mix >= 0)
+    assert torch.allclose(mix.sum(dim=1), torch.ones(2))
+    x = torch.randn(2, 3, 16)
+    expected = torch.einsum("bcl,oc->bol", x, mix)
+    assert torch.allclose(adapter(x), expected, atol=1e-6)
 
 
 def test_resnet1d_integration():

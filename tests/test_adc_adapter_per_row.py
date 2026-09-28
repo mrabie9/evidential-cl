@@ -17,9 +17,9 @@ from model.resnet1d import AdcIqAdapter  # noqa: E402
 def _adapter() -> AdcIqAdapter:
     adapter = AdcIqAdapter()
     with torch.no_grad():
-        # Weights whose ADC0 entry normalises well away from 1, so the mixing
-        # path is clearly distinguishable from the identity path. Shared
-        # across the I and Q channels.
+        # Logits whose softmax gives ADC0 ~0.55, well away from 1, so the
+        # mixing path is clearly distinguishable from the identity path.
+        # Shared across the I and Q channels.
         adapter.weight.copy_(torch.tensor([1.7, 0.8, 0.8]))
     return adapter
 
@@ -64,8 +64,7 @@ def test_three_adc_rows_still_get_the_learned_mixing() -> None:
 
     out = adapter(torch.cat([_padded_rows(4), real]))[4:]
 
-    weight = adapter.weight
-    normalized = weight / weight.sum()
+    normalized = torch.softmax(adapter.weight, dim=0)
     expected = torch.einsum("bial,a->bil", real.permute(0, 2, 1, 3), normalized)
     assert torch.allclose(out, expected, atol=1e-6)
     assert not torch.allclose(out, real[:, 0, :, :], atol=1e-3)
