@@ -1704,9 +1704,9 @@ def save_results(
     kept first so older parsers still find the zero-shot row and ``Backward:``),
     then the precision and F1 matrices, then a per-metric summary table.
 
-    ``final`` is the mean of the last matrix row, so ``bwt = final - diagonal``
-    exactly. When ``headline`` is given, the headline macro metrics are recorded
-    beside it (summary table ``headline`` column and the one-liner). Under CIL
+    ``final`` is the mean of the last matrix row; ``bwt`` is the mean of the
+    last row minus the diagonal over every task but the last. When
+    ``headline`` is given, the headline macro metrics are recorded beside it (summary table ``headline`` column and the one-liner). Under CIL
     the headline is scored over every seen class at once and differs from the
     row mean, which weights classes unequally when tasks differ in size; under
     TIL it equals the row mean.
@@ -1809,7 +1809,8 @@ def save_results(
                     file=results_file,
                 )
             print(
-                "final = mean of the last row (bwt = final - diagonal); "
+                "final = mean of the last row; bwt = mean of (last row - "
+                "diagonal) over all tasks but the last; "
                 "headline = macro score over every seen class.",
                 file=results_file,
             )
@@ -1907,6 +1908,10 @@ SWEEP_BWT_FIELDS = [
     ("val_bwt_f1", "Validation BWT f1"),
 ]
 
+# Marks seed_metrics.json files whose BWT averages over every task but the
+# last; scripts/backfill_bwt_excl_last_task.py rescales files without it.
+BWT_EXCLUDES_LAST_TASK_KEY = "bwt_excludes_last_task"
+
 
 def _write_seed_metrics(args, spent_time, headline, val_bwt):
     """Write a small machine-readable metrics file into the seed's log dir.
@@ -1925,6 +1930,7 @@ def _write_seed_metrics(args, spent_time, headline, val_bwt):
         payload[field] = headline.get(field)
     for key in ("rec", "prec", "f1"):
         payload["val_bwt_" + key] = val_bwt.get(key)
+    payload[BWT_EXCLUDES_LAST_TASK_KEY] = True
     payload["runtime_seconds"] = float(spent_time)
     path = os.path.join(args.log_dir, "seed_metrics.json")
     try:

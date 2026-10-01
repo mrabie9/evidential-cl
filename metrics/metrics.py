@@ -42,7 +42,8 @@ def transfer_stats(result_t, result_a):
     Returns:
         Tuple ``(baseline, reduced, diag, final, bwt, fwt)``: the first-round
         row, the T x T matrix, and per-task tensors for the diagonal, the last
-        row, backward transfer (last row minus diagonal) and forward transfer.
+        row, backward transfer (last row minus diagonal, over the first T-1
+        tasks) and forward transfer.
 
     Usage:
         baseline, reduced, diag, final, bwt, fwt = transfer_stats(val_t, val_a)
@@ -56,8 +57,9 @@ def transfer_stats(result_t, result_a):
     # acc[t] equals result[t,t]
     acc = result.diag()
     fin = result[nt - 1]
-    # bwt[t] equals result[T,t] - acc[t]
-    bwt = result[nt - 1] - acc
+    # bwt[t] equals result[T,t] - acc[t], for t < T only: the last task has
+    # had no later training to forget under, so it would only dilute the mean
+    bwt = (result[nt - 1] - acc)[: max(nt - 1, 1)]
 
     # fwt[t] equals result[t-1,t] - baseline[t]
     fwt = torch.zeros(nt)
