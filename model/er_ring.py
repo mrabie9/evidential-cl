@@ -12,7 +12,11 @@ from model.replay_utils import (
     ReplayInputMixin,
     unpack_y_to_class_labels,
 )
-from model.task_bn import frozen_running_stats
+from model.task_bn import (
+    forward_replay_and_current,
+    frozen_running_stats,
+    replay_forward_is_joint,
+)
 import torch.nn as nn
 import numpy as np
 from utils.training_metrics import macro_recall
@@ -205,6 +209,51 @@ class Net(ReplayInputMixin, torch.nn.Module):
         sizes = (offsets[:, 1] - offsets[:, 0]).long()
         return xx, yy, feat, mask.long(), sizes, t_idx, yy_global
 
+    def _forward_current_and_replay(
+        self, x: torch.Tensor, t: int, replay_rows: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Forward the current batch and, if drawn, the replay rows.
+
+        Under CIL the two blocks share one forward so BatchNorm normalizes the
+        current task with the mixed-batch statistics it meets at evaluation
+        (:func:`model.task_bn.replay_forward_is_joint`). Otherwise the replay
+        rows, which come from earlier tasks, are normalized with their own batch
+        statistics without writing task ``t``'s running buffers.
+
+        Args:
+            x: Current minibatch (raw input format).
+            t: Task being trained.
+            replay_rows: Canonical replay inputs, or ``None`` when none were drawn.
+
+        Returns:
+            ``(current_logits, replay_raw)``: current logits masked to tasks
+            ``0..t``, and unmasked replay logits (``None`` without replay).
+        """
+        if replay_rows is None:
+            return self.forward(x, t, True, cil_all_seen_upto_task=t), None
+        if not replay_forward_is_joint(self.incremental_loader_name):
+            current_logits = self.forward(x, t, True, cil_all_seen_upto_task=t)
+            with frozen_running_stats(self):
+                replay_raw = self.net(replay_rows)
+            return current_logits, replay_raw
+        replay_raw, current_raw = forward_replay_and_current(
+            self,
+            self.net,
+            replay_rows,
+            self._canonicalize_input(x, detach=False),
+            joint=True,
+        )
+        current_logits = misc_utils.apply_task_incremental_logit_mask(
+            current_raw,
+            t,
+            self.classes_per_task,
+            self.n_outputs,
+            cil_all_seen_upto_task=t,
+            fill_value=-10e10,
+            loader=self.incremental_loader_name,
+        )
+        return current_logits, replay_raw
+
     def observe(self, x, y, t):
         # t = info[0]
         # idx = info[1]
@@ -243,8 +292,9 @@ class Net(ReplayInputMixin, torch.nn.Module):
             loss2 = torch.tensor(0.0).cuda()
 
             offset1, offset2 = self.compute_offsets(t)
-            pred = self.forward(x, t, True, cil_all_seen_upto_task=t)
-            logits = pred
+            sampled = self.memory_sampling(t) if t > 0 else None
+            replay_rows = None if sampled is None else sampled[0]
+            logits, replay_raw = self._forward_current_and_replay(x, t, replay_rows)
             targets = y_work.long()
             preds = torch.argmax(logits, dim=1)
             cls_tr_rec.append(macro_recall(preds, targets))
@@ -254,13 +304,9 @@ class Net(ReplayInputMixin, torch.nn.Module):
                 class_weighted_ce=self.class_weighted_ce,
             )
             if t > 0:
-                sampled = self.memory_sampling(t)
                 if sampled is not None:
                     xx, yy, target, mask, class_sizes, t_idx, yy_global = sampled
-                    # Replay rows come from earlier tasks: normalize with this
-                    # batch's statistics without writing task ``t``'s buffers.
-                    with frozen_running_stats(self):
-                        pred_ = self.net(xx)
+                    pred_ = replay_raw
                     if self.incremental_loader_name == "class_incremental_loader":
                         # CIL: replayed rows compete with every class seen so
                         # far, as the current batch does; a per-task block would

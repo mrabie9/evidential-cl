@@ -31,7 +31,11 @@ from model.replay_utils import (
     ReplayInputMixin,
     unpack_y_to_class_labels,
 )
-from model.task_bn import frozen_running_stats
+from model.task_bn import (
+    forward_replay_and_current,
+    frozen_running_stats,
+    replay_forward_is_joint,
+)
 from utils.training_metrics import macro_recall
 from utils import misc_utils
 from utils.class_weighted_loss import classification_cross_entropy
@@ -391,6 +395,60 @@ class Net(ReplayInputMixin, nn.Module):
         bt = torch.tensor(replay_t, dtype=torch.long, device=device)
         return bx, by, bt
 
+    def _er_step_losses(
+        self, x: torch.Tensor, y: torch.Tensor, current_t: torch.Tensor, t: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward the current batch and a replay draw, and score each block.
+
+        Logits are raw; per-sample task masking happens inside
+        ``take_multitask_loss`` (global CE targets index the full ``n_outputs``
+        vector). Under CIL the two blocks share one forward so BatchNorm
+        normalizes the current task with the same mixed-batch statistics it meets
+        at evaluation (:func:`model.task_bn.replay_forward_is_joint`); under TIL
+        they are forwarded separately, the replay pass without writing running
+        statistics.
+
+        Args:
+            x: Current minibatch, live through the input adapter.
+            y: Current class labels.
+            current_t: Task id per current row.
+            t: Task being trained.
+
+        Returns:
+            ``(current_logits, current_loss, replay_loss)``; ``replay_loss`` is a
+            zero scalar when the replay pool is empty.
+        """
+        replay = self._sample_replay(x.device)
+        if replay is None:
+            set_batch_task_counts(self._adab1n, current_t)
+            current_logits = self.net.forward(x)
+            current_loss = self.take_multitask_loss(current_t, t, current_logits, y)
+            return current_logits, current_loss, torch.zeros_like(current_loss)
+
+        replay_x, replay_y, replay_t = replay
+        if replay_forward_is_joint(self.incremental_loader_name):
+            # Replay rows are stored canonical, so bring the live rows to the
+            # same shape (keeping the adapter graph) before concatenating.
+            set_batch_task_counts(self._adab1n, torch.cat([replay_t, current_t]))
+            replay_logits, current_logits = forward_replay_and_current(
+                self,
+                self.net.forward,
+                replay_x,
+                self._canonicalize_input(x, detach=False),
+                joint=True,
+            )
+        else:
+            # AdaB1N reweights by the rows' task mix, so each separate pass
+            # carries its own counts.
+            set_batch_task_counts(self._adab1n, current_t)
+            current_logits = self.net.forward(x)
+            set_batch_task_counts(self._adab1n, replay_t)
+            with frozen_running_stats(self):
+                replay_logits = self.net.forward(replay_x)
+        current_loss = self.take_multitask_loss(current_t, t, current_logits, y)
+        replay_loss = self.take_multitask_loss(replay_t, t, replay_logits, replay_y)
+        return current_logits, current_loss, replay_loss
+
     def ER(self, x, y, t):
         """Single training step per inner step on the live current minibatch.
 
@@ -407,31 +465,9 @@ class Net(ReplayInputMixin, nn.Module):
 
             self.net.zero_grad()
 
-            # Current minibatch: live forward through the adapter. Raw logits;
-            # per-sample task masking happens inside ``take_multitask_loss``
-            # (global CE targets index the full ``n_outputs`` vector).
-            # The current batch is single-task, so AdaB1N's reweighting collapses
-            # to uniform here; the replay batch below is where it does work.
-            set_batch_task_counts(self._adab1n, current_t)
-            current_logits = self.net.forward(x)
-            current_loss = self.take_multitask_loss(current_t, t, current_logits, y)
-
-            # Replay minibatch: pre-canonicalized rows from the buffer.
-            replay = self._sample_replay(x.device)
-            if replay is not None:
-                replay_x, replay_y, replay_t = replay
-                set_batch_task_counts(self._adab1n, replay_t)
-                # Mixed-task rows: normalize with this batch's own statistics but
-                # do not fold them into the current task's running statistics.
-                with frozen_running_stats(self):
-                    replay_logits = self.net.forward(replay_x)
-                replay_loss = self.take_multitask_loss(
-                    replay_t, t, replay_logits, replay_y
-                )
-            else:
-                replay_loss = torch.zeros(
-                    (), device=current_logits.device, dtype=current_logits.dtype
-                )
+            current_logits, current_loss, replay_loss = self._er_step_losses(
+                x, y, current_t, t
+            )
 
             loss = current_loss + (self.memory_loss_lambda * replay_loss)
 
@@ -638,13 +674,20 @@ class Net(ReplayInputMixin, nn.Module):
             current_t = torch.full(
                 (x_live.size(0),), int(t), dtype=torch.long, device=x_live.device
             )
-            current_logits = self.net.forward(x_live)
+            if replay_count > 0:
+                replay_logits, current_logits = forward_replay_and_current(
+                    self,
+                    self.net.forward,
+                    bx[:replay_count],
+                    x_live,
+                    joint=replay_forward_is_joint(self.incremental_loader_name),
+                )
+            else:
+                current_logits = self.net.forward(x_live)
             current_loss = self.take_multitask_loss(
                 current_t, t, current_logits, current_labels
             )
             if replay_count > 0:
-                with frozen_running_stats(self):
-                    replay_logits = self.net.forward(bx[:replay_count])
                 replay_loss = self.take_multitask_loss(
                     bt[:replay_count], t, replay_logits, by[:replay_count]
                 )

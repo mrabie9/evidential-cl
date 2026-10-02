@@ -37,7 +37,7 @@ Usage:
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Iterator, List, Optional, Sequence
+from typing import Callable, Iterator, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -460,6 +460,67 @@ def eval_uses_batch_statistics(args: object) -> bool:
     return str(getattr(args, "bn_mode", "shared")).lower() == "shared"
 
 
+def replay_forward_is_joint(loader_name: Optional[str]) -> bool:
+    """Report whether replay and current rows should share one BatchNorm pass.
+
+    Class-incremental evaluation scores every seen task from one shuffled,
+    mixed-task pass with batch statistics (``main.eval_cil_pooled``). Training
+    the current task in its own forward normalizes it with single-task
+    statistics it never meets at evaluation, so the newest task is learned
+    under the wrong normalization and only "recovers" once it is replayed in
+    mixed batches -- an artificial, large positive BWT. Task-incremental
+    evaluation is per task, so there the separate passes are the match.
+
+    Args:
+        loader_name: The run's ``args.loader``.
+
+    Returns:
+        ``True`` for ``class_incremental_loader``.
+
+    Usage:
+        joint = replay_forward_is_joint(self.incremental_loader_name)
+    """
+    return loader_name == "class_incremental_loader"
+
+
+def forward_replay_and_current(
+    model: object,
+    forward: Callable[[Tensor], Tensor],
+    replay_x: Tensor,
+    current_x: Tensor,
+    *,
+    joint: bool,
+) -> Tuple[Tensor, Tensor]:
+    """Forward a replay block and a current block, jointly or separately.
+
+    Joint mode concatenates the blocks so BatchNorm normalizes both with the
+    statistics of the mixed batch (the class-incremental evaluation regime).
+    Separate mode forwards each block on its own, with the replay pass under
+    :func:`frozen_running_stats`.
+
+    Args:
+        model: Continual-learning module owning the BatchNorm layers.
+        forward: Maps an input batch to logits (e.g. ``self.net.forward``).
+        replay_x: Replay rows.
+        current_x: Current-task rows.
+        joint: Forward both blocks in one pass when ``True``.
+
+    Returns:
+        ``(replay_logits, current_logits)`` aligned with the inputs.
+
+    Usage:
+        replay_logits, current_logits = forward_replay_and_current(
+            self, self.net.forward, replay_x, x, joint=True
+        )
+    """
+    if joint:
+        logits = forward(torch.cat([replay_x, current_x], dim=0))
+        return logits[: replay_x.size(0)], logits[replay_x.size(0) :]
+    with frozen_running_stats(model):
+        replay_logits = forward(replay_x)
+    return replay_logits, forward(current_x)
+
+
 def task_bn_enabled(args: object) -> bool:
     """Report whether this run should use task-specific BatchNorm statistics.
 
@@ -548,9 +609,11 @@ __all__ = [
     "batch_statistics",
     "convert_batchnorm_to_task_specific",
     "eval_uses_batch_statistics",
+    "forward_replay_and_current",
     "frozen_running_stats",
     "get_active_task",
     "install",
+    "replay_forward_is_joint",
     "set_active_task",
     "task_bn_enabled",
     "task_bn_layers",
