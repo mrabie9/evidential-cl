@@ -5,5 +5,5 @@ sync_update: true
 use_old_task_memory: true
 second_order: false
 opt_lr: 0.0003
-opt_wt: 0.01
-alpha_init: 0.001
+opt_wt: 0.03
+alpha_init: 0.01

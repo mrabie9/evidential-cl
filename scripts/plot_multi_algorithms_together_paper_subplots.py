@@ -392,6 +392,101 @@ def _compute_val_metric_for_single_task(
     )
 
 
+def _cil_union_key_for_val_key(val_metric_key: str) -> str:
+    """Map a per-task validation key onto its CIL pooled-union counterpart.
+
+    Usage:
+        >>> _cil_union_key_for_val_key("val_macro_f1")
+        'cil_union_macro_f1'
+    """
+    return "cil_union_" + val_metric_key.removeprefix("val_")
+
+
+def _cil_union_series(tasks: Sequence[Any], val_metric_key: str) -> np.ndarray | None:
+    """Return the per-checkpoint CIL pooled-union metric, or ``None`` if absent.
+
+    In CIL mode ``SUMMARY_TE`` (and hence ``results.txt``) reports the macro
+    metric over every seen class on the pooled test set, stored cumulatively
+    as ``cil_union_macro_*`` in each checkpoint's npz. Averaging the per-task
+    ``val_macro_*`` vector instead overstates CIL performance, because a
+    per-task split never counts predictions into another task's classes as
+    false positives.
+
+    Args:
+        tasks: Per-checkpoint metric dictionaries for a single run.
+        val_metric_key: Per-task validation key (``val_macro_f1``/``val_macro_rec``).
+
+    Returns:
+        One value per checkpoint, or ``None`` for runs without union metrics
+        (TIL runs, or CIL runs written before the union metric existed).
+
+    Usage:
+        >>> series = _cil_union_series(tasks, "val_macro_f1")
+    """
+    if not tasks:
+        return None
+    union_key = _cil_union_key_for_val_key(val_metric_key)
+    union_values = tasks[-1].get(union_key)
+    if union_values is None:
+        return None
+    union_array = np.asarray(union_values, dtype=float).reshape(-1)
+    if union_array.size != len(tasks):
+        return None
+    return union_array
+
+
+def _continual_val_metric_series(
+    tasks: Sequence[Any], val_metric_key: str
+) -> tuple[np.ndarray, np.ndarray]:
+    """Validation metric per checkpoint, matching the ``SUMMARY_TE`` semantics.
+
+    Uses the CIL pooled-union metric when the run stores it, else the mean of
+    the per-task validation vector over the tasks seen so far.
+
+    Args:
+        tasks: Per-checkpoint metric dictionaries for a single run.
+        val_metric_key: Per-task validation key (``val_macro_f1``/``val_macro_rec``).
+
+    Returns:
+        Tuple ``(checkpoint_numbers, values)`` with 1-based checkpoint numbers.
+
+    Usage:
+        >>> x, y = _continual_val_metric_series(tasks, "val_macro_f1")
+    """
+    from scripts.plot_multi_algorithms import _compute_mean_val_metric_over_tasks
+
+    union_array = _cil_union_series(tasks, val_metric_key)
+    if union_array is None:
+        return _compute_mean_val_metric_over_tasks(tasks, val_metric_key)
+    return np.arange(1, union_array.size + 1, dtype=float), union_array
+
+
+def _final_val_metric_for_run(
+    tasks: Sequence[Any], val_metric_key: str
+) -> float | None:
+    """Final validation metric for a run, matching the ``SUMMARY_TE`` semantics.
+
+    Args:
+        tasks: Per-checkpoint metric dictionaries for a single run.
+        val_metric_key: Per-task validation key (``val_macro_f1``/``val_macro_rec``).
+
+    Returns:
+        The CIL pooled-union value after the last task when stored, else the
+        mean of the final per-task vector; ``None`` when neither is available.
+
+    Usage:
+        >>> final_f1 = _final_val_metric_for_run(tasks, "val_macro_f1")
+    """
+    from scripts.plot_multi_algorithms import _mean_final_metric_for_run
+
+    if not tasks:
+        return None
+    union_array = _cil_union_series(tasks, val_metric_key)
+    if union_array is not None:
+        return float(union_array[-1])
+    return _mean_final_metric_for_run(tasks[-1], val_metric_key, len(tasks))
+
+
 def _metric_label_to_filename_token(metric_label: str) -> str:
     """Convert a metric label into a hyphenated filename token.
 
@@ -704,11 +799,9 @@ def main() -> None:
         sys.path.insert(0, str(REPO_ROOT))
 
     from scripts.plot_multi_algorithms import (  # pylint: disable=import-error
-        _compute_mean_val_metric_over_tasks,
         _concat_train_metric_for_run,
         _discover_runs_from_algorithm_root,
         _discover_runs_from_run_dir,
-        _mean_final_metric_for_run,
         _prepare_algo_runs,
         _resolve_train_x_axis_label,
         compute_average_forgetting,
@@ -964,12 +1057,8 @@ def main() -> None:
             continue
         seed_tasks_list = algo_seed_tasks.get(run.name, [run.tasks])
 
-        def _seed_final_metric(tasks: list[Any], key: str) -> float | None:
-            last = tasks[-1]
-            return _mean_final_metric_for_run(last, key, len(tasks))
-
         def _mean_across_seeds(key: str) -> float | None:
-            vals = [_seed_final_metric(t, key) for t in seed_tasks_list]
+            vals = [_final_val_metric_for_run(t, key) for t in seed_tasks_list]
             vals = [v for v in vals if v is not None]
             return float(np.mean(vals)) if vals else None
 
@@ -1037,7 +1126,7 @@ def main() -> None:
         if len(seed_tasks_list) > 1:
             x_vals, mean_y, std_y = _aggregate_across_seeds(
                 seed_tasks_list,
-                lambda tasks: _compute_mean_val_metric_over_tasks(tasks, first_key),
+                lambda tasks: _continual_val_metric_series(tasks, first_key),
             )
             if x_vals.size == 0:
                 continue
@@ -1059,9 +1148,7 @@ def main() -> None:
                     alpha=0.15,
                 )
         else:
-            x_vals, y_vals = _compute_mean_val_metric_over_tasks(
-                seed_tasks_list[0], first_key
-            )
+            x_vals, y_vals = _continual_val_metric_series(seed_tasks_list[0], first_key)
             if x_vals.size == 0:
                 continue
             zero_based_x = x_vals - 1

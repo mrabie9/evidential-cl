@@ -33,7 +33,7 @@ def test_append_metric_block_stats_and_lines(tmp_path: Path) -> None:
 
     assert stats["diag"] == pytest.approx((0.8 + 0.9 + 0.9) / 3)
     assert stats["final"] == pytest.approx((0.6 + 0.8 + 0.9) / 3)
-    assert stats["bwt"] == pytest.approx((-0.2 - 0.1 + 0.0) / 3)
+    assert stats["bwt"] == pytest.approx((-0.2 - 0.1) / 2)
     assert stats["fwt"] == pytest.approx((0.0 + 0.0 + 0.1) / 3)
     lines = path.read_text().splitlines()
     assert lines[0] == "existing"
@@ -45,7 +45,7 @@ def test_append_metric_block_stats_and_lines(tmp_path: Path) -> None:
         "0.7000 0.9000 0.4000",
         "0.6000 0.8000 0.9000",
     ]
-    assert lines[10] == "Backward F1: -0.1000"
+    assert lines[10] == "Backward F1: -0.1500"
 
 
 def test_append_metric_block_skips_empty_matrix(tmp_path: Path) -> None:
@@ -89,11 +89,11 @@ def test_save_results_writes_all_metrics(tmp_path: Path) -> None:
     first_backward = next(
         line for line in text.splitlines() if line.startswith("Backward")
     )
-    assert first_backward == "Backward: -0.1000"
-    assert val_bwt["rec"] == pytest.approx(-0.1)
-    assert val_bwt["prec"] == pytest.approx(-0.05)
-    assert val_bwt["f1"] == pytest.approx(-0.025)
-    assert "Backward F1: -0.0250" in text
+    assert first_backward == "Backward: -0.1500"
+    assert val_bwt["rec"] == pytest.approx(-0.15)
+    assert val_bwt["prec"] == pytest.approx(-0.075)
+    assert val_bwt["f1"] == pytest.approx(-0.0375)
+    assert "Backward F1: -0.0375" in text
 
 
 def test_task_confusion_matrix_reads_metric_blocks(tmp_path: Path) -> None:
@@ -173,11 +173,11 @@ def _save_with_headline(log_dir: Path, loader: str) -> str:
 
 
 def test_summary_keeps_row_mean_and_adds_headline(tmp_path: Path) -> None:
-    """final stays the row mean (bwt = final - diag); the headline sits beside it."""
+    """final stays the row mean (bwt excludes the last task); the headline sits beside it."""
     text = _save_with_headline(tmp_path, "class_incremental_loader")
     row_mean = (0.6 + 0.8 + 0.9) / 3
     assert "Final Accuracy: {:.4f}".format(row_mean) in text
-    assert "Backward: -0.1000" in text
+    assert "Backward: -0.1500" in text
     summary = text.split("Summary (validation):", 1)[1].splitlines()
     assert summary[1].split() == [
         "metric",
@@ -190,14 +190,14 @@ def test_summary_keeps_row_mean_and_adds_headline(tmp_path: Path) -> None:
     rows = {line.split()[0]: line.split()[1:] for line in summary[2:5]}
     diag, final, bwt, _, headline = rows["recall"]
     assert float(final) == pytest.approx(row_mean, abs=1e-4)
-    assert float(bwt) == pytest.approx(float(final) - float(diag), abs=1e-4)
+    assert float(bwt) == pytest.approx((-0.2 - 0.1) / 2, abs=1e-4)
     assert headline == "0.5500"
     assert rows["precision"][4] == "0.3300"
     assert rows["f1"][4] == "0.2200"
 
     bundle = torch.load(tmp_path / "results.pt", weights_only=False)
     assert float(bundle[3][1]) == pytest.approx(row_mean)
-    assert "# val: 0.867 0.767 -0.100" in bundle[4]
+    assert "# val: 0.867 0.767 -0.150" in bundle[4]
     assert "# headline: rec=0.5500 prec=0.3300 f1=0.2200" in bundle[4]
 
 

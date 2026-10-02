@@ -5,7 +5,11 @@ from model.replay_utils import (
     ReplayInputMixin,
     unpack_y_to_class_labels,
 )
-from model.task_bn import frozen_running_stats
+from model.task_bn import (
+    forward_replay_and_current,
+    frozen_running_stats,
+    replay_forward_is_joint,
+)
 from utils.training_metrics import macro_recall
 from utils import misc_utils
 
@@ -70,13 +74,22 @@ class Net(ReplayInputMixin, BaseNet):  # noqa: F405
         The replay block additionally runs under ``frozen_running_stats``: its
         rows span several old tasks, so they must not be folded into the current
         task's per-task BatchNorm running statistics.
+
+        Class-incremental runs are the exception: their evaluation normalizes
+        every task inside one mixed batch, so the two blocks are forwarded
+        jointly to train under the same statistics (see
+        :func:`model.task_bn.replay_forward_is_joint`).
         """
 
         rc = None if replay_count is None else int(replay_count)
         if rc is not None and 0 < rc < x.size(0):
-            with frozen_running_stats(self):
-                replay_raw = self.net.forward(x[:rc], fast_weights)
-            current_raw = self.net.forward(x[rc:], fast_weights)
+            replay_raw, current_raw = forward_replay_and_current(
+                self,
+                lambda rows: self.net.forward(rows, fast_weights),
+                x[:rc],
+                x[rc:],
+                joint=replay_forward_is_joint(self.incremental_loader_name),
+            )
             raw = torch.cat([replay_raw, current_raw], dim=0)
         elif rc is not None and rc >= x.size(0) > 0:
             # Whole meta batch is replay.
