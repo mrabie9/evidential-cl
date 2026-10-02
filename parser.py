@@ -1273,14 +1273,38 @@ def get_parser():
         "--woe_centering_mode",
         type=str,
         default="centered_uniform",
-        choices=["centered_uniform", "raw_uniform", "prop2_uniform", "full_lc"],
+        choices=[
+            "centered_uniform",
+            "raw_uniform",
+            "prop2_uniform",
+            "prop2_full",
+            "full_lc",
+        ],
         help=(
             "WoE-SI feature-centering / alpha scheme for the DS weights of "
             "evidence (Denoeux 2019 Eq 25/29). 'prop2_uniform' is Denoeux's own "
             "Prop 2 Eq 38 identification, under which sum_j w_jk = z_k exactly; "
             "'centered_uniform' is this project's convention and drops the "
             "sum_q beta*_qk mu_q term (measured 40-191x larger than the "
-            "beta*_0k it keeps). 'full_lc' is not implemented."
+            "beta*_0k it keeps). 'prop2_full' additionally row-centres beta "
+            "across classes (Prop 2's other half; matches NNDS's beta_star_jk). "
+            "'full_lc' is not implemented."
+        ),
+    )
+    parser.add_argument(
+        "--woe_evidence_scope",
+        type=str,
+        default="auto",
+        choices=["auto", "task", "seen"],
+        help=(
+            "Which output columns the WoE-SI importance path (I_2/i1/z2/ce "
+            "tracked scalars) is combined over, independent of the "
+            "Least-Commitment or evidential objectives (which always use only "
+            "the current task's columns). 'auto' (default) keeps today's "
+            "behaviour: current task's columns under TIL, cumulative "
+            "all-classes-seen-so-far under CIL. 'task' forces task-only "
+            "columns regardless of loader; 'seen' forces cumulative "
+            "all-seen columns regardless of loader."
         ),
     )
     parser.add_argument(
@@ -1479,7 +1503,18 @@ def get_parser():
         "--woe_importance_scalar",
         type=str,
         default="i2",
-        choices=["i2", "z2", "phi2", "ce", "i1", "logit", "conflict"],
+        choices=[
+            "i2",
+            "z2",
+            "phi2",
+            "ce",
+            "i1",
+            "logit",
+            "conflict",
+            "kappa_staged",
+            "true_support",
+            "true_margin",
+        ],
         help=(
             "woe_si: which scalar the SI path integral tracks. 'i2' (default) "
             "is the Dempster-Shafer information content, i.e. WoE-SI proper. "
@@ -1495,7 +1530,17 @@ def get_parser():
             "'logit' is NOT 'z2': under centered_uniform the total weight "
             "of evidence is z_k - beta_k.mu, and the divisor is J^2 rather "
             "than the active-class count. They sit on "
-            "different scales, so woe_lambda must be swept per scalar."
+            "different scales, so woe_lambda must be swept per scalar. "
+            "'kappa_staged' is Beechey's genuine joint-frame Dempster conflict "
+            "(Eq 11a/11b/12), combining all active classes into one frame -- "
+            "unlike 'conflict' (a per-class binary-frame quantity), it is "
+            "naturally O(1) in [0, 1) with no J^2 rescaling needed. "
+            "'true_support' is (w+_y)^2 / J^2, the supporting evidence for the "
+            "labelled class only: I_2's normalisation, but every other scalar "
+            "except 'ce' is label-free and credits evidence for any class. "
+            "'true_margin' is (w+_y - w-_y)^2 / J^2, the labelled class's "
+            "signed margin squared, so withdrawing evidence against the "
+            "correct class also counts."
         ),
     )
     parser.add_argument(

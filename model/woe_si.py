@@ -83,8 +83,20 @@ _CENTERING_MODES = (
     "centered_uniform",
     "raw_uniform",
     "prop2_uniform",
+    "prop2_full",
     "full_lc",
 )
+# Which output columns the WoE-SI importance path (I_2/i1/z2/ce, i.e. the
+# tracked scalar whose path integral defines Omega) is combined over. This is
+# an axis on `_active_class_indices` only -- the Least-Commitment and
+# evidential objectives always use `_current_task_class_indices` and never
+# consult this setting, by construction (see their docstrings).
+#   "auto" -- today's behaviour: current task's columns under TIL, cumulative
+#             all-classes-seen-so-far under CIL (`self.is_cil` decides).
+#   "task" -- force current-task-only columns regardless of loader.
+#   "seen" -- force cumulative all-classes-seen-so-far columns regardless of
+#             loader.
+_EVIDENCE_SCOPES = ("auto", "task", "seen")
 
 # Which mu centres the weights of evidence (PR-3, docs/woe-cl/preregistration.md).
 #
@@ -147,7 +159,39 @@ _EVIDENCE_SCALES = ("weight", "belief")
 #             commitment measure selects nearly the same parameters, does the
 #             exponent -- the one part of I_p Denoeux picked for tractability
 #             rather than principle -- matter either?
-_IMPORTANCE_SCALARS = ("i2", "z2", "phi2", "ce", "i1", "logit", "conflict")
+#   "kappa_staged" -- Beechey's genuine *joint*-frame conflict mass (Eq
+#             11a/11b/12 of Beechey et al., Information Fusion 92 (2023)
+#             115-126; see joint_mass_quantities), combining all K classes'
+#             evidence into one Dempster-Shafer frame rather than "i2"/"conflict"'s
+#             per-class binary read. Answers a different B6-style question than
+#             "i1"/"z2"/"phi2" do: not "does the exponent matter" or "is any
+#             monotone scalar equivalent", but "does tracking real cross-class
+#             disagreement, instead of I_2's per-class w+/w- decomposition,
+#             select better parameters".
+#   "true_support" -- (w+_y)^2 / J^2: the squared total supporting evidence for
+#             the *labelled* class only. Every other scalar above except "ce"
+#             is label-free, so it credits a parameter for committing evidence
+#             in any direction on any active class -- including support for a
+#             wrong class. This is I_2 restricted to the correct class's
+#             support channel, with the same p=2 and J^2 divisor, so the only
+#             thing it changes relative to "i2" is *whose* evidence counts.
+#   "true_margin" -- (w+_y - w-_y)^2 / J^2: the labelled class's centred logit,
+#             squared. Unlike "true_support" it also moves when evidence
+#             *against* the correct class is withdrawn. The square discards the
+#             margin's sign, so a confidently wrong sample (large negative
+#             margin) scores as high as a confidently right one.
+_IMPORTANCE_SCALARS = (
+    "i2",
+    "z2",
+    "phi2",
+    "ce",
+    "i1",
+    "logit",
+    "conflict",
+    "kappa_staged",
+    "true_support",
+    "true_margin",
+)
 # How the signed path integral omega^t is projected onto the non-negative Omega
 # the quadratic anchor needs. Some projection is mandatory, not stylistic: a
 # negative Omega makes the loss-form penalty unbounded below (an anti-anchor that
@@ -251,7 +295,8 @@ def compute_weights_of_evidence(
         readout_bias: Linear readout bias ``beta_0`` with shape ``(K,)``.
         feature_mean: Running feature mean ``mu`` with shape ``(J,)`` (the EMA of
             ``phi`` over the current task). Ignored for ``"raw_uniform"``.
-        centering_mode: One of ``{"centered_uniform", "raw_uniform", "full_lc"}``.
+        centering_mode: One of ``{"centered_uniform", "raw_uniform",
+            "prop2_uniform", "prop2_full", "full_lc"}``.
             ``"centered_uniform"`` (default) centres features and uses the
             Least-Commitment uniform offset ``alpha_jk = beta_0k / J``.
             ``"raw_uniform"`` skips centring (uses raw ``phi``) but keeps the same
@@ -259,8 +304,11 @@ def compute_weights_of_evidence(
             same centring, but the offset is ``beta'_0k / J`` with
             ``beta'_0k = beta_0k + sum_q beta_qk mu_q``, which is what Sec 4.1
             derives once the features are centred and what Prop 2 Eq 38 gives in
-            the multi-category case. ``"full_lc"`` (exact Sec 4.2 identification)
-            is not implemented and raises ``NotImplementedError``.
+            the multi-category case. ``"prop2_full"`` is ``"prop2_uniform"``
+            plus the row-centring of ``beta`` (and of ``beta'_0k``) across
+            classes that Prop 2's construction also uses -- see the dedicated
+            paragraph below. ``"full_lc"`` (exact Sec 4.2 identification) is not
+            implemented and raises ``NotImplementedError``.
 
     **The default is not Denoeux's identification, and the gap is not small.**
     ``"centered_uniform"`` imposes ``sum_j alpha_jk = beta_0k`` while feeding the
@@ -276,6 +324,34 @@ def compute_weights_of_evidence(
     genuinely different quantities. ``"centered_uniform"`` is kept as the default
     because every recorded result in ``docs/woe-cl/README.md`` was measured under
     it; ``"prop2_uniform"`` is the one to quote against the paper.
+
+    **``"prop2_full"`` adds the row-centring ``"prop2_uniform"`` leaves out.**
+    Denoeux's Prop 2 / Beechey Eq 5 (Beechey et al., *Information Fusion* 92
+    (2023) 115-126 -- the paper NNDS's ``adversarial_attacks.py::
+    calculate_masses`` implements) additionally centres ``beta`` itself across
+    the ``K`` classes before forming ``w``: ``beta*_kj = beta_kj -
+    mean_k(beta_kj)``, and row-centres the Eq-38 bias the same way,
+    ``beta*'_0k = beta'_0k - mean_k(beta'_0k)``, before splitting it uniformly
+    over ``J``. Substituting the row-centred offset into ``w_jk = beta*_kj
+    phi'_j + beta*'_0k / J`` and expanding shows it equals ``beta*_kj (phi_j -
+    mu_j) + beta'_0k / J`` computed on *raw* ``phi`` -- i.e. this is an
+    algebraic rearrangement of the NNDS source's formula, not a different
+    quantity, and it is exact for any ``K`` (the NNDS source happens to
+    hardcode ``K=3``, this implementation does not).
+
+    This is **not** a NNDS-only quirk: it is Prop 2's *other half*, and the
+    repo already has a validated, independent implementation of exactly this
+    gauge-fixing -- ``block_centre()`` in ``scripts/ds_ignorance_conflict.py``,
+    used there (offline, on a checkpoint) as "Denoeux Prop 2 / Beechey Eq 5"
+    ahead of ``prop2_uniform``. ``"prop2_full"`` reproduces that combination to
+    machine precision (``tests/test_woe_si.py::
+    test_prop2_full_matches_block_centre_plus_prop2_uniform``), it was simply
+    never wired into the *trained* model (rather than an offline diagnostic)
+    before this mode. Row-centring ``beta`` is **not** a counterpart of
+    ``"full_lc"``: ``"full_lc"`` is the unrelated, harder Sec 4.2 per-batch
+    constrained solve for ``alpha`` (see below); this is only the other half
+    of the same Prop 2 identification ``"prop2_uniform"`` already partially
+    implements.
 
     Returns:
         Weights of evidence ``w`` with shape ``(batch, K, J)`` where
@@ -303,17 +379,31 @@ def compute_weights_of_evidence(
     feature_count = features.shape[1]
     if centering_mode == "raw_uniform":
         centered_features = features
-    else:  # centered_uniform, prop2_uniform
+    else:  # centered_uniform, prop2_uniform, prop2_full
         centered_features = features - feature_mean.unsqueeze(0)
 
-    # w[b, k, j] = beta_kj * phi'_bj + alpha_kj.
-    evidence = readout_weight.unsqueeze(0) * centered_features.unsqueeze(1)
-    if centering_mode == "prop2_uniform":
+    if centering_mode in ("prop2_uniform", "prop2_full"):
         # alpha_kj = beta'_0k / J with beta'_0k = beta_0k + sum_q beta_kq mu_q,
         # so that sum_j w_jk = z_k exactly (Denoeux Sec 4.1 / Prop 2 Eq 38).
+        # Computed from the ORIGINAL (not row-centred) readout_weight even under
+        # "prop2_full" -- matches NNDS's beta_dash_0_k, which is built from raw
+        # beta before beta_star_jk is ever formed (adversarial_attacks.py:121).
         effective_bias = readout_bias + readout_weight @ feature_mean
     else:
         effective_bias = readout_bias
+
+    evidence_weight = readout_weight
+    if centering_mode == "prop2_full":
+        # Row-centre beta across classes (Prop 2's other half): beta*_kj =
+        # beta_kj - mean_k(beta_kj), matching NNDS's beta_star_jk
+        # (adversarial_attacks.py:120). Row-centre the corrected bias the same
+        # way (beta_dash_star_0_k, adversarial_attacks.py:122) before the
+        # uniform J-way split below.
+        evidence_weight = readout_weight - readout_weight.mean(dim=0, keepdim=True)
+        effective_bias = effective_bias - effective_bias.mean()
+
+    # w[b, k, j] = beta_kj * phi'_bj + alpha_kj.
+    evidence = evidence_weight.unsqueeze(0) * centered_features.unsqueeze(1)
     offset = (effective_bias / feature_count).view(1, -1, 1)
     return evidence + offset
 
@@ -521,7 +611,7 @@ _LC_TERMS = ("i2", "logit", "conflict", "kappa")
 # Scalars a shadow path integral can be built from (WOE_OMEGA_SHADOW). The three
 # LC terms plus the B6 stand-ins, so one run can carry the halves of I_2 and the
 # rival scalars side by side on a single trajectory.
-_SHADOW_SCALARS = ("i2", "logit", "conflict", "ce", "z2", "phi2")
+_SHADOW_SCALARS = ("i2", "logit", "conflict", "ce", "z2", "phi2", "kappa_staged")
 
 
 def least_commitment_penalty(
@@ -909,6 +999,92 @@ def _conflict_factor(w_plus: torch.Tensor, w_minus: torch.Tensor) -> torch.Tenso
     return 1.0 + kappa
 
 
+def joint_mass_quantities(
+    w_plus: torch.Tensor, w_minus: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Genuine *joint*-frame ignorance and conflict, Beechey-matched, general K.
+
+    ``_conflict_factor`` above (and the ``"conflict"`` half of ``I_2``, see
+    :func:`_least_commitment_terms`) are per-class, binary-frame quantities:
+    each class ``k`` is scored against its own complement in isolation, never
+    combined with the other ``K-1`` classes into one frame. This function is
+    the thing NNDS's ``adversarial_attacks.py::calculate_masses`` actually
+    computes and calls a Dempster-Shafer mass function: combine all ``K``
+    singleton-supporting simple support functions
+    ``S+_k: m({theta_k}) = 1-e^{-w+_k}, m(Theta) = e^{-w+_k}`` and all ``K``
+    complement-supporting ones
+    ``S-_k: m(~{theta_k}) = 1-e^{-w-_k}, m(Theta) = e^{-w-_k}``
+    into a single joint mass function over the ``K``-class frame ``Theta`` via
+    Dempster's rule, and read off the normalised ignorance ``m(Theta)`` and
+    the conflict (empty-set) mass it discards.
+
+    **Why this is not simply "NNDS's ``k_conflict``" ported verbatim.** The
+    naive one-stage combination (all ``2K`` simple support functions combined
+    at once -- which is what ``calculate_masses`` does, and what a first port
+    of it computes) gives a conflict mass that is mathematically correct but
+    numerically useless for ``K >= 6``: with per-class evidence ``w+ ~ 5`` (a
+    typical trained value here), ``P_a = exp(-sum_k w+_k)`` underflows and the
+    one-stage conflict saturates at 1 to many decimal places, so it cannot
+    order or correlate with anything. This is a **bookkeeping artefact, not a
+    property of the data** (Beechey et al., *Information Fusion* 92 (2023)
+    115-126): doing the combination in two stages instead -- combine and
+    *normalise* the ``K`` positive-evidence functions, likewise the ``K``
+    negative ones, then combine those two normalised results -- gives the
+    exact same ``m(Theta)`` (Dempster's rule is associative with
+    normalisation) but quotients out the within-family singleton disagreements
+    (``{theta_1}`` vs ``{theta_2}``, which are near-certain and numerically
+    saturate first) before they can swamp the cross-family conflict that is
+    actually informative. That staged conflict is Beechey's Eq 11a/11b/12,
+    returned here as ``kappa_staged``. Verified against a full power-set
+    enumeration at K=3 in ``tests/test_woe_si.py`` (both the one-stage and
+    staged forms give the same ``m(Theta)`` to machine precision; only the
+    discarded conflict mass differs).
+
+    Ported from the offline diagnostic ``scripts/ds_ignorance_conflict.py``
+    (``mass_quantities``), which derives and empirically validates this same
+    formula; kept here as a differentiable, general-``K`` primitive so it can
+    be used both as a live uncertainty readout and (via ``importance_scalar=
+    "kappa_staged"``) as a tracked scalar for the SI path integral, not only
+    as an offline checkpoint diagnostic.
+
+    Args:
+        w_plus: Positive total evidence ``(batch, K)``, non-negative.
+        w_minus: Negative total evidence ``(batch, K)``, non-negative.
+
+    Returns:
+        ``(m_theta, kappa_staged)``, each ``(batch,)``, in the input dtype.
+        ``m_theta`` is the normalised ignorance mass ``Bel(Theta)`` in
+        ``(0, 1]``; ``kappa_staged`` is the staged conflict mass in ``[0, 1)``.
+
+    Usage:
+        >>> w_plus, w_minus = per_class_total_evidence(weights)
+        >>> m_theta, kappa_staged = joint_mass_quantities(w_plus, w_minus)
+    """
+    dtype = w_plus.dtype
+    w_plus64 = w_plus.double()
+    w_minus64 = w_minus.double()
+    # S = sum_k (e^{w+_k} - 1) e^{-w-_k} + 1 - prod_l (1 - e^{-w-_l}); expm1/log1p
+    # keep this stable at both small and large w, matching FIX_MASSES.
+    singleton_sum = (torch.expm1(w_plus64) * torch.exp(-w_minus64)).sum(dim=1)
+    prod_one_minus_b = torch.exp(
+        torch.log1p(-torch.exp(-w_minus64).clamp(max=1 - 1e-16)).sum(dim=1)
+    )
+    total = singleton_sum + 1.0 - prod_one_minus_b
+    w_minus_total = w_minus64.sum(dim=1)
+    m_theta = torch.exp(-w_minus_total - torch.log(total.clamp(min=1e-300)))
+
+    # 1/eta+ = sum_k(e^{w+_k} - 1) + 1, 1/eta- = 1 - prod_l(1 - e^{-w-_l}).
+    inv_eta_plus = torch.expm1(w_plus64).sum(dim=1) + 1.0
+    inv_eta_minus = (1.0 - prod_one_minus_b).clamp(min=1e-300)
+    log_nonconflict_staged = (
+        torch.log(total.clamp(min=1e-300))
+        - torch.log(inv_eta_plus)
+        - torch.log(inv_eta_minus)
+    )
+    kappa_staged = -torch.expm1(log_nonconflict_staged)
+    return m_theta.to(dtype), kappa_staged.to(dtype)
+
+
 # ======================================================================
 # Configuration
 # ======================================================================
@@ -1053,6 +1229,12 @@ class Net(ReplayInputMixin, nn.Module):
             raise ValueError(
                 "woe_mu_mode='frozen_pretask' needs args.get_task_train_loader "
                 "(bound from IncrementalLoader.get_tasks in main.py); it is absent."
+            )
+        self.evidence_scope = str(getattr(args, "woe_evidence_scope", "auto"))
+        if self.evidence_scope not in _EVIDENCE_SCOPES:
+            raise ValueError(
+                f"woe_evidence_scope must be one of {_EVIDENCE_SCOPES}, "
+                f"got {self.evidence_scope!r}"
             )
         self.importance_stride = max(1, int(self.cfg.woe_importance_stride))
         self.conflict_weighting = bool(self.cfg.woe_conflict_weighting)
@@ -1495,7 +1677,8 @@ class Net(ReplayInputMixin, nn.Module):
 
         Args:
             x: Current batch.
-            y: Current labels; used only by ``"ce"``.
+            y: Current labels; used only by ``"ce"``, ``"true_support"`` and
+                ``"true_margin"``.
             t: Current task index.
 
         Returns:
@@ -1508,8 +1691,21 @@ class Net(ReplayInputMixin, nn.Module):
         self._update_feature_mean(features.detach())
         feature_count = features.shape[1]
 
+        if self.importance_scalar == "kappa_staged":
+            active = self._active_class_indices(t, features.device)
+            return self._joint_conflict_scalar(features, active)
+
         if self.importance_scalar == "phi2":
             return features.pow(2).sum(dim=1).mean() / float(feature_count)
+
+        if self.importance_scalar in ("true_support", "true_margin"):
+            active = self._active_class_indices(t, features.device)
+            return self._true_support_scalar(
+                features,
+                active,
+                unpack_y_to_class_labels(y),
+                margin=self.importance_scalar == "true_margin",
+            )
 
         logits = self.net.forward_classifier(features, bn_training=False)
         if self.importance_scalar == "z2":
@@ -1590,6 +1786,88 @@ class Net(ReplayInputMixin, nn.Module):
         return self._least_commitment_scalar(features, active, term=term, p=exponent)
 
     # ------------------------------------------------------------------
+    def _true_support_scalar(
+        self,
+        features: torch.Tensor,
+        active: torch.Tensor,
+        y_cls: torch.Tensor,
+        margin: bool = False,
+    ) -> torch.Tensor:
+        """Batch-mean ``(w+_y)^2 / J^2`` over the labelled class only.
+
+        With ``margin`` the read-out is the signed margin ``w+_y - w-_y``
+        instead of the support ``w+_y`` (``importance_scalar="true_margin"``).
+
+        The weights of evidence are computed over the full ``active`` column set,
+        not the labelled column alone, because the centring modes that
+        row-centre ``beta`` across classes (``prop2_full``) make ``w_jy`` depend
+        on the other active rows; only the *read-out* is restricted to ``y``.
+
+        Labels are global column indices and are mapped to positions within
+        ``active`` through a lookup, as in :meth:`_evidential_loss`. Samples
+        whose label is not an active column (e.g. an always-active noise column
+        that ``_active_class_indices`` omits) contribute nothing; the mean is
+        still taken over the whole batch so the scalar's scale does not jump with
+        the fraction of usable samples.
+
+        Args:
+            features: Penultimate features ``(batch, J)``, attached.
+            active: Active global column indices ``(K,)``.
+            y_cls: Global class labels ``(batch,)``.
+            margin: Read out ``w+_y - w-_y`` rather than ``w+_y``.
+
+        Returns:
+            Scalar tensor; ``0`` (still attached) if no label is active.
+        """
+        readout = self.net.model.fc
+        weights = compute_weights_of_evidence(
+            features,
+            readout.weight[active],
+            readout.bias[active],
+            self._mu_for_evidence(),
+            centering_mode=self.centering_mode,
+        )
+        w_plus, w_minus = per_class_total_evidence(weights)
+        evidence = w_plus - w_minus if margin else w_plus
+        lookup = torch.full(
+            (self.n_outputs,), -1, dtype=torch.long, device=features.device
+        )
+        lookup[active] = torch.arange(active.numel(), device=features.device)
+        local = lookup[y_cls.long().to(features.device)]
+        usable = local >= 0
+        support = evidence.gather(1, local.clamp(min=0).unsqueeze(1)).squeeze(1)
+        support = torch.where(usable, support, torch.zeros_like(support))
+        feature_count = features.shape[1]
+        return support.pow(2).mean() / float(feature_count**2)
+
+    # ------------------------------------------------------------------
+    def _joint_conflict_scalar(
+        self, features: torch.Tensor, active: torch.Tensor
+    ) -> torch.Tensor:
+        """Batch-mean Beechey-staged joint conflict over ``active`` columns.
+
+        Shared by :meth:`_importance_scalar` (``importance_scalar=
+        "kappa_staged"``, measured) and :meth:`_shadow_scalar_value` (shadow-
+        tracked), so the two can never drift apart in centring or ``mu``
+        handling -- the same reason :meth:`_least_commitment_scalar` is shared
+        between the measured and minimised uses of ``I_2``. Naturally ``O(1)``
+        (``kappa_staged in [0, 1)``), so unlike ``I_2`` it needs no ``J^p``
+        rescaling to be usable as an SI path-integral scalar. See
+        :func:`joint_mass_quantities`.
+        """
+        readout = self.net.model.fc
+        weights = compute_weights_of_evidence(
+            features,
+            readout.weight[active],
+            readout.bias[active],
+            self._mu_for_evidence(),
+            centering_mode=self.centering_mode,
+        )
+        w_plus, w_minus = per_class_total_evidence(weights)
+        _, kappa_staged = joint_mass_quantities(w_plus, w_minus)
+        return kappa_staged.mean()
+
+    # ------------------------------------------------------------------
     def _shadow_scalar_value(
         self, name: str, x: torch.Tensor, y: torch.Tensor, t: int
     ) -> torch.Tensor:
@@ -1614,6 +1892,9 @@ class Net(ReplayInputMixin, nn.Module):
         if name in ("i2", "logit", "conflict"):
             active = self._active_class_indices(t, features.device)
             return self._least_commitment_scalar(features, active, term=name, p=2)
+        if name == "kappa_staged":
+            active = self._active_class_indices(t, features.device)
+            return self._joint_conflict_scalar(features, active)
         if name == "phi2":
             return features.pow(2).sum(dim=1).mean() / float(features.shape[1])
         logits = self.net.forward_classifier(features, bn_training=False)
@@ -3071,15 +3352,29 @@ class Net(ReplayInputMixin, nn.Module):
 
     # ------------------------------------------------------------------
     def _active_class_indices(self, t: int, device: torch.device) -> torch.Tensor:
-        """Active output columns: cumulative seen classes (CIL) or task slice (TIL).
+        """Active output columns for the WoE-SI importance path.
 
-        Matches ``utils.misc_utils.apply_task_incremental_logit_mask``, so the DS
-        frame ``Theta`` spans the same classes the CE head is actually predicting
-        over.
+        Under ``woe_evidence_scope="auto"`` (default) this matches
+        ``utils.misc_utils.apply_task_incremental_logit_mask``: cumulative seen
+        classes under CIL, the task's own slice under TIL -- so the DS frame
+        ``Theta`` spans the same classes the CE head is actually predicting
+        over. ``"task"``/``"seen"`` override that loader-tied default so the
+        combination scope can be ablated independently of TIL/CIL. This method
+        feeds only the tracked importance scalar
+        (:meth:`_compute_information_content`, :meth:`_importance_scalar`,
+        :meth:`_shadow_scalar_value`); the Least-Commitment and evidential
+        objectives use :meth:`_current_task_class_indices` instead and are
+        unaffected by ``woe_evidence_scope``.
         """
         offset1, offset2 = misc_utils.compute_offsets(t, self.classes_per_task)
         offset2 = min(self.n_outputs, offset2)
-        if self.is_cil:
+        if self.evidence_scope == "task":
+            cumulative = False
+        elif self.evidence_scope == "seen":
+            cumulative = True
+        else:  # "auto"
+            cumulative = self.is_cil
+        if cumulative:
             indices = list(range(0, offset2))
         else:
             indices = list(range(offset1, offset2))
